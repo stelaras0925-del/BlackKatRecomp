@@ -1,0 +1,1 @@
+Ghidra writes `SLUS_203.65.csv` here when you follow the export steps in the top-level README. That CSV is a map of the ELF you own, so it is gitignored, along with any TOML saved into this directory. The config that is meant to be committed is `config/slus_203.65.toml`.

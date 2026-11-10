@@ -1,0 +1,53 @@
+# Build trees, the PS2Recomp symlink overlay, and recompiler output.
+/build/
+/out/
+/cmake-build-*/
+/CMakeUserPresets.json
+compile_commands.json
+
+# Disc, BIOS, and anything extracted from them. This repository ships no game data.
+/game/
+*.iso
+*.ISO
+*.cue
+*.CUE
+*.chd
+*.CHD
+*.elf
+*.ELF
+*.irx
+*.IRX
+*.img
+*.IMG
+*.viv
+*.VIV
+*.vob
+*.VOB
+*.pss
+*.PSS
+*.bios
+*.BIOS
+*.bin
+*.BIN
+*.mec
+*.MEC
+*.nvm
+*.NVM
+
+# Ghidra exports describe the user's ELF.
+/config/ghidra/*.csv
+/config/ghidra/*.toml
+
+# Recompiler products, wherever ps2_recomp was pointed.
+ps2_recompiled_functions.cpp
+ps2_recompiled_functions.h
+ps2_recompiled_stubs.h
+register_functions.cpp
+
+# Editor and local tooling.
+.cache/
+.vscode/
+.idea/
+.vs/
+*.user
+*.log

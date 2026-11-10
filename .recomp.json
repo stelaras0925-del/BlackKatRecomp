@@ -1,0 +1,12 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Pirates: The Legend of Black Kat",
+  "system": "PS2",
+  "type": "recomp",
+  "toolchain": "PS2Recomp",
+  "status": "exploring",
+  "original": {
+    "region": "USA",
+    "serial": "SLUS-20365"
+  }
+}
