@@ -5,12 +5,17 @@
 // the function table is empty and loadELF still boots the runtime.
 
 #include "ps2_runtime.h"
+#include "runtime/ee_scheduler.h"
 
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <chrono>
+#include <cstdio>
+#include <sstream>
+#include <thread>
 
 namespace
 {
@@ -80,6 +85,75 @@ int main(int argc, char *argv[])
         {
             std::cerr << "Failed to load ELF: " << elfPath << std::endl;
             return 1;
+        }
+
+        // Optional disc image for raw sceCdRead sector access:
+        // blackkat [elf] [iso], or BLACKKAT_ISO=/path/to/game.iso
+        {
+            std::filesystem::path iso;
+            if (argc >= 3 && argv[2] != nullptr && argv[2][0] != '\0')
+                iso = argv[2];
+            else if (const char *env = std::getenv("BLACKKAT_ISO"); env && env[0])
+                iso = env;
+            if (!iso.empty())
+            {
+                if (!std::filesystem::exists(iso))
+                {
+                    std::cerr << "[blackkat] disc image not found: " << iso.string() << std::endl;
+                    return 1;
+                }
+                PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+                paths.cdImage = iso;
+                PS2Runtime::setIoPaths(paths);
+                std::cerr << "[blackkat] CD image: " << PS2Runtime::getIoPaths().cdImage.string() << std::endl;
+            }
+        }
+
+        // Debug: BLACKKAT_RAMDUMP="20,50" writes guest RDRAM (32 MB) to
+        // ramdump_<sec>.bin in the working directory after each delay.
+        if (const char *dumpEnv = std::getenv("BLACKKAT_RAMDUMP"); dumpEnv && dumpEnv[0])
+        {
+            std::string spec(dumpEnv);
+            std::thread([&runtime, spec]()
+                        {
+                            std::stringstream ss(spec);
+                            std::string item;
+                            int elapsed = 0;
+                            while (std::getline(ss, item, ','))
+                            {
+                                const int at = std::atoi(item.c_str());
+                                if (at > elapsed)
+                                    std::this_thread::sleep_for(std::chrono::seconds(at - elapsed));
+                                elapsed = at;
+                                const std::string name = "ramdump_" + std::to_string(at) + ".bin";
+                                if (FILE *f = std::fopen(name.c_str(), "wb"))
+                                {
+                                    std::fwrite(runtime.memory().getRDRAM(), 1, PS2_RAM_SIZE, f);
+                                    std::fclose(f);
+                                    std::cerr << "[blackkat] RAM dump written: " << name << std::endl;
+                                }
+                                const EeKernelSnapshot snap = runtime.eeScheduler().snapshot();
+                                std::cerr << std::hex << "[blackkat] EE snapshot @" << std::dec << at
+                                          << "s running=" << snap.runningThreadId << std::endl;
+                                for (const EeThreadSnapshot &t : snap.threads)
+                                {
+                                    std::cerr << "[blackkat]   thread " << std::dec << t.id << std::hex
+                                              << " pc=0x" << t.pc << " ra=0x" << t.ra << " sp=0x" << t.sp
+                                              << " entry=0x" << t.entry << std::dec
+                                              << " prio=" << t.currentPriority
+                                              << " status=" << static_cast<int>(t.status)
+                                              << " wait=" << static_cast<int>(t.waitReason)
+                                              << " waitId=" << t.waitId
+                                              << " invDepth=" << t.invocationDepth << std::endl;
+                                }
+                                for (const EeSemaphoreSnapshot &sm : snap.semaphores)
+                                {
+                                    std::cerr << "[blackkat]   sema " << sm.id << " count=" << sm.count
+                                              << "/" << sm.maxCount << " waiters=" << sm.waiters << std::endl;
+                                }
+                            }
+                        })
+                .detach();
         }
 
         runtime.run();

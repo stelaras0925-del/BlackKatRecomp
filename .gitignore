@@ -51,3 +51,8 @@ register_functions.cpp
 .vs/
 *.user
 *.log
+
+# Local backups, runtime logs and RAM dumps.
+*.bak
+ps2_log.txt
+ramdump_*.bin
