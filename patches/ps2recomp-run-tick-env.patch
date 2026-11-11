@@ -1,0 +1,104 @@
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -20,6 +20,8 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
++#include <cstdlib>
++#include <cstdio>
+ #include <limits>
+ #include <chrono>
+ #include <atomic>
+@@ -2395,38 +2397,65 @@
+     uint64_t tick = 0;
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
+-        PS2_IF_AGRESSIVE_LOGS({
++        {
++            // [run:tick] periodic status, enabled with PS2X_TICK=<frames> (or BLACKKAT_TICK);
++            // independent of AGRESSIVE_LOGS.
++            static const uint64_t s_tickEvery = []() -> uint64_t {
++                const char *e = std::getenv("PS2X_TICK");
++                if (!e || !*e) e = std::getenv("BLACKKAT_TICK");
++                if (!e || !*e) return 0;
++                long v = std::strtol(e, nullptr, 0);
++                return v > 0 ? static_cast<uint64_t>(v) : 120u;
++            }();
++            static const auto s_tickT0 = std::chrono::steady_clock::now();
+             tick++;
+-            if ((tick % 120) == 0)
++            if (s_tickEvery && (tick % s_tickEvery) == 0)
+             {
+-                uint64_t curDma = m_memory.dmaStartCount();
+-                uint64_t curGif = m_memory.gifCopyCount();
+-                uint64_t curGs = m_memory.gsWriteCount();
+-                uint64_t curVif = m_memory.vifWriteCount();
+                 const GSRegisters &gs = m_memory.gs();
+-                const uint32_t dbgPc = m_debugPc.load(std::memory_order_relaxed);
+-                const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
+-                const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
+-                const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
+                 const auto eeSnapshot = m_eeScheduler->snapshot();
+-
+-                RUNTIME_LOG("[run:tick] tick=" << tick
+-                                               << " pc=0x" << std::hex << dbgPc
+-                                               << " ra=0x" << dbgRa
+-                                               << " sp=0x" << dbgSp
+-                                               << " gp=0x" << dbgGp
+-                                               << " dispfb1=0x" << gs.dispfb1
+-                                               << " display1=0x" << gs.display1
+-                                               << std::dec
+-                                               << " activeThreads=" << eeSnapshot.threads.size()
+-                                               << " dma=" << curDma
+-                                               << " gif=" << curGif
+-                                               << " gsw=" << curGs
+-                                               << " vif=" << curVif
+-                                               << std::endl);
+-
++                const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_tickT0).count();
++                std::ostringstream os;
++                os << "[run:tick] t=" << secs << "s frame=" << tick
++                   << " vsync=" << m_eeScheduler->currentVSyncTick()
++                   << " eeCycle=" << eeSnapshot.eeCycle
++                   << " running=" << eeSnapshot.runningThreadId
++                   << std::hex
++                   << " pc=0x" << m_debugPc.load(std::memory_order_relaxed)
++                   << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
++                   << " sp=0x" << m_debugSp.load(std::memory_order_relaxed)
++                   << " dispfb1=0x" << gs.dispfb1
++                   << " display1=0x" << gs.display1
++                   << std::dec
++                   << " dma=" << m_memory.dmaStartCount()
++                   << " gif=" << m_memory.gifCopyCount()
++                   << " gsw=" << m_memory.gsWriteCount()
++                   << " vif=" << m_memory.vifWriteCount()
++                   << "\n";
++                for (const auto &t : eeSnapshot.threads)
++                {
++                    os << "[run:tick]   th" << t.id << " st=" << static_cast<int>(t.status)
++                       << " wait=" << static_cast<int>(t.waitReason) << "/" << t.waitId
++                       << " prio=" << t.currentPriority << std::hex
++                       << " pc=0x" << t.pc << " ra=0x" << t.ra << " sp=0x" << t.sp
++                       << " entry=0x" << t.entry << std::dec
++                       << " depth=" << t.invocationDepth << " wake=" << t.wakeupCount << "\n";
++                }
++                for (const auto &sm : eeSnapshot.semaphores)
++                {
++                    if (sm.waiters)
++                        os << "[run:tick]   sema" << sm.id << " count=" << sm.count << "/" << sm.maxCount
++                           << " waiters=" << sm.waiters << "\n";
++                }
++                for (const auto &ef : eeSnapshot.eventFlags)
++                {
++                    if (ef.waiters)
++                        os << "[run:tick]   evf" << ef.id << " bits=0x" << std::hex << ef.bits << std::dec
++                           << " waiters=" << ef.waiters << "\n";
++                }
++                std::fputs(os.str().c_str(), stderr);
++                std::fflush(stderr);
+             }
+-        });
++        }
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
