@@ -112,3 +112,60 @@ Known issues in-game (run 28):
   (VIF/VU1 path suspected). Main next priority: profile (perf) where host time goes.
 - Leftover "Loading" text on the menu (FMV background never decoded, old frame not cleared).
 - No FMV video (IPU missing), no sound (SNDDRV/SPU2 stream only load-emulated).
+
+## Gameplay speed (2026-11-11, prof runs 1-4)
+Profiler: perf is not installed and ptrace_scope=1, so main.cpp has an opt-in SIGPROF sampler:
+BLACKKAT_PROF="start,dur" (1 kHz of process CPU, RIP + 10-frame backtrace) -> blackkat_prof.txt +
+blackkat_prof_maps.txt; report with `python3 tools/prof_report.py blackkat_prof.txt blackkat_prof_maps.txt`.
+Findings (gameplay, one EE thread at ~100% of a core, everything synchronous on it):
+- GS software rasterizer ~55% (GIF -> vertexKick -> GSCpuBackend::DrawTriangle; per-pixel
+  SampleTexture bilinear = 4 swizzled reads + CLUT; the 1-page texture "cache" memcpy'd 8 KB per
+  page change, ~6%; lerpChannel called libm lround per channel).
+- VU1 interpreter ~25-30% (cycle-accurate pipeline model: commitReadyPipelines/calculatePairReadyCycle).
+- IOP emulation ~12-16% (std::map walks in IopKernel::beginNextReady/endTimeslice).
+- Guest EE code small. 0x15B468 loop = frame limiter polling 0x188F60 (vsync counter 0x330D58, +100
+  per vsync via 0x188F48), not a hardware busy-wait. Guest vsync is cycle-paced, so a slow host
+  => slow game clock (~4.9M EE cycles per vsync).
+Changes (runtime lib only, patches/ps2recomp-gs-vu1-speed.patch):
+- lround -> inline round, std::floor -> inline floor; per-row span clipping in DrawTriangle
+  (exact per-pixel test kept); VU1 commitReadyPipelines early-out via file-local min-ready hint
+  (header untouched -> no full rebuild). Default on.
+- Opt-in PS2X_GS_NEAREST=1 (point sampling) and PS2X_GS_TEXCACHE_OFF=1 (direct VRAM texel reads).
+Results (vsync/s in gameplay, t=30..58s): baseline 2.0; defaults-only 2.1; + both opt-ins 2.8.
+Next: move GS rasterization to a worker thread (or GPU backend), VU1 fast (non-cycle-accurate) path,
+IOP ready-queue data structure.
+
+## Real keyboard / gamepad input (2026-11-11)
+
+**Symptom:** on the main menu, holding X on the keyboard did nothing (autopress worked).
+
+**Cause:** `PSPadBackend::readState` (ps2xRuntime `src/lib/ps2_pad.cpp`) was either/or:
+when raylib reported gamepad 0 as available it read **only** that gamepad and skipped the
+keyboard. On this PC raylib/GLFW enumerates three "gamepads": 0 = "Generic X-Box pad"
+(js0, a wireless receiver), 1 = "2.4G XBOX 360 For Windows Keyboard", and 2 = "Logitech G502 X PLUS".
+Gamepad 0 always exists, so the keyboard was never read. The guest path (scePadRead stub →
+0x2AD758 timer pump → 0x687090 → menu) was fine; the multitap shim and autopress (bound
+only when `BLACKKAT_AUTOPRESS` is set) were not involved. IsKeyDown on the EE thread
+reads raylib's CORE key array, which the main loop updates in EndDrawing/PollInputEvents. That is fine.
+
+**Fix (relink-only, patches/ps2recomp-pad-input.patch):** the keyboard is always merged in.
+Buttons from all available gamepads 0–3 are ORed together. Sticks come from the most deflected
+gamepad, with a 0.2 deadzone. KP_ENTER is added as Start.
+`PS2X_PAD_EXCLUSIVE=1` restores the old behaviour.
+
+**Debug env:**
+- `PS2X_PAD_LOG=1` (or `BLACKKAT_PAD_LOG=1`) logs the detected gamepads and every change of
+  kb/gp pressed masks plus data[2..3] and sticks per port.
+- `BLACKKAT_FAKEKEY=x[,enter,down,...]` (src/main.cpp) injects key press/release through
+  raylib's own GLFW key callback, the same path a physical key uses. Timing is set by
+  `BLACKKAT_FAKEKEY_MS`/`_HOLD_MS`/`_DELAY_MS` (default 1500/150/7000).
+
+**Verified:**
+- build/input1_run.log (`PS2X_PAD_EXCLUSIVE=1`): 36 injected X presses and kb never changed.
+  Attract mode looped and the menu was never left.
+- build/input2_run.log (default): `kb=0x4000 -> data[2..3]=ff bf`. Then
+  `FMV frame cb 0x1e8028 -> 0x1`, `FMV abort=1`, MC GetInfo, and
+  `FMV skipped: "SEQ_01_E.MPC"` (New Game started).
+
+Keys: arrows/WASD = d-pad, X/Space = Cross, C = Circle (Esc also closes the window), Z = Square,
+V = Triangle, Q/E = L1/R1, LShift/RShift = L2/R2, Enter = Start, Tab = Select.
