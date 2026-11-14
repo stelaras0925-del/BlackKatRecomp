@@ -386,3 +386,83 @@ The drop is the extra geometry now drawn (2x ~2200-tri sea passes, overlays), no
   those runs (slow, debug only).
 - `PS2X_VIF_STATS=1`: UNPACK format histogram + `[vif:drop]` details. `PS2X_VU1_STATS=1`: VU1 runs cut
   by the cycle budget (0 seen).
+
+## GPU GS backend (stage one): opt-in, `PS2X_GS_GPU=1`
+
+Status: works for the opening ship-deck scene. The CPU rasterizer stays the default and the fallback: unset the variable, or let it fall back automatically if EGL/GL init fails.
+Patch: `patches/ps2recomp-gs-gpu.patch`. Apply it on top of `ps2recomp-geometry-fix.patch`.
+
+**Files (runtime submodule):**
+- `src/lib/gs/gs_gpu_backend.inl` (new): the whole backend. It is `#include`d at the end of `gs_frontend.cpp`, so no CMake change or reconfigure is needed.
+- `src/lib/gs/gs_frontend.cpp`: `makeDefaultRasterBackend()` selects the GPU backend when `PS2X_GS_GPU=1`. The GPU backend is not wrapped in the band threads.
+- `include/runtime/gs/gs_cpu_backend.h` / `.cpp`: two public helpers, `DecodeTextureRgba()` and `ClutHash()`.
+  - This header is only included by gs_frontend.cpp and gs_cpu_backend.cpp, not from `ps2_runtime.h`, so the change is relink-only.
+
+**Design:**
+- One GL thread with a surfaceless EGL context. libEGL is dlopen'ed and GL entry points come from eglGetProcAddress, so nothing new is linked.
+- All backend calls are queued in order. Calls with observable results wait: Present, ReadVram, SnapshotVram, ClearFramebuffer and local->host.
+- An internal `GSCpuBackend` on the same VRAM handles transfers, CLUT loads, texture decode, Present (display conversion) and local->host.
+- Render targets: one 1024x1024 RGBA16F texture per FRAME.fbp, with alpha stored as A/128.
+- Depth: one DEPTH32F texture per ZBUF.zbp, holding z/2^32 clamped to the format max.
+- Blending: dual-source, so As, Ad and FIX all work as GS blend factors, and the ABCD modes map to GL blend func/equation.
+
+**Implemented:**
+- Points, lines, triangles, strips, fans and sprites, with Gouraud or flat colour.
+- TEX0 for CT32/24/16/16S and T8/T4/T8H/T4HL/T4HH via CLUT, decoded on the CPU into an RGBA8 texture cache.
+  - The cache is keyed by TEX0, TEXA and a CLUT hash, and checked against per-8KB-page generation counters.
+- TFX modulate/decal/highlight/highlight2 and TCC.
+- Fog.
+- The ABCD alpha blend modes.
+- Alpha test (all ATST values; AFAIL done as a second pass).
+- DATE/DATM.
+- Z test and write, with format max.
+- Scissor.
+- FBMSK per channel, plus the special case 0x80 on the alpha byte (preserve the MSB).
+- FBA.
+- CT16 1-bit alpha.
+- REPEAT/CLAMP wrap modes.
+- Bilinear filtering when TEX1 asks for it.
+
+**Coherency (simple and correct, not fast):**
+- A target is uploaded VRAM->GPU when it is created or stale.
+- A target is resolved GPU->VRAM (glReadPixels + swizzled write) before:
+  - Present;
+  - ReadVram or SnapshotVram;
+  - any transfer whose source or destination pages overlap it;
+  - any texture or CLUT read from its pages. This covers render-to-texture, e.g. the sea reflection: fb 0x46 to tex 0x8C0 to fb 0x15E to tex 0x2BC0;
+  - local->local copies.
+- CPU-side VRAM writes mark overlapping targets stale.
+
+**Speed** (same ship-deck scene, vsync/s between t~30 s and t~56 s, `BLACKKAT_FAKEKEY=x`):
+- CPU rasterizer (default, 4 band threads): 4.1 vsync/s.
+- GPU: 4.6–4.7 vsync/s.
+- With the GPU backend, the GS work takes about 11% of one thread. The game thread (EE, VIF, VU1 and the GS frontend, all inline) is pegged at 100%. **The GS is no longer the bottleneck;** further speed has to come from the game thread.
+
+**Known gaps / approximations (each is logged once as `[gs:gpu] approximated: ...` when it is hit; none were hit in the ship scene):**
+- Region CLAMP/REPEAT (wrap modes 2/3) are treated as CLAMP/REPEAT, ignoring MINU/MAXU/MINV/MAXV.
+- PABE is ignored.
+- The blend coefficient `1+f` (rare ABCD combinations) is approximated as 1.
+- Partial alpha FBMSK values other than 0x00, 0x80 and 0xFF are handled as all or nothing.
+- Partial RGB FBMSK is per channel only: a channel is written unless its whole byte is masked.
+- COLCLAMP=0 (wrap) is not emulated. Blend results above 1.0 are kept in the float target until a resolve clamps them.
+- DATE and alpha-MSB preservation read a snapshot of the target taken before each batch, so overlapping primitives inside one batch see stale destination alpha.
+- Depth is never resolved to VRAM, so the CPU never sees GPU Z. Z used as a texture, Z readback or Z-to-colour aliasing would be wrong.
+  - New depth buffers start cleared to 0 instead of loading VRAM.
+- Render-to-texture always goes through a CPU resolve and re-decode (no GPU-side copy yet). Local->local moves and readback also go through the CPU.
+- Targets are capped at 1024x1024. Frame widths over 1024 px are clipped.
+- Pixel convention copies the CPU rasterizer (integer XYOFFSET, sample at pixel centre), not exact GS hardware.
+- AA1, dithering (DTHE), SCANMSK and mipmapping (MXL > 0) are not implemented.
+- `PS2X_GS_DRAWLOG` pixel probes still work, but they cost one queue round trip per ReadVram.
+
+**Env:**
+- `PS2X_GS_GPU=1`: enables the GPU backend.
+- `PS2X_GS_GPU_STATS=1`: prints `[gs:gpu:time]` / `[gs:gpu:stats]` every 5 s (worker busy %, producer waits, resolves, uploads, texture decodes).
+- `PS2X_GS_GPU_GLERRORS=1`: checks glGetError after each batch.
+- `PS2X_GS_GPU_DEFAULT_DISPLAY=1`: uses eglGetDisplay(EGL_DEFAULT_DISPLAY) instead of the surfaceless Mesa platform.
+
+**Stage two ideas:**
+1. Resolve less. Copy GPU->GPU when TEX0 matches a target (sample the FBO texture directly with a format/offset view) instead of resolve + decode. Resolve only the displayed buffer at Present.
+2. Present straight from the GPU target (share or blit into raylib's texture) to skip glReadPixels and the CPU display conversion.
+3. Decode textures on the GPU: upload the raw VRAM pages and deswizzle plus CLUT in a shader.
+4. Implement region clamp, PABE, the exact AFAIL/partial FBMSK paths and depth resolve.
+5. The real speed limit is now the game thread: profile and parallelise VU1/VIF, e.g. run VU1 microprograms on their own thread with GIF output queued.
