@@ -169,3 +169,220 @@ gamepad, with a 0.2 deadzone. KP_ENTER is added as Start.
 
 Keys: arrows/WASD = d-pad, X/Space = Cross, C = Circle (Esc also closes the window), Z = Square,
 V = Triangle, Q/E = L1/R1, LShift/RShift = L2/R2, Enter = Start, Tab = Select.
+
+## Gameplay graphics vs the speed patch (2026-11-11, after cf98cfa)
+
+The question was whether the broken water and terrain (teal shards, torn cliffs) came from the speed patch.
+**Answer: no.** All runs below reached the same ship-deck scene (New Game, about 30–58 s), with
+`BLACKKAT_FAKEKEY=x`. Shots are in build/shots/ (copies in ~/blackkat_shots/).
+
+| run | config | look | vsync/s (t 30→59) |
+|---|---|---|---|
+| a | defaults (speed patch on) | same as c | 2.06 |
+| b | `PS2X_GS_NEAREST=1 PS2X_GS_TEXCACHE_OFF=1` | same geometry, blockier textures | 2.83 |
+| c | `PS2X_VU1_NOHINT=1 PS2X_GS_NOSPAN=1 PS2X_GS_NOFASTMATH=1` (= pre-speed code) | reference | 1.85 |
+| d | b + Z clamp/precision fix | same as b | 2.90 |
+| e | defaults + pixel probe | same as a | 1.99 |
+
+Runs a, c and e show the same geometry, draw order and teal patches at the bottom right.
+Camera timing differs between runs, so the comparison is visual, not per pixel.
+Code review agrees:
+- The span bounds are the exact edge functions, widened by one pixel, and the per-pixel test is unchanged.
+- The VU1 hint is only ever lowered at each readyCycle insertion and is recomputed after every full scan.
+- `x+0.5` equals `lround` and `fastFloor` equals `floor` on the ranges used.
+- TEXCACHE_OFF calls the same per-PSM read functions without the page cache.
+
+NEAREST is a visual trade-off: it makes magnified textures, such as water and cliffs, look blocky.
+
+New opt-in debug tools:
+- `PS2X_SHOT=30,40,50` saves the presented frame as PNG at those seconds. Set the file prefix with `PS2X_SHOT_PREFIX=dir/name`.
+- A/B switches that bring back the pre-speed code paths at runtime: `PS2X_VU1_NOHINT=1`, `PS2X_GS_NOSPAN=1`, `PS2X_GS_NOFASTMATH=1`.
+- `PS2X_GS_PROBE="x,y;x,y"` with `PS2X_GS_PROBE_T=sec` logs every pixel write at those framebuffer coordinates for 0.3 s: prim, TEST, ALPHA, TEX0, Z and RGBA.
+- `PS2X_GS_ZSTATS=1` logs Z buffer formats and how many Z values fall outside the format's range.
+
+Z correctness fixes (kept; no visible change in this scene):
+- Packed XYZ2/XYZF2/XYZ3/XYZF3 Z was stored via float, which loses bits above 2^24 on Z32. It is now stored as double.
+- WritePixel now clamps Z to the Z buffer format's maximum before the test and write (Z24 0xFFFFFF, Z16/16S 0xFFFF), as the GS does. `PS2X_GS_ZCLAMP_OFF=1` turns this off.
+- ZSTATS showed no over-range Z in this scene. The main 3D pass uses Z16S at 0x3A, zbp 0xD2, with max Z 0xFFFF.
+
+Probe findings for the terrain and water pixels:
+- Every pixel gets two passes with ALPHA = (Cs−Cd)·As+Cd.
+  - Pass 1: TEX0 0x2FC0 (CT32, 256², tcc=0), TEST 0x30000 = ZTE on, **ZTST=ALWAYS**.
+  - Pass 2: TEX0 0x3660 (CT16, 128², tcc=1), TEST 0x50000 = ZTST GEQUAL.
+- The base terrain pass is therefore not depth-tested at all: whatever draws last wins. Draw order and correct
+  primitive culling matter, not the Z buffer.
+- Next suspects for the sea-battle artefacts (not reachable inside 60 s): VU1 clipping and culling of
+  off-screen vertices (CLIP flag / ADC), and the 16-bit Z16S layout. Probe a sea-battle frame next.
+
+## GS rasterizer on a worker thread (2026-11-11, patches/ps2recomp-gs-thread.patch)
+
+`GSThreadedBackend` lives in gs_frontend.cpp, wrapping GSCpuBackend. It is on by default; `PS2X_GS_SYNC=1` gives the old single-thread path.
+- **Queued in order on one worker:** Submit, LoadClut, BeginTransfer (all directions, including the
+  local→host fill), UploadImage (data copied), TextureFlush and WriteVram.
+- **Drain first (wait for everything queued before the call):** Flush, Sync (FINISH, presentation, reset,
+  debug), Present, ClearFramebuffer, ConsumeLocalToHostBytes (BITBLT readback), ReadVram,
+  SnapshotVram, Reset and Initialize.
+- **No drain:** GetTransferSnapshot, which is debug only.
+- No header changes.
+- `PS2X_GS_THREAD_STATS=1` logs drains per reason, how many waited, and the wait time.
+
+Results (gameplay vsync/s, t≈30→59 s, `BLACKKAT_FAKEKEY=x`):
+
+| config | sync (old) | threaded |
+|---|---|---|
+| defaults | 2.06 (run a) | 2.33 (+13%) |
+| TEXCACHE_OFF | not measured alone; 2.83 with NEAREST too | 2.67 |
+
+- Shots f_thread_* and g_thread_tcoff_50s match the sync shots: same scene, no visual difference.
+- **Bottleneck is now the rasterizer itself.** Stats: about 5 FINISH drains per vsync, and the EE waited about 21 s of 60 s on them.
+- **Tried and rejected: skipping the drain on FINISH.** Run h_thread_nofinish:
+  - The EE ran millions of commands ahead and the host present stalled for about 43 s.
+  - Frames showed exactly the reported corruption: floating hull slabs and teal terrain shards.
+  - Kept the drain. Hypothesis to check: some of Stelios's in-game corruption may be ordering between FINISH,
+    present and VRAM state, not geometry.
+- **Next steps for real speed:**
+  - Split rasterization across N workers by screen tiles or scanline bands.
+  - Run VU1 and GIF ahead with a bounded queue, only once present is double-buffered.
+
+## Banded multi-thread rasterizer (2026-11-11, patches/ps2recomp-gs-bands.patch, on top of gs-thread)
+
+**Design:**
+- Worker k owns framebuffer rows with (y/16) % N == k. Each primitive goes to all N workers, and each
+  submits it once per owned 16-row band with the scissor narrowed to that band.
+- Triangle and sprite interpolation use the unclipped vertices, so pixels are identical to a single
+  thread. Lines and points are rejected per pixel by the scissor.
+- Each worker has its own GSCpuBackend (texture page cache, CLUT) on the shared VRAM.
+- LoadClut and TextureFlush are sent to every worker in stream order.
+- **Barriers:** BeginTransfer, UploadImage and WriteVram are queued barriers. All workers arrive, the last one
+  executes the operation on worker 0's backend, then every texture cache is flushed.
+- **Hazard barriers:** a textured draw whose TEX0 range overlaps frame or Z memory written since the last barrier gets a
+  barrier first (render-to-texture across bands). So does a CLUT load whose CBP overlaps that memory.
+  Ranges are conservative, rounded to 8 KiB pages plus one page.
+- ClearFramebuffer drains everything, then flushes the caches.
+- All earlier drain points stay: FINISH, present, readback, ReadVram and snapshots.
+
+**Settings:** N = min(4, hw threads/2), which is 4 on this 16-thread CPU. `PS2X_GS_THREADS=N` overrides it,
+`PS2X_GS_THREADS=1` gives the single-worker path, and `PS2X_GS_SYNC=1` gives no worker at all.
+
+**Results** (gameplay, t≈30→59 s, `BLACKKAT_FAKEKEY=x`):
+
+| config | vsync/s | CPU (user+sys over 60 s) |
+|---|---|---|
+| PS2X_GS_THREADS=1 (previous build's behaviour) | 2.39 | ≈1.2 cores |
+| 4 bands, defaults | 4.27 (+79%) | ≈2.0 cores |
+| 4 bands + PS2X_GS_TEXCACHE_OFF=1 | 4.33 | — |
+
+- Shots i_thr1_*, j_thr4_* and k_thr4_tcoff_* show no band seams and look the same as the single-thread
+  ones. The faster runs get further into the scene in 60 s, so the camera differs.
+- Barriers per 60 s: 13k with 1 worker, about 127k with 4 (mostly hazards) and 243k with TEXCACHE_OFF.
+- FINISH drains still cost about 5 s of EE wait per run.
+
+The earlier note on the no-FINISH-drain experiment needs correcting. Its odd frame may partly have been a
+later scene, since the game had run further ahead. The 43 s present stall was real.
+
+## VU1 fast mode, first step (2026-11-11, patches/ps2recomp-vu1-fast.patch)
+
+**Status:** opt-in. `PS2X_VU1_FAST=1` turns it on. The built-in default is `kVu1FastDefault=false`;
+`PS2X_VU1_ACCURATE=1` forces the accurate path.
+
+**What it changes:** only XGKICK. The whole PATH1 packet is transferred and submitted at issue, instead of
+one qword per 2 cycles. PATH1 order, flags, Q/P, stalls and E-bit handling are untouched.
+
+**Result:** 4.34 vsync/s against the 4.27 baseline, which is noise. Shot l_vu1fast_50s matches j_thr4_50s, and the run was stable.
+
+**Conclusion:** kick pacing is not the VU1 cost. The cost is the deferred-write design itself:
+- Every pair copies old and new VF/ACC/VI values.
+- Every result is queued into a pipeline, then committed later.
+- calculatePairReadyCycle checks stalls on every pair.
+- advanceTo steps one cycle at a time.
+
+A real fast mode needs a separate straight-through executor:
+- Write VF/VI/ACC directly. Hardware stalls dependent reads, so the values match.
+- Keep only the Q/P and MAC/status/clip flag delay queues, plus the branch VI delay.
+- Run without per-cycle stepping.
+
+That is a larger rewrite of the pair loop in ps2_vu1_core.cpp, not a relink tweak. Not started.
+
+### VU1 straight-through executor (now the default)
+
+**Status:** on by default (`kVu1FastDefault=true`). `PS2X_VU1_ACCURATE=1` reverts to the cycle-accurate VU1;
+`PS2X_VU1_FAST=1` forces fast. Only VU1 is affected, not VU0.
+
+**What changes:**
+- Upper and lower results (VF/ACC/VI) are left in the register file as executed. There is no deferred
+  VF/VI/ACC write queue, no restore/requeue copies, no markPairWrites, and no VF/VI/ACC stall scan.
+- The only stalls left are FDIV/EFU resource use and WAITQ/WAITP. Q/P still go through their latency queues,
+  so DIV/EFU results appear after the proper cycles, counted as one cycle per pair.
+
+**What is kept:** the in-pair shadow (lower sees upper's old dest), the I-bit, MAC/status/clip flag pipelines,
+the store pipeline, the branch VI backup, branch delay slots, the E-bit plus its delay slot, and the D/T halts.
+XGKICK is immediate, in order.
+
+**Decode cache:** none added, since getDecodedInstructionPairForPc already caches per pc.
+
+**Results** (gameplay vsync/s, t≈30→59 s):
+
+| run | vsync/s |
+|---|---|
+| baseline, accurate | 4.27 / 4.34 |
+| m_vu1exec (FAST=1) | 5.37 |
+| n_vu1default (default build) | 5.03 |
+
+That is about +18–25%.
+
+**Visual check:**
+- n_vu1default_50s matches the accurate j_thr4_50s view almost pixel for pixel.
+- m_vu1exec_57s matches the accurate h_thread_nofinish_57s view of the same later scene.
+- The floating hull and flag slabs in the sky appear in both VU1 modes, so they are pre-existing.
+- No crashes and no reserved-instruction reports.
+
+## Broken in-game geometry: FIXED (2026-11-15, patches/ps2recomp-geometry-fix.patch)
+
+Applies on top of gs-ab-shot-probe-z, gs-thread, gs-bands and vu1-fast (same files, relink-only).
+
+**Symptom:** teal water/terrain "shards", cliffs where the sea should be, floating hull/flag slabs, and
+(after the first fix below) fan-shaped stretched triangles and horizontal streaks across the water.
+
+**Root cause 1: DMA chain tag cap (ps2_memory.cpp).** Source-chain DMA gathering stopped after a hard
+`kMaxChainTags = 4096`. The game's VIF1 display list for a gameplay frame is ~1.7 MB with thousands of REF
+tags, so everything after tag 4096 was silently dropped: the sea surface (reflection-mapped, tex 0x2BC0 =
+the 256x256 reflection rendered at the start of the frame), fish/reef overlays etc. never reached VU1/GS.
+What we saw as "water shards" was the teal-tinted underwater terrain (sunken reefs) with no sea over it.
+The cut also left a dangling UNPACK at the end of the buffer (`[vif:drop]`, 36-94 per minute).
+Fix: cap raised to 1<<20 tags (`PS2X_DMA_MAXTAGS=N` overrides, logs `[dma] ... hit tag cap` if reached).
+After the fix: 0 dropped unpacks.
+
+**Root cause 2: VU1 fast mode had no data-hazard stalls (ps2_vu1_core.cpp).** Once the sea was drawn,
+fast mode showed fans/streaks: sea vertices behind the camera (24-bit Z wrapped to ~0xFC0000) were not
+culled. The sea microprogram culls with CLIP + FCAND -> ADC bit. Without stalls the pair loop ran fewer
+cycles between CLIP and FCAND than the hardware does, so FCAND read clip flags that were still in the
+4-cycle flag pipeline. Evidence: ADC kicks on the sea run 1601/2606 in fast mode vs 2035/2202 accurate;
+accurate mode looked right. Fix: fast mode now uses the existing cheap ready-cycle scan
+(calculatePairReadyCycle + markPairWrites) for stall timing; values are still written straight into the
+register file (no deferred-write queues). ADC now 2049/2216, zero out-of-range-Z triangles.
+`PS2X_VU1_FAST_NOSTALL=1` restores the old stall-free fast mode.
+
+**Also corrected (no visible change in this scene, matches PCSX2 Vif_Unpack.cpp):** VIF1 UNPACK
+V2 writes x,y,x,y; V3 takes W from the next stream element; V4-5 expands 5-bit channels (<<3, A->0x80);
+MODE 3 sets ROW = data. `PS2X_VIF_UNPACK_LEGACY=1` restores the old behaviour.
+Not done: VIF0 UNPACK still only handles 32-bit (vl=0) formats; generated code for VCALLMSR (0x2B47DC)
+reads `ctx->vi[27]` out of bounds instead of CMSAR0 (function has no static callers; override if ever hit).
+
+**Speed (gameplay vsync/s, t=30 -> ~56 s, BLACKKAT_FAKEKEY=x):**
+| build | vsync/s | note |
+|---|---|---|
+| before (n_vu1default) | 5.0 | ~half the frame missing |
+| fixed, PS2X_VU1_ACCURATE=1 (w_acc) | 3.6 | full frame |
+| fixed, default fast (x_fast) | 4.2 | full frame |
+The drop is the extra geometry now drawn (2x ~2200-tri sea passes, overlays), not the fixes themselves.
+
+**Shots:** before build/shots/n_vu1default_{30,40,50,57}s.png, after build/shots/x_fast_*.png
+(copies in ~/blackkat_shots/). Accurate reference: ~/blackkat_shots/w_acc_56s.png.
+
+**New debug env (all off by default):**
+- `PS2X_GS_DRAWLOG=sec[,dur]`: log draw runs (`[gs:draw]` with prim/fb/zbuf/tex/test/alpha/scissor,
+  bbox, z range, ADC count) plus `[gs:huge]` for triangles with Z > 0xFFFF.
+- `PS2X_GS_DUMPRUNS=a,b,...` (with DRAWLOG): dump fb + Z (PPM/PGM) to build/shots/dr_<run>_* before
+  those runs (slow, debug only).
+- `PS2X_VIF_STATS=1`: UNPACK format histogram + `[vif:drop]` details. `PS2X_VU1_STATS=1`: VU1 runs cut
+  by the cycle budget (0 seen).
