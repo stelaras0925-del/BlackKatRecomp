@@ -621,3 +621,33 @@ Measured (t=30–56 s, VU1 thread on), VIF writes/s | vsync/s:
 - In-game reached at ~12 s instead of ~15 s.
 - `PS2X_VU1_BC_CHECK=1`: 0 mismatches (CPU 240k runs, GPU 280k runs).
 - CPU GS worker wait for the stage: 640 ms/5 s (pipe off) -> 0 ms (pipe on).
+
+## VU1 zero-result / lower-op fast paths + IOP fast paths (patch: ps2recomp-vu1-lowerops.patch)
+
+Applies on top of `ps2recomp-vu1-loop-iop.patch`. No public header changes (private `iop_memory.h` /
+`iop_kernel.h` only, ~15 IOP TUs).
+
+- **VU1 FMAC zero results** (`ps2_vu1_core.cpp`, fast upper): MUL with a zero operand, ADD of opposites,
+  SUB of equals, and MADD/MSUB with a zero product are handled inline (same signed zero and Z/S flags,
+  product sticky Z|S, as the long-double path). These were ~14% of all upper ops and all fell back to
+  execUpper; generic uppers are now ~0.004%. Revert: `PS2X_VU1_FASTZERO=0`.
+- **VU1 lower ops**: inline copies of NOP, LQ/SQ, LQI/SQI, MOVE, IADDIU/ISUBIU, IADD/IADDI/IAND/IOR,
+  IBEQ/IBNE in the run loop (everything else -> execLower). Revert: `PS2X_VU1_FASTLOWER=0`.
+  OPMSUB/OPMULA turned out to be ~0% of executed uppers here, so they are not specialised.
+- **IOP** (`iop_emulator.cpp`, `iop_cpu.cpp`, `iop_memory.h`, `iop_kernel.*`): the EE runs the IOP for
+  ~1 IOP cycle per EE dispatch (avg 3.8 IOP instructions per timeslice), so per-instruction and
+  per-slice overhead dominated. Added: inline `jr ra` pre-check before the import-stub decode, inline
+  DMA-start flag check, a due-cycle guard (`dmaMinDue`, only ever stale-low) for the pending DMA
+  interrupt map scan, inline RAM fetch (`IopMemory::fetch32`), and a dead-thread flag so
+  `cleanupDeadThreads` skips its scan. All produce the same result as before. Revert: `PS2X_IOP_FASTPATH=0`
+  (the dead flag follows `PS2X_IOP_FASTSCHED=0`).
+- **Experimental, default off:** `PS2X_IOP_QUANTUM=N` runs the IOP only once N IOP cycles are owed.
+  N=32 gave GPU vsync/s 36.7 -> 46.6 and in-game looked fine, but it changes EE/IOP interleaving and
+  can't be checked automatically (audio/SIF timing), so it is opt-in.
+- Diagnostics: `PS2X_VU1_OPSTATS=1` (upper generic/fast + lower op histogram), `PS2X_IOP_PCSTATS=1`
+  (hot IOP PCs, timeslice length).
+
+Measured (t=30–56 s, VU1 thread on), VIF writes/s | vsync/s:
+- GPU GS: 15.59 | 28.26 (7b97dc8) -> 17.40 | 36.67
+- CPU GS: 9.44 | 19.90 (7b97dc8) -> 9.44 | 24.55 (CPU GS rasteriser-bound)
+- `PS2X_VU1_BC_CHECK=1`: 0 mismatches (GPU 280k runs, CPU 240k runs).
