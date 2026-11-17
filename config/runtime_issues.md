@@ -559,3 +559,43 @@ Visuals (sea, terrain, ship) match the baseline; `PS2X_VU1_ACCURATE=1` still run
 Next steps: translator/block cache for 0x2c18/0x1ee0/0x2460, per-block flag liveness
 (skip MAC/status work when no FMAND/FSAND/... reads them before overwrite), splitting the GS
 frontend off the VU1 worker.
+
+## VU1 block cache + GS stage (patches/ps2recomp-vu1-blockcache.patch, default on)
+
+Revert switches: `PS2X_VU1_BLOCKCACHE=0` (VU1 part, also implied by `PS2X_VU1_JIT=0`),
+`PS2X_GS_STAGE=0` (GS stage). Validation: `PS2X_VU1_BC_CHECK=1` runs every VU1 program twice
+(copy of the interpreter on the reference path with XGKICK only hashed, VU data restored, then
+the real run with the block cache) and compares VF/VI/ACC/Q/P/I/R, MAC/status/clip, pc, cycles,
+control state, VU data memory and the XGKICK packet stream. `PS2X_VU1_BC_BREAK=1` perturbs one
+lane on purpose to prove the checker fires. `PS2X_VU1_BC_STATS=1` prints translation/skip counts.
+
+VU1 block cache (ps2_vu1_core.cpp only, header untouched):
+- per micro-memory image translation, keyed by a 64-bit FNV hash of the code (reused when the
+  same microcode is uploaded again; this game uploads one 2048-pair image, translated once);
+- FMAC flag liveness: an FMAC MAC/status entry is dead when the next flag-writing FMAC on the
+  straight-line path (<= 8 pairs, no branch/E-bit/D/T in between, not a delay slot) overwrites it
+  and no FSEQ/FSAND/FSOR/FMEQ/FMAND/FMOR/FSSET can run before that entry commits (window to
+  j+3 pairs; program end is fine because everything flushes in order). Dead entries are not
+  queued; their sticky bits are carried into the next entry. Runtime guard: only with >= 1024
+  cycles of budget left. 553 of 685 flag-writing FMACs are dead (~15 M skipped entries/s);
+- specialised FMAC upper handler (ADD/SUB/MUL/MADD/MSUB bc/q/i/vector, VF or ACC dest) when all
+  written lanes are in the fast-flag range; anything else falls back to execUpper unchanged;
+- flag/store pipeline commits visit only valid slots (thread_local valid masks per instance,
+  same slot order), XGKICK qword copy by memcpy, 64 KB XGKICK buffer not re-zeroed per program,
+  decoded-cache currency checked once per run.
+Check results: 0 mismatches over 240k (GPU), 160k (CPU) and 100k (thread off) compared runs.
+
+GS stage (ps2_vu1_async.h/.inl, ps2_memory.cpp): on the VU1 worker, GIF arbiter submit/drain
+calls (GIF parsing + GS backend) are copied into an ordered queue run by a "GSStage" thread;
+the PATH3 mask logic stays on the worker; the worker waits for the stage at the end of each
+job, so DMA completions are still published after their GS work (EE drains unchanged). The
+stage thread counts as "worker" for drainIfOffWorker. Gains: CPU GS +11% (frontend/CPU raster
+setup was ~40% of a core), GPU GS neutral (frontend only ~5% of the worker there).
+
+Speed (vifw/s, t=30-56 s, thread on): CPU GS 7.28 -> 8.78, GPU GS 10.75 -> 13.44; thread off:
+CPU 4.92 -> 5.23, GPU 6.30 -> 7.27. Worker is still ~95% busy with GPU GS (VU1 run loop,
+ready-cycle scan, generic execUpper for MAX/MINI/FTOI/CLIP/OPMSUB, execLower).
+Next: per-pair precomputed stall read lists / fused run loop, specialised lower handlers
+(LQ/SQ/IADDIU/branches), CLIP/MAX/MINI/FTOI fast handlers, batching GS stage ops (CPU GS stage
+is now ~40% busy and the worker waits on it), the EE thread's IOP emulation
+(IopKernel::beginNextReady iterates a std::map: ~30% of the EE thread).

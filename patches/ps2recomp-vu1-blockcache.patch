@@ -1,0 +1,959 @@
+# PS2Recomp runtime: VU1 block cache (per-image translation keyed by a micro-memory hash: FMAC flag liveness,
+# specialised FMAC upper handler, valid-slot pipeline commits) + GS stage thread for GIF/GS work off the VU1 worker.
+# Default on; PS2X_VU1_BLOCKCACHE=0 / PS2X_GS_STAGE=0 revert. Check mode: PS2X_VU1_BC_CHECK=1, stats PS2X_VU1_BC_STATS=1.
+# Apply on top of ps2recomp-vu1-jit.patch, from third_party/PS2Recomp: git apply ../../patches/ps2recomp-vu1-blockcache.patch
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 3861128..0a6ccd0 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2004,6 +2004,8 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+ 
+     auto emit = [&](const uint8_t *packetData, uint32_t packetSize)
+     {
++        if (m_gifArbiter && ps2x_vu1async::gsDeferSubmit(*this, static_cast<uint32_t>(GifPathId::Path3), packetData, packetSize, false))
++            return;
+         if (m_gifArbiter)
+             m_gifArbiter->submit(GifPathId::Path3, packetData, packetSize, false);
+         else if (m_gifPacketCallback)
+@@ -2017,7 +2019,7 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+     }
+     m_path3MaskedFifo.clear();
+ 
+-    if (m_gifArbiter && drainImmediately)
++    if (m_gifArbiter && drainImmediately && !ps2x_vu1async::gsDeferDrain(*this))
+         m_gifArbiter->drain();
+ }
+ 
+@@ -2037,11 +2039,14 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+     }
+ 
+     if (m_gifArbiter)
+-        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
++    {
++        if (!ps2x_vu1async::gsDeferSubmit(*this, static_cast<uint32_t>(pathId), data, sizeBytes, path2DirectHl))
++            m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
++    }
+     else if (m_gifPacketCallback)
+         m_gifPacketCallback(data, sizeBytes);
+ 
+-    if (m_gifArbiter && drainImmediately)
++    if (m_gifArbiter && drainImmediately && !ps2x_vu1async::gsDeferDrain(*this))
+         m_gifArbiter->drain();
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_vu1_async.h b/ps2xRuntime/src/lib/ps2_vu1_async.h
+index cb200ab..5adf17f 100644
+--- a/ps2xRuntime/src/lib/ps2_vu1_async.h
++++ b/ps2xRuntime/src/lib/ps2_vu1_async.h
+@@ -34,6 +34,14 @@ namespace ps2x_vu1async
+     // CHCR read of a channel with a job in flight: returns true and the value to report
+     // (STR still set), or drains first when PS2X_VU1_THREAD_DRAIN_ON_POLL=1 and returns false.
+     bool chcrReadWhileBusy(PS2Memory &mem, uint32_t address, uint32_t &value);
++
++    // GS stage (default on with the worker; PS2X_GS_STAGE=0 disables): on the VU1 worker, GIF
++    // arbiter submits/drains (GIF packet parsing + GS backend calls) are queued to a separate
++    // "GSStage" thread in order instead of running inline; the worker waits for the stage at
++    // the end of every job, so DMA completions are still published after their GS work.
++    // Return false when the call must run directly (not on the worker, stage off).
++    bool gsDeferSubmit(PS2Memory &mem, uint32_t pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl);
++    bool gsDeferDrain(PS2Memory &mem);
+ }
+ 
+ // Perf counters for [run:tick] (defined in ps2_memory.cpp).
+diff --git a/ps2xRuntime/src/lib/ps2_vu1_async.inl b/ps2xRuntime/src/lib/ps2_vu1_async.inl
+index adc6470..5758b6b 100644
+--- a/ps2xRuntime/src/lib/ps2_vu1_async.inl
++++ b/ps2xRuntime/src/lib/ps2_vu1_async.inl
+@@ -117,6 +117,120 @@ namespace ps2x_vu1async
+                                              .count());
+         }
+ 
++        // ---- GS stage ------------------------------------------------------------------------
++        thread_local bool tlsIsGsStage = false;
++        struct GsOp
++        {
++            bool drain = false;
++            bool hl = false;
++            uint32_t path = 0;
++            std::vector<uint8_t> data;
++        };
++        struct GsStage
++        {
++            std::mutex m;
++            std::condition_variable workCv;
++            std::condition_variable doneCv;
++            std::deque<GsOp> queue;
++            uint64_t pushed = 0; // guarded by m
++            uint64_t done = 0;   // guarded by m
++            PS2Memory *mem = nullptr;
++            bool started = false;
++            std::atomic<uint64_t> busyNs{0};
++            std::atomic<uint64_t> waitNs{0};
++            std::atomic<uint64_t> ops{0};
++        };
++        GsStage &gsStage()
++        {
++            static GsStage *g = new GsStage(); // never destroyed: the thread is detached
++            return *g;
++        }
++        bool gsStageOn();
++        uint64_t nowNs();
++
++        void gsStageMain()
++        {
++            GsStage &g = gsStage();
++            tlsIsWorker = true; // GS code run here must not drain the worker (it waits for us)
++            tlsIsGsStage = true;
++            pthread_setname_np(pthread_self(), "GSStage");
++            std::vector<GsOp> batch;
++            for (;;)
++            {
++                PS2Memory *mem = nullptr;
++                {
++                    std::unique_lock<std::mutex> lk(g.m);
++                    g.workCv.wait(lk, [&]() { return !g.queue.empty(); });
++                    batch.clear();
++                    while (!g.queue.empty())
++                    {
++                        batch.push_back(std::move(g.queue.front()));
++                        g.queue.pop_front();
++                    }
++                    mem = g.mem;
++                }
++                const uint64_t t0 = nowNs();
++                for (GsOp &op : batch)
++                {
++                    try
++                    {
++                        if (!mem || !mem->m_gifArbiter)
++                            continue;
++                        if (op.drain)
++                            mem->m_gifArbiter->drain();
++                        else
++                            mem->m_gifArbiter->submit(static_cast<GifPathId>(op.path), op.data.data(),
++                                                      static_cast<uint32_t>(op.data.size()), op.hl);
++                    }
++                    catch (const std::exception &e)
++                    {
++                        std::fprintf(stderr, "[gsstage] op threw: %s\n", e.what());
++                    }
++                }
++                g.busyNs.fetch_add(nowNs() - t0, std::memory_order_relaxed);
++                {
++                    std::lock_guard<std::mutex> lk(g.m);
++                    g.done += batch.size();
++                }
++                g.doneCv.notify_all();
++            }
++        }
++
++        void gsStagePush(PS2Memory &mem, GsOp &&op)
++        {
++            GsStage &g = gsStage();
++            bool wake = false;
++            {
++                std::lock_guard<std::mutex> lk(g.m);
++                if (!g.started)
++                {
++                    g.started = true;
++                    std::thread(gsStageMain).detach();
++                    std::fprintf(stderr, "[gsstage] GS stage thread started (PS2X_GS_STAGE=0 disables)\n");
++                }
++                g.mem = &mem;
++                wake = g.queue.empty();
++                g.queue.push_back(std::move(op));
++                ++g.pushed;
++            }
++            g.ops.fetch_add(1, std::memory_order_relaxed);
++            if (wake)
++                g.workCv.notify_one();
++        }
++
++        // Worker: wait until the GS stage has run every op queued so far.
++        void gsStageWait()
++        {
++            GsStage &g = gsStage();
++            const uint64_t t0 = nowNs();
++            std::unique_lock<std::mutex> lk(g.m);
++            if (g.done >= g.pushed)
++                return;
++            g.doneCv.wait(lk, [&]() { return g.done >= g.pushed; });
++            lk.unlock();
++            g.waitNs.fetch_add(nowNs() - t0, std::memory_order_relaxed);
++        }
++
+         void runJobItems(PS2Memory *mem, const Job &job)
+         {
+             for (const Item &it : job.items)
+@@ -134,8 +248,10 @@ namespace ps2x_vu1async
+                     mem->processVIF1Data(it.data.data(), static_cast<uint32_t>(it.data.size()));
+                 }
+             }
+-            if (mem->m_gifArbiter)
++            if (mem->m_gifArbiter && !gsDeferDrain(*mem))
+                 mem->m_gifArbiter->drain();
++            if (tlsIsWorker && gsStageOn())
++                gsStageWait();
+         }
+ 
+         void workerMain()
+@@ -236,6 +352,10 @@ namespace ps2x_vu1async
+                          s.jobBytes.exchange(0) / 1048576.0, 100.0 * (s.workerBusyNs.exchange(0) / 1e9) / span,
+                          (unsigned long long)s.drains.exchange(0), (unsigned long long)s.drainsWaited.exchange(0),
+                          s.drainWaitNs.exchange(0) / 1e6, (unsigned long long)s.busyPolls.exchange(0), (unsigned long long)s.inlineGif.exchange(0), reasons.c_str());
++            if (gsStageOn())
++                std::fprintf(stderr, "[vu1thread:stats] GS stage busy %.0f%%, worker waited %.0f ms for it, %llu ops\n",
++                             100.0 * (gsStage().busyNs.exchange(0) / 1e9) / span, gsStage().waitNs.exchange(0) / 1e6,
++                             (unsigned long long)gsStage().ops.exchange(0));
+             if (traceOn() && !s.traceKeys.empty())
+             {
+                 std::vector<std::pair<uint64_t, std::string>> v;
+@@ -323,6 +443,40 @@ namespace ps2x_vu1async
+         return tlsIsWorker;
+     }
+ 
++    namespace
++    {
++        bool gsStageOn()
++        {
++            static const bool on = []() {
++                const char *e = std::getenv("PS2X_GS_STAGE");
++                return !(e && e[0] == '0');
++            }();
++            return on && enabled();
++        }
++    }
++
++    bool gsDeferSubmit(PS2Memory &mem, uint32_t pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
++    {
++        if (!tlsIsWorker || tlsIsGsStage || !gsStageOn() || !data)
++            return false;
++        GsOp op;
++        op.path = pathId;
++        op.hl = path2DirectHl;
++        op.data.assign(data, data + sizeBytes);
++        gsStagePush(mem, std::move(op));
++        return true;
++    }
++
++    bool gsDeferDrain(PS2Memory &mem)
++    {
++        if (!tlsIsWorker || tlsIsGsStage || !gsStageOn())
++            return false;
++        GsOp op;
++        op.drain = true;
++        gsStagePush(mem, std::move(op));
++        return true;
++    }
++
+     void setNotify(std::function<void()> fn)
+     {
+         State &s = st();
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index c3d6a49..1e3c4a3 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -16,6 +16,8 @@
+ #include <chrono>
+ #include <unordered_map>
+ #include <vector>
++#include <atomic>
++#include <memory>
+ #include <ps2_log.h>
+ 
+ namespace
+@@ -198,6 +200,105 @@ namespace
+     }
+ }
+ 
++
++namespace
++{
++    // ---- VU1 block cache (patches/ps2recomp-vu1-blockcache.patch) ----------------------------
++    // A translation of one VU1 micro-memory image, keyed by a hash of its bytes (so re-uploading
++    // the same microcode reuses it), built from the decoded pairs. Today it carries per-pair
++    // FMAC flag liveness: an FMAC whose MAC/status flag-pipeline entry is provably never
++    // observed (the next flag-writing FMAC on the straight-line path overwrites MAC and the
++    // current status bits before any FSxx/FMxx reader or FSSET could run) does not queue an
++    // entry; its sticky bits are carried into that next entry, which commits them at a point
++    // where nothing can tell the difference. PS2X_VU1_BLOCKCACHE=0 disables it,
++    // PS2X_VU1_BC_CHECK=1 runs every VU1 program twice (reference path vs block cache) and
++    // compares registers, flags, cycles, VU data memory and the XGKICK packets.
++    bool vu1BlockCacheOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_BLOCKCACHE"); return !(e && e[0] == '0') && vu1JitOn(); }();
++        return on;
++    }
++    bool vu1BcCheck()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_BC_CHECK"); return e && e[0] == '1'; }();
++        return on;
++    }
++    bool vu1BcStats()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_BC_STATS"); return (e && e[0] == '1') || vu1BcCheck(); }();
++        return on;
++    }
++    struct Vu1Xlat
++    {
++        std::vector<uint8_t> flagDead; // per pair index
++        uint32_t writers = 0;
++        uint32_t dead = 0;
++    };
++    struct Vu1XlatCur
++    {
++        const void *owner = nullptr;
++        const uint8_t *code = nullptr;
++        uint64_t generation = 0;
++        uint32_t codeSize = 0;
++        const Vu1Xlat *xlat = nullptr;
++    };
++    thread_local Vu1XlatCur tl_xlCur;
++    thread_local std::unordered_map<uint64_t, std::unique_ptr<Vu1Xlat>> *tl_xlCache = nullptr;
++    // Set for the duration of one run() of the owner instance.
++    thread_local const void *tl_runOwner = nullptr;
++    thread_local const Vu1Xlat *tl_runXlat = nullptr;
++    thread_local uint64_t tl_runBudgetEnd = 0;
++    thread_local bool tl_bcSuppress = false; // reference run of the check mode
++    // Sticky bits of skipped FMAC entries, folded into the next queued FMAC entry.
++    thread_local const void *tl_carryOwner = nullptr;
++    thread_local uint32_t tl_carry = 0;
++    // XGKICK capture for the check mode: 0 = normal, 1 = hash only (reference run), 2 = hash + submit.
++    thread_local int tl_gifMode = 0;
++    thread_local uint64_t tl_gifHash = 0;
++    thread_local uint64_t tl_gifCount = 0;
++    std::atomic<uint64_t> g_bcTranslations{0}, g_bcReuse{0}, g_bcSkipped{0}, g_bcQueued{0};
++
++    // Valid-slot masks of the flag and store pipelines for the instance that owns them on this
++    // thread (rebuilt from the arrays whenever another instance used them in between).
++    struct Vu1PipeMask
++    {
++        const void *owner = nullptr;
++        uint32_t flag = 0;
++        uint32_t store = 0;
++    };
++    thread_local Vu1PipeMask tl_pm;
++
++    inline uint64_t vu1Fnv(const uint8_t *p, size_t n, uint64_t h = 1469598103934665603ull)
++    {
++        for (size_t k = 0; k < n; ++k)
++            h = (h ^ p[k]) * 1099511628211ull;
++        return h;
++    }
++    // Upper instructions that queue an FMAC MAC/status entry (applyFmacDest/applyFmacDestAcc with dest != 0).
++    inline bool vu1UpperWritesFmacFlags(uint32_t upper)
++    {
++        if (DEST(upper) == 0u)
++            return false;
++        const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
++        if (op <= 0x2Fu)
++            return !((op >= 0x10u && op <= 0x17u) || op == 0x1Du || op == 0x1Fu || op == 0x2Bu || op == 0x2Fu);
++        if (op >= 0x3Cu)
++        {
++            const uint8_t sp = static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
++            return sp <= 0x0Fu || (sp >= 0x18u && sp <= 0x1Cu) || sp == 0x1Eu ||
++                   (sp >= 0x20u && sp <= 0x2Au) || (sp >= 0x2Cu && sp <= 0x2Eu);
++        }
++        return false;
++    }
++    // Lower instructions that read MAC/status (FSEQ/FSAND/FSOR/FMEQ/FMAND/FMOR) or write it (FSSET).
++    inline bool vu1LowerTouchesFmacFlags(uint32_t lower)
++    {
++        const uint32_t opHi = (lower >> 25) & 0x7Fu;
++        return opHi == 0x14u || opHi == 0x15u || opHi == 0x16u || opHi == 0x17u ||
++               opHi == 0x18u || opHi == 0x1Au || opHi == 0x1Bu;
++    }
++}
++
+ namespace
+ {
+     constexpr uint8_t laneForComponent(uint32_t component)
+@@ -257,7 +358,25 @@ void VU1Interpreter::resetScheduler()
+     m_vfWritePipeline = {};
+     m_viWritePipeline = {};
+     m_accWritePipeline = {};
+-    m_xgkick = {};
++    if (vu1BlockCacheOn() && !tl_bcSuppress)
++    {
++        // Same as m_xgkick = {} except the 64 KB packet buffer, which is only ever read
++        // below copiedBytes (written first by progressXgkick).
++        m_xgkick.sourceAddress = 0;
++        m_xgkick.totalBytes = 0;
++        m_xgkick.copiedBytes = 0;
++        m_xgkick.currentTagEnd = 0;
++        m_xgkick.cycleCredit = 0;
++        m_xgkick.issueCycle = 0;
++        m_xgkick.active = false;
++        m_xgkick.currentTagEop = false;
++    }
++    else
++        m_xgkick = {};
++    if (tl_carryOwner == this)
++        tl_carry = 0u;
++    if (tl_pm.owner == this)
++        tl_pm.flag = tl_pm.store = 0u;
+     m_vfReady = {};
+     m_viReady = {};
+     m_accReady = {};
+@@ -749,6 +868,34 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     if (dest == 0u)
+         return;
+ 
++    if (tl_runXlat && tl_runOwner == this && !tl_bcSuppress)
++    {
++        const uint32_t pairIndex = m_state.pc / 8u;
++        if (pairIndex < tl_runXlat->flagDead.size() && tl_runXlat->flagDead[pairIndex] &&
++            m_cycle + 1024u < tl_runBudgetEnd && !m_stopRequested)
++        {
++            // Dead entry: only its sticky contribution survives (see Vu1Xlat).
++            uint32_t sticky = extraSticky;
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((dest & laneForComponent(component)) != 0u)
++                    sticky |= laneFlags[component];
++            if (tl_carryOwner != this)
++            {
++                tl_carryOwner = this;
++                tl_carry = 0u;
++            }
++            tl_carry |= sticky & 0xFu;
++            if (vu1BcStats())
++                g_bcSkipped.fetch_add(1, std::memory_order_relaxed);
++            return;
++        }
++    }
++    if (tl_carryOwner == this && tl_carry != 0u)
++    {
++        extraSticky |= tl_carry;
++        tl_carry = 0u;
++    }
++
+     uint32_t mac = 0u;
+     uint32_t status = 0u;
+     for (uint32_t component = 0; component < 4u; ++component)
+@@ -786,6 +933,8 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+ 
+     *entry = {};
+     entry->valid = true;
++    if (tl_pm.owner == this)
++        tl_pm.flag |= 1u << static_cast<uint32_t>(entry - m_flagPipeline.data());
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
+     vu1NoteReady(this, entry->readyCycle);
+@@ -826,6 +975,8 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+         {
+             entry = {};
+             entry.valid = true;
++            if (tl_pm.owner == this)
++                tl_pm.flag |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
+             vu1NoteReady(this, entry.readyCycle);
+@@ -846,6 +997,8 @@ void VU1Interpreter::queueClip(uint32_t clip)
+         {
+             entry = {};
+             entry.valid = true;
++            if (tl_pm.owner == this)
++                tl_pm.flag |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
+             vu1NoteReady(this, entry.readyCycle);
+@@ -871,6 +1024,8 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+         {
+             entry = {};
+             entry.valid = true;
++            if (tl_pm.owner == this)
++                tl_pm.flag |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
+             vu1NoteReady(this, entry.readyCycle);
+@@ -920,6 +1075,8 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         if (!store.valid)
+         {
+             store.valid = true;
++            if (tl_pm.owner == this)
++                tl_pm.store |= 1u << static_cast<uint32_t>(&store - m_storePipeline.data());
+             store.readyCycle = m_cycle + 1u;
+             vu1NoteReady(this, store.readyCycle);
+             store.address = address;
+@@ -1012,6 +1169,97 @@ void VU1Interpreter::commitReadyPipelines()
+     static const bool s_noHint = []() { const char *e = std::getenv("PS2X_VU1_NOHINT"); return e && e[0] == '1'; }();
+     if (!s_noHint && g_vu1HintOwner == this && m_cycle < g_vu1CommitHint)
+         return;
++    static const bool s_maskCommit = vu1BlockCacheOn() && vu1FastMode();
++    if (s_maskCommit && m_unit == Unit::VU1 && !tl_bcSuppress)
++    {
++        // Same commits in the same (slot) order as below, visiting only valid slots. VU1 fast
++        // mode never uses the VF/VI/ACC write pipelines.
++        if (tl_pm.owner != this)
++        {
++            tl_pm.owner = this;
++            tl_pm.flag = tl_pm.store = 0u;
++            for (uint32_t k = 0; k < kMaxFlagEntries; ++k)
++                if (m_flagPipeline[k].valid)
++                    tl_pm.flag |= 1u << k;
++            for (uint32_t k = 0; k < kMaxPendingStores; ++k)
++                if (m_storePipeline[k].valid)
++                    tl_pm.store |= 1u << k;
++        }
++        uint64_t next = ~0ull;
++        for (uint32_t m = tl_pm.flag; m != 0u; m &= m - 1u)
++        {
++            const uint32_t k = static_cast<uint32_t>(__builtin_ctz(m));
++            FlagPipelineEntry &entry = m_flagPipeline[k];
++            if (entry.readyCycle > m_cycle)
++            {
++                next = std::min(next, entry.readyCycle);
++                continue;
++            }
++            if (entry.writesMac)
++                m_state.mac = entry.mac;
++            if (entry.writesStatus)
++            {
++                const uint32_t current = entry.status & 0xFu;
++                m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
++            }
++            if (entry.writesSticky)
++                m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
++            if (entry.writesClip)
++                m_state.clip = entry.clip;
++            entry = {};
++            tl_pm.flag &= ~(1u << k);
++        }
++        if (m_fdiv.valid)
++        {
++            if (m_fdiv.readyCycle <= m_cycle)
++            {
++                m_state.q = m_fdiv.value;
++                const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
++                m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
++                m_fdiv = {};
++            }
++            else
++                next = std::min(next, m_fdiv.readyCycle);
++        }
++        for (ScalarPipelineEntry &entry : m_efu)
++        {
++            if (!entry.valid)
++                continue;
++            if (entry.readyCycle <= m_cycle)
++            {
++                m_state.p = entry.value;
++                entry = {};
++            }
++            else
++                next = std::min(next, entry.readyCycle);
++        }
++        for (uint32_t m = tl_pm.store; m != 0u; m &= m - 1u)
++        {
++            const uint32_t k = static_cast<uint32_t>(__builtin_ctz(m));
++            PendingStore &store = m_storePipeline[k];
++            if (store.readyCycle > m_cycle)
++            {
++                next = std::min(next, store.readyCycle);
++                continue;
++            }
++            if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
++            {
++                uint32_t oldWords[4]{};
++                std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
++                for (uint32_t component = 0; component < 4u; ++component)
++                {
++                    if ((store.laneMask & laneForComponent(component)) != 0u)
++                        oldWords[component] = store.words[component];
++                }
++                std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
++            }
++            store = {};
++            tl_pm.store &= ~(1u << k);
++        }
++        g_vu1HintOwner = this;
++        g_vu1CommitHint = next;
++        return;
++    }
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+         if (!entry.valid || entry.readyCycle > m_cycle)
+@@ -1153,6 +1401,10 @@ void VU1Interpreter::progressXgkick()
+         }
+ 
+         const uint32_t qwordOffset = m_xgkick.copiedBytes;
++        const uint32_t source0 = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
++        if (vu1BlockCacheOn() && !tl_bcSuppress && source0 + 16u <= m_activeVuDataSize)
++            std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + source0, 16u);
++        else
+         for (uint32_t i = 0; i < 16u; ++i)
+         {
+             const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
+@@ -1215,6 +1467,16 @@ void VU1Interpreter::finishXgkick()
+     if (!m_xgkick.active)
+         return;
+ 
++    if (tl_gifMode != 0)
++    {
++        tl_gifHash = vu1Fnv(m_xgkick.packet.data(), m_xgkick.totalBytes, tl_gifHash ^ m_xgkick.totalBytes);
++        ++tl_gifCount;
++        if (tl_gifMode == 1)
++        {
++            m_xgkick.active = false;
++            return;
++        }
++    }
+     if (m_activeMemory)
+         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+     else if (m_activeGs)
+@@ -1949,6 +2211,61 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
+ {
++    static thread_local bool tl_inBcCheck = false;
++    if (vu1BcCheck() && vu1BlockCacheOn() && !tl_inBcCheck && m_unit == Unit::VU1 && vu1FastMode() && vuData && dataSize)
++    {
++        // PS2X_VU1_BC_CHECK=1: run a copy on the reference path (block cache off, XGKICK only
++        // hashed), restore VU data memory, run for real with the block cache, compare.
++        static thread_local VU1Interpreter *ref = nullptr;
++        static thread_local uint64_t s_checked = 0, s_bad = 0, s_unended = 0;
++        if (!ref)
++            ref = new VU1Interpreter(Unit::VU1);
++        *ref = *this;
++        std::vector<uint8_t> before(vuData, vuData + dataSize);
++        tl_inBcCheck = true;
++        tl_bcSuppress = true;
++        tl_gifMode = 1;
++        tl_gifHash = 0;
++        tl_gifCount = 0;
++        ref->run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++        tl_bcSuppress = false;
++        const uint64_t refHash = tl_gifHash, refCount = tl_gifCount;
++        std::vector<uint8_t> refData(vuData, vuData + dataSize);
++        std::memcpy(vuData, before.data(), dataSize);
++        tl_gifMode = 2;
++        tl_gifHash = 0;
++        tl_gifCount = 0;
++        const uint32_t startPc = m_state.pc;
++        run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++        tl_gifMode = 0;
++        tl_inBcCheck = false;
++        const VU1State &a = ref->m_state, &b = m_state;
++        const char *what = nullptr;
++        if (std::memcmp(a.vf, b.vf, sizeof(a.vf)) != 0) what = "vf";
++        else if (std::memcmp(a.vi, b.vi, sizeof(a.vi)) != 0) what = "vi";
++        else if (std::memcmp(a.acc, b.acc, sizeof(a.acc)) != 0) what = "acc";
++        else if (std::memcmp(&a.q, &b.q, 4) || std::memcmp(&a.p, &b.p, 4) || std::memcmp(&a.i, &b.i, 4) || a.r != b.r) what = "q/p/i/r";
++        else if (a.mac != b.mac) what = "mac";
++        else if (a.status != b.status) what = "status";
++        else if (a.clip != b.clip) what = "clip";
++        else if (a.pc != b.pc || a.cycles != b.cycles || ref->m_cycle != m_cycle) what = "pc/cycles";
++        else if (a.ebit != b.ebit || a.haltAfterDelaySlot != b.haltAfterDelaySlot || a.stoppedByD != b.stoppedByD ||
++                 a.stoppedByT != b.stoppedByT || a.branchPending != b.branchPending ||
++                 a.branchTarget != b.branchTarget || a.branchDelay != b.branchDelay) what = "control";
++        else if (refHash != tl_gifHash || refCount != tl_gifCount) what = "xgkick";
++        else if (std::memcmp(refData.data(), vuData, dataSize) != 0) what = "vudata";
++        ++s_checked;
++        if (pipelinesPending())
++            ++s_unended;
++        if (what && ++s_bad <= 20)
++            std::fprintf(stderr, "[vu1:bccheck] MISMATCH %s start pc=0x%04x end pc=0x%04x/0x%04x mac %04x/%04x status %03x/%03x cycles %llu/%llu\n",
++                         what, startPc, a.pc, b.pc, a.mac, b.mac, a.status, b.status,
++                         (unsigned long long)ref->m_cycle, (unsigned long long)m_cycle);
++        if ((s_checked % 20000u) == 0u)
++            std::fprintf(stderr, "[vu1:bccheck] %llu runs compared, %llu mismatches (%llu with pipelines pending)\n",
++                         (unsigned long long)s_checked, (unsigned long long)s_bad, (unsigned long long)s_unended);
++        return;
++    }
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+@@ -1962,8 +2279,233 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const bool s_vu1Prof = vu1ProfOn() && m_unit == Unit::VU1;
+     const uint32_t profStartPc = m_state.pc;
+     const uint64_t profStartCycle = m_cycle;
++
++    const void *const savedRunOwner = tl_runOwner;
++    const Vu1Xlat *const savedRunXlat = tl_runXlat;
++    const uint64_t savedRunBudget = tl_runBudgetEnd;
++    tl_runOwner = this;
++    tl_runXlat = nullptr;
++    tl_runBudgetEnd = budgetEnd;
++    if (fastMode && vu1BlockCacheOn() && !tl_bcSuppress && memory && vuCode == memory->getVU1Code())
++    {
++        const uint64_t gen = memory->getVU1CodeGeneration();
++        if (tl_xlCur.owner == this && tl_xlCur.code == vuCode && tl_xlCur.generation == gen && tl_xlCur.codeSize == codeSize)
++            tl_runXlat = tl_xlCur.xlat;
++        else
++        {
++            if (!(m_decodedCodeCacheValid && m_cachedVuCode == vuCode && m_cachedMemory == memory &&
++                  m_cachedCodeSize == codeSize && m_cachedCodeGeneration == gen))
++                rebuildDecodedCodeCache(vuCode, codeSize, memory, gen);
++            const uint32_t n = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
++            const uint64_t key = vu1Fnv(vuCode, n * 8u) ^ (static_cast<uint64_t>(n) * 0x9E3779B97F4A7C15ull);
++            if (!tl_xlCache)
++                tl_xlCache = new std::unordered_map<uint64_t, std::unique_ptr<Vu1Xlat>>();
++            auto found = tl_xlCache->find(key);
++            Vu1Xlat *x = nullptr;
++            if (found != tl_xlCache->end() && found->second->flagDead.size() == n)
++            {
++                x = found->second.get();
++                g_bcReuse.fetch_add(1, std::memory_order_relaxed);
++            }
++            else
++            {
++                if (tl_xlCache->size() >= 256u)
++                    tl_xlCache->clear();
++                auto made = std::make_unique<Vu1Xlat>();
++                x = made.get();
++                x->flagDead.assign(n, 0u);
++                const auto P = [&](int k) -> const DecodedInstructionPair & { return m_decodedCodeCache[static_cast<uint32_t>(k)]; };
++                const auto isBranch = [&](int k) { return !P(k).iBit && P(k).lowerUsage.pipeline == PipelineBranch; };
++                const auto touches = [&](int k) { return !P(k).iBit && vu1LowerTouchesFmacFlags(P(k).lower); };
++                const auto writer = [&](int k) { return vu1UpperWritesFmacFlags(P(k).upper); };
++                // 1: pair pos runs right after pos-1 on the path that started at i; 0: the program
++                // has ended (E-bit delay slot done); -1: unknown (branch target, wrap).
++                const auto seqNext = [&](int i, int pos) -> int {
++                    if (pos >= static_cast<int>(n))
++                        return -1;
++                    const int q2 = pos - 2;
++                    if (q2 >= 0 && q2 >= i - 1)
++                    {
++                        if (isBranch(q2))
++                            return -1;
++                        if (P(q2).eBit)
++                            return 0;
++                    }
++                    return 1;
++                };
++                for (int i = 0; i < static_cast<int>(n); ++i)
++                {
++                    if (!writer(i))
++                        continue;
++                    ++x->writers;
++                    if (touches(i))
++                        continue;
++                    int j = -1;
++                    bool ok = true;
++                    for (int pos = i + 1; pos <= i + 8; ++pos)
++                    {
++                        if (seqNext(i, pos) != 1 || P(pos - 1).dBit || P(pos - 1).tBit || touches(pos))
++                        {
++                            ok = false;
++                            break;
++                        }
++                        if (writer(pos))
++                        {
++                            j = pos;
++                            break;
++                        }
++                    }
++                    if (!ok || j < 0)
++                        continue;
++                    for (int pos = j + 1; pos <= j + 3; ++pos)
++                    {
++                        const int sn = seqNext(i, pos);
++                        if (sn == 0)
++                            break; // program over: everything is flushed in order
++                        if (sn < 0 || touches(pos))
++                        {
++                            ok = false;
++                            break;
++                        }
++                    }
++                    if (!ok)
++                        continue;
++                    x->flagDead[static_cast<uint32_t>(i)] = 1u;
++                    ++x->dead;
++                }
++                (*tl_xlCache)[key] = std::move(made);
++                g_bcTranslations.fetch_add(1, std::memory_order_relaxed);
++                if (vu1BcStats())
++                    std::fprintf(stderr, "[vu1:bc] translated image %016llx: %u pairs, %u flag-writing FMACs, %u with dead flags\n",
++                                 (unsigned long long)key, n, x->writers, x->dead);
++            }
++            tl_xlCur = {this, vuCode, gen, codeSize, x};
++            tl_runXlat = x;
++        }
++    }
+     if (s_vu1Prof)
+         vu1ProfBeginRun();
++
++    // Block cache: specialised FMAC upper handler. Covers ADD/SUB/MUL/MADD/MSUB (bc, q, i and
++    // vector forms, VF or ACC destination) when every written lane is in the range where
++    // normalizeFmacResult / calculateFmacProductSticky take their fast path (so the value is
++    // unchanged and the flags are just the signs); otherwise it returns false and execUpper
++    // runs the generic code. No state is touched before that decision.
++    const bool fastUpperOn = tl_runXlat != nullptr && !vu1ExactFlagsOnly() && !vu1FlagCheck();
++    const auto fastUpper = [&](uint32_t instr) -> bool {
++        const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
++        const bool toAcc = op >= 0x3Cu;
++        const uint8_t code = toAcc ? static_cast<uint8_t>((instr & 3u) | ((instr >> 4) & 0x7Cu)) : op;
++        int kind; // 0 add, 1 sub, 2 mul, 3 madd, 4 msub
++        int src;  // 0 bc, 1 q, 2 i, 3 vector
++        if (code <= 0x0Fu)
++        {
++            static constexpr int kinds[4] = {0, 1, 3, 4};
++            kind = kinds[code >> 2];
++            src = 0;
++        }
++        else if (code >= 0x18u && code <= 0x1Bu) { kind = 2; src = 0; }
++        else
++        {
++            switch (code)
++            {
++            case 0x1Cu: kind = 2; src = 1; break;
++            case 0x1Eu: kind = 2; src = 2; break;
++            case 0x20u: kind = 0; src = 1; break;
++            case 0x21u: kind = 3; src = 1; break;
++            case 0x22u: kind = 0; src = 2; break;
++            case 0x23u: kind = 3; src = 2; break;
++            case 0x24u: kind = 1; src = 1; break;
++            case 0x25u: kind = 4; src = 1; break;
++            case 0x26u: kind = 1; src = 2; break;
++            case 0x27u: kind = 4; src = 2; break;
++            case 0x28u: kind = 0; src = 3; break;
++            case 0x29u: kind = 3; src = 3; break;
++            case 0x2Au: kind = 2; src = 3; break;
++            case 0x2Cu: kind = 1; src = 3; break;
++            case 0x2Du: kind = 4; src = 3; break;
++            default: return false;
++            }
++        }
++        const uint8_t dest = DEST(instr);
++        if (dest == 0u)
++            return false;
++        const uint8_t fs = FS(instr);
++        const uint8_t ft = FT(instr);
++        float t[4];
++        if (src == 0)
++            t[0] = t[1] = t[2] = t[3] = vuNormOperand(m_state.vf[ft][code & 3u]);
++        else if (src == 1)
++            t[0] = t[1] = t[2] = t[3] = vuNormOperand(m_state.q);
++        else if (src == 2)
++            t[0] = t[1] = t[2] = t[3] = vuNormOperand(m_state.i);
++        else
++            for (uint32_t c = 0; c < 4u; ++c)
++                t[c] = vuNormOperand(m_state.vf[ft][c]);
++        float res[4];
++        uint8_t laneFlags[4] = {0u, 0u, 0u, 0u};
++        uint32_t sticky = 0u;
++        for (uint32_t c = 0; c < 4u; ++c)
++        {
++            if ((dest & laneForComponent(c)) == 0u)
++                continue;
++            const float sv = vuNormOperand(m_state.vf[fs][c]);
++            float r;
++            if (kind == 0)
++                r = sv + t[c];
++            else if (kind == 1)
++                r = sv - t[c];
++            else if (kind == 2)
++                r = sv * t[c];
++            else
++            {
++                const float a = vuNormOperand(m_state.acc[c]);
++                const float prod = sv * t[c];
++                r = kind == 3 ? a + prod : a - prod;
++                uint32_t pbits, abits;
++                std::memcpy(&pbits, &prod, 4);
++                std::memcpy(&abits, &a, 4);
++                const uint32_t pexp = (pbits >> 23) & 0xFFu;
++                if (pexp < 3u || pexp > 252u || ((abits >> 23) & 0xFFu) > 252u)
++                    return false;
++                const double ra = std::fabs(static_cast<double>(r));
++                if (!(ra * 1048576.0 >= std::fabs(static_cast<double>(a)) + ra))
++                    return false;
++                sticky |= (pbits & 0x80000000u) ? 0x2u : 0x0u;
++            }
++            uint32_t rbits;
++            std::memcpy(&rbits, &r, 4);
++            const uint32_t rexp = (rbits >> 23) & 0xFFu;
++            if (rexp < 3u || rexp > 252u)
++                return false;
++            laneFlags[c] = (rbits & 0x80000000u) ? 0x2u : 0x0u;
++            res[c] = r;
++        }
++        static const bool s_break = []() { const char *e = std::getenv("PS2X_VU1_BC_BREAK"); return e && e[0] == '1'; }();
++        if (s_break && (dest & 0x8u) && kind == 3) // checker self-test only: perturb MADD x by 1 ulp
++        {
++            uint32_t b;
++            std::memcpy(&b, &res[0], 4);
++            b ^= 1u;
++            std::memcpy(&res[0], &b, 4);
++        }
++        m_currentUpperInstruction = instr;
++        updateFmacFlags(laneFlags, dest, sticky);
++        float *dst = toAcc ? m_state.acc : m_state.vf[FD(instr)];
++        for (uint32_t c = 0; c < 4u; ++c)
++            if ((dest & laneForComponent(c)) != 0u)
++                dst[c] = res[c];
++        return true;
++    };
++    const auto doUpper = [&](uint32_t instr) {
++        if (!fastUpperOn || !fastUpper(instr))
++            execUpper(instr);
++    };
++    // The decoded-pair cache cannot change during a run (VU1 code is only written by VIF MPG
++    // between runs), so whether it is current is checked once.
++    const bool decodedCurrent = tl_runXlat != nullptr && m_decodedCodeCacheValid && m_cachedVuCode == vuCode &&
++                                m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
++                                m_cachedCodeGeneration == memory->getVU1CodeGeneration();
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         commitReadyPipelines();
+@@ -1974,7 +2516,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         // getDecodedInstructionPairForPc, without copying the ~100-byte struct per pair).
+         DecodedInstructionPair decodedCopy;
+         const DecodedInstructionPair *decodedPtr = nullptr;
+-        if (vu1JitOn() && m_unit == Unit::VU1 && memory && (m_state.pc & 7u) == 0u && (m_state.pc / 8u) < kMaxDecodedPairs &&
++        if (decodedCurrent && (m_state.pc & 7u) == 0u && (m_state.pc / 8u) < kMaxDecodedPairs)
++            decodedPtr = &m_decodedCodeCache[m_state.pc / 8u];
++        else if (vu1JitOn() && m_unit == Unit::VU1 && memory && (m_state.pc & 7u) == 0u && (m_state.pc / 8u) < kMaxDecodedPairs &&
+             m_decodedCodeCacheValid && m_cachedVuCode == vuCode && vuCode == memory->getVU1Code() &&
+             m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
+             m_cachedCodeGeneration == memory->getVU1CodeGeneration())
+@@ -2066,7 +2610,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+         if (decoded.iBit)
+         {
+-            execUpper(decoded.upper);
++            doUpper(decoded.upper);
+             float immediate = 0.0f;
+             std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
+             m_state.i = normalizeOperand(immediate);
+@@ -2078,7 +2622,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             std::memcpy(oldVf,
+                         m_state.vf[decoded.upperVfShadowReg],
+                         sizeof(oldVf));
+-            execUpper(decoded.upper);
++            doUpper(decoded.upper);
+             std::memcpy(upperVf,
+                         m_state.vf[decoded.upperVfShadowReg],
+                         sizeof(upperVf));
+@@ -2092,7 +2636,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+         else
+         {
+-            execUpper(decoded.upper);
++            doUpper(decoded.upper);
+             execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+         }
+ 
+@@ -2238,6 +2782,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     }
+     if (s_vu1Prof)
+         vu1ProfEndRun(profStartPc, m_cycle - profStartCycle);
++    tl_runOwner = savedRunOwner;
++    tl_runXlat = savedRunXlat;
++    tl_runBudgetEnd = savedRunBudget;
++    if (vu1BcStats() && m_unit == Unit::VU1 && !tl_bcSuppress)
++    {
++        static thread_local auto s_last = std::chrono::steady_clock::now();
++        const auto now = std::chrono::steady_clock::now();
++        if (now - s_last > std::chrono::seconds(5))
++        {
++            s_last = now;
++            std::fprintf(stderr, "[vu1:bc] translations=%llu reused=%llu dead FMAC flag entries skipped=%llu\n",
++                         (unsigned long long)g_bcTranslations.load(), (unsigned long long)g_bcReuse.load(),
++                         (unsigned long long)g_bcSkipped.load());
++        }
++    }
+     m_state.cycles = m_cycle;
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
