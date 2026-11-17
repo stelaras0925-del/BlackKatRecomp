@@ -599,3 +599,25 @@ Next: per-pair precomputed stall read lists / fused run loop, specialised lower 
 (LQ/SQ/IADDIU/branches), CLIP/MAX/MINI/FTOI fast handlers, batching GS stage ops (CPU GS stage
 is now ~40% busy and the worker waits on it), the EE thread's IOP emulation
 (IopKernel::beginNextReady iterates a std::map: ~30% of the EE thread).
+
+## VU1 run loop + GS stage batching + IOP ready queue (patch: ps2recomp-vu1-loop-iop.patch)
+
+Applies on top of `ps2recomp-vu1-blockcache.patch`. No public header changes (only private `iop_kernel.h`, 5 IOP TUs).
+
+- **VU1 loop** (`ps2_vu1_core.cpp`): each cached translation stores per-pair stall read/write slot lists
+  (`Vu1PairStall`), so `pairReady`/write marking no longer decode usages every pair. Fast upper handlers
+  for MAX/MINI, ITOF/FTOI, ABS, CLIP and special NOP. Revert: `PS2X_VU1_LOOP=0`.
+- **GS stage** (`ps2_vu1_async.inl`): GS ops are batched (byte arena, pooled batches, default 32 ops / 256 KB)
+  and the job completion is posted by the stage itself (pipelined), so the VU1 worker no longer waits for the
+  stage at job end. EE-visible order unchanged (job completes after its GS work, FIFO).
+  Revert: `PS2X_GS_STAGE_PIPE=0` (wait at job end), `PS2X_GS_STAGE_BATCH=1`, `PS2X_GS_STAGE=0`.
+- **IOP** (`iop_kernel.cpp/.h`): `beginNextReady` uses a cached id-ordered thread vector and one pass
+  (wake due Delay threads + pick lowest priority, then lowest id) — same order as before.
+  `nextWakeCycle` uses the list; `cleanupDeadThreads` early-outs. Revert: `PS2X_IOP_FASTSCHED=0`.
+
+Measured (t=30–56 s, VU1 thread on), VIF writes/s | vsync/s:
+- GPU GS: 13.44 | 19.77 (02c73e5) -> 15.59 | 28.26
+- CPU GS: 8.78 | 14.09 (02c73e5) -> 9.44 | 19.90
+- In-game reached at ~12 s instead of ~15 s.
+- `PS2X_VU1_BC_CHECK=1`: 0 mismatches (CPU 240k runs, GPU 280k runs).
+- CPU GS worker wait for the stage: 640 ms/5 s (pipe off) -> 0 ms (pipe on).
