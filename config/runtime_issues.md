@@ -465,4 +465,68 @@ Patch: `patches/ps2recomp-gs-gpu.patch`. Apply it on top of `ps2recomp-geometry-
 2. Present straight from the GPU target (share or blit into raylib's texture) to skip glReadPixels and the CPU display conversion.
 3. Decode textures on the GPU: upload the raw VRAM pages and deswizzle plus CLUT in a shader.
 4. Implement region clamp, PABE, the exact AFAIL/partial FBMSK paths and depth resolve.
-5. The real speed limit is now the game thread: profile and parallelise VU1/VIF, e.g. run VU1 microprograms on their own thread with GIF output queued.
+5. The real speed limit is now the game thread: profile and parallelise VU1/VIF, e.g. run VU1 microprograms on their own thread with GIF output queued. Done, see the next section.
+
+## VIF1/VU1/GIF worker thread (2026-11-17, patches/ps2recomp-vu1-thread.patch, default ON)
+
+Patch: `patches/ps2recomp-vu1-thread.patch`, on top of `ps2recomp-gs-gpu.patch`. Runtime .cpp files plus a
+private header (`src/lib/ps2_vu1_async.h` / `.inl`, included only by runtime .cpp files), so relink-only.
+**Revert switch: `PS2X_VU1_THREAD=0`** (the old fully synchronous path; no worker thread is started).
+
+**Why.** Game-thread profile before (GPU GS, gameplay, 20 s): VU1 interpreter + VIF1 ~63%, IOP emulation ~28%
+(IopKernel std::map walks, run from EeScheduler::checkpointDue), guest EE code + GS frontend the rest.
+
+**Design.**
+- processPendingTransfers() no longer runs VIF1 (UNPACK/MPG/MSCAL -> VU1 -> XGKICK) and PATH3 GIF DMA on the EE
+  thread. It copies the data (chains are already gathered at kick time) into one job per kick and returns.
+  One worker thread ("VU1Worker") runs jobs in kick order (GIF before VIF1 inside one batch, as before), so
+  PATH3 vs PATH1/PATH2 order into the GS is unchanged. VIF0 and VU0 macro mode stay on the EE thread.
+- While a job is in flight its channel keeps CHCR.STR=1. On finish the worker posts an EE scheduler Dmac event;
+  the EE thread then publishes the completion like the synchronous path did (STR clear, QWC=0, D_STAT CIS,
+  DMAC cause -> handlers). VPU_STAT VU1 D/T stop bits are applied on the EE thread at completion; FBRST
+  (DE1/TE1) is snapshotted at kick.
+- EE accesses that need the worker's state drain it first: VU1 code/data memory, VIF1 registers
+  (0x10003C00..) incl. STAT/MARK/TOP/ITOP/FBRST, VIF1 FIFO writes, GIF control (0x10003000..), GS privileged
+  registers (CSR FINISH/SIGNAL, DISPFB...), the native GIF chain shortcuts, and direct GS writes / GIF packets /
+  readback from any non-worker thread. D_STAT and GIF/VIF1 channel registers just publish finished jobs.
+- **GIF inline fast path:** a GIF-only kick while the worker is idle runs synchronously on the EE thread
+  (nothing queued can be overtaken). Without it the front end (tens of thousands of tiny scratchpad PATH3
+  sprite/text packets per second) ran at ~4 vsync/s, cycled the attract FMVs and never accepted X on the
+  title menu. `PS2X_VU1_THREAD_GIF_INLINE=0` sends every GIF kick to the worker (debug only).
+- Backpressure: at most 32 jobs in flight (`PS2X_VU1_THREAD_MAXJOBS`). The banded CPU rasterizer queue is
+  now bounded too (`PS2X_GS_QUEUE_MAX`, default 8192 commands, 0 = unbounded; 1024 cost ~15% in sync mode).
+
+**Results** (opening ship-deck scene, `BLACKKAT_FAKEKEY=x BLACKKAT_FAKEKEY_HOLD_MS=700 PS2X_TICK=60`, t=30..56 s,
+`python3 build/vt_rate2.py <log>`; vifw/s = VIF register writes per second, which equals vsync/s in sync
+mode, used as a rough game-frames proxy):
+
+| GS backend | VU1 thread | vsync/s | vifw/s (~frames/s) |
+|---|---|---|---|
+| CPU | off (`PS2X_VU1_THREAD=0`) | 4.04 | 4.00 |
+| CPU | on (default) | 19.3 | 5.15 |
+| GPU | off | 4.54 | 4.54 |
+| GPU | on | 21.1 | 6.0-6.15 |
+
+- Guest vsync is EE-cycle paced. With the thread on the EE spins on CHCR/STAT while VU1 works (like real
+  hardware), so EE cycles and vsyncs advance ~5x faster: game time runs ~4-5x faster (the mission HUD is
+  reached much sooner), the drawn frame rate gains ~30-35%. If a game ever misbehaves from the extra vsyncs
+  per frame, `PS2X_VU1_THREAD_DRAIN_ON_POLL=1` makes a CHCR poll wait for the worker instead.
+- Stability: 7 runs of 60 s and one of 90 s (CPU and GPU GS) boot -> menu -> New Game -> mission with no
+  errors; RSS flat at ~255-265 MB; visuals match the synchronous path.
+- Profile with the thread on (CPU GS, 20 s): VU1Worker ~91% VU1 interpreter (execUpper, calculatePairReadyCycle,
+  commitReadyPipelines, normalizeFmacResult), ~9% GS frontend; worker busy 90-98% = the new bottleneck. The EE
+  thread is ~84% IOP emulation (more EE cycles -> more IOP cycles) plus guest wait loops.
+
+**Env:** `PS2X_VU1_THREAD=0` (off), `PS2X_VU1_THREAD_STATS=1` (`[vu1thread:stats]` every 5 s),
+`PS2X_VU1_THREAD_TRACE=1` (top kick shapes), `PS2X_VU1_THREAD_SYNC=1` (worker but wait for each job),
+`PS2X_VU1_THREAD_INLINE=1` (jobs inline, hooks active), `PS2X_VU1_THREAD_DRAIN_ON_POLL=1`,
+`PS2X_VU1_THREAD_MAXJOBS=N`, `PS2X_VU1_THREAD_GIF_INLINE=0`, `PS2X_GS_QUEUE_MAX=N`. `[run:tick]` also prints
+`dispfbw=` (EE DISPFB writes; 0 in this game, it does not flip through those paths).
+
+**Known limits:** VU1 reset/start through VU0 macro CTC2 (FBRST/CMSAR1 from the EE side) is not drained;
+VPU_STAT read through CFC2 sees the last completed job. Only the ship-deck scene and the front end were tested.
+
+**Next:** 1) make the VU1 interpreter cheaper (fast mode still runs the pipeline model; a per-microprogram
+block cache / VU1 recompiler is the big one); 2) split the GS frontend (GIF parse + vertexKick) off the worker;
+3) cut IOP cost (IopKernel std::map walks, or run the IOP on its own thread / at a fixed rate instead of per
+EE cycle, since spinning EE cycles now drive it).
