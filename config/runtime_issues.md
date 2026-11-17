@@ -530,3 +530,32 @@ VPU_STAT read through CFC2 sees the last completed job. Only the ship-deck scene
 block cache / VU1 recompiler is the big one); 2) split the GS frontend (GIF parse + vertexKick) off the worker;
 3) cut IOP cost (IopKernel std::map walks, or run the IOP on its own thread / at a fixed rate instead of per
 EE cycle, since spinning EE cycles now drive it).
+
+## VU1 interpreter speed-up (patches/ps2recomp-vu1-jit.patch, default on, `PS2X_VU1_JIT=0` reverts)
+
+With the VU1 worker thread the worker was 90-98% busy and ~91% of it was the VU1
+interpreter (self time: calculatePairReadyCycle 25%, commitReadyPipelines 16%, FMAC
+exact-flag math ~15%, normalizeOperand 6%). Hot programs (`PS2X_VU1_PROFILE=1`):
+start pc 0x2c18 = 45% of pairs (~1282 pairs/run, ~2000 runs/s), 0x1ee0 17%, 0x2460 7%,
+0x1318 5.5%; 19 programs / 1576 distinct pairs, top-64 pairs = 60%; ~44% of VU cycles are stalls.
+
+Chosen approach: keep the exact fast-mode cycle model (clip-flag stall timing, XGKICK at
+issue, E-bit/delay slots, Q/P pipeline, MAC/status/clip flags, integer-branch delay) and make
+the interpreter cheaper instead of writing a translator:
+- decoded pair used by reference from the decode cache (no per-pair struct copy);
+- ready-cycle / write-marking scans iterate set bits (ctz) instead of all 32 regs/lanes;
+- fast mode: vf/vi/acc write pipelines are never used on VU1, so their commit loops are skipped;
+- fast FMAC flags: when the float result is provably normal and not near over/underflow
+  (exponent 3..252; product-sum ops also need |r|*2^20 >= |acc|+|r|), flags are just the sign
+  and the long-double "exact" path is skipped (`PS2X_VU1_FLAGCHECK=1` compares both: 0
+  mismatches over 553M lanes; `PS2X_VU1_EXACTFLAGS=1` forces the exact path);
+- advanceTo() jumps over stall cycles where nothing can commit (commit hint) and no XGKICK runs;
+- commit hint globals are now thread_local (VU0 on EE thread vs VU1 on worker could race).
+
+Speed (60 s run, in-game, t=30-56 s, thread on): CPU GS vifw/s 5.15 -> 7.28 (+41%, worker now
+~78% busy, GS becomes the limit); GPU GS 6.15 -> 10.75 (+75%, worker 96%). Thread off:
+CPU 4.00 -> 4.92, GPU 4.54 -> 6.30. `PS2X_VU1_JIT=0`: 6.22 (CPU; the pure refactors remain).
+Visuals (sea, terrain, ship) match the baseline; `PS2X_VU1_ACCURATE=1` still runs.
+Next steps: translator/block cache for 0x2c18/0x1ee0/0x2460, per-block flag liveness
+(skip MAC/status work when no FMAND/FSAND/... reads them before overwrite), splitting the GS
+frontend off the VU1 worker.
