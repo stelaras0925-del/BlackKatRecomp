@@ -747,3 +747,65 @@ regen is still needed to cover all 4347 branch sites (registers set in another
 block) and keep build/generated consistent with the generator.
 Verified: slot-4 save on foot, Kat fully drawn (build/shots/ab_s64b_*,
 before: ab_dl4_*); Kat VU1 0xbd8 runs per frame went from ~10 to ~85.
+
+## Teleport garbage / VU1 "reserved lower 0xfffffffb" — CANDIDATE FIX 2026-11-18, NOT YET VERIFIED (patches/ps2recomp-vif1-direct-carry-mpg-wrap.patch)
+
+Symptom (build/teleport2_1650.log): when the teleport loads the new area, 1051
+"[VU1 reserved lower] instruction=0xfffffffb" lines appear (the first at log line
+1555, before the first [vif1:carry]), and the carries that follow have garbage
+command words (eb7ce35b, ca96d6f9...). The garbage carry commands show the VIF1
+stream is already out of step: data words are being parsed as VIFcodes, and
+random MPG codes write data into VU1 micro memory.
+
+VIF1 interpreter gaps found by code review:
+- DIRECT/DIRECTHL whose payload ran past the end of the DMA transfer was
+  truncated (pos = end) with no carry, unlike UNPACK/MPG/STROW. Only IMAGE data was
+  continued (m_vif1PendingPath2ImageQwc), so the rest of a PACKED/REGLIST
+  payload in the next transfer was parsed as VIFcodes. This is the likely way
+  the stream gets out of step during the area load (large DIRECT texture/CLUT
+  uploads). It now carries like the other commands. A truncated DIRECT
+  (only when carry is off or the 4 MB guard trips) logs [vif1:direct] truncated.
+- MPG uploads past the end of micro memory were clipped; the VU wraps the
+  address mod 16 KB. Now they wrap, logged as [vif1:mpg] upload wraps.
+- Diagnostic: [vif1:direct] IMAGE continues past DIRECT logs when a GIF IMAGE tag
+  extends beyond a complete DIRECT (the raw-continuation path then eats the
+  following words, which is suspicious on hardware too).
+Checked and fine: MPG NUM=0 means 256, UNPACK NUM=0 means 256, VIF0 MPG goes to VU0,
+DMA CALL depth (PS2X_DMA_CHAINLOG shows no overflow on Buccaneer Bay).
+The normal Buccaneer Bay slot-4 scene logs none of the new messages. It still needs a
+teleport run: record the walk with BLACKKAT_PADREC (below) and replay it.
+
+## Pad record / replay (src/overrides, patches/blackkat-pad-record-replay.patch)
+
+BLACKKAT_PADREC=<file> records pad 0 (mode byte, buttons, 4 analog axes) on
+every change, as "readIndex ms mode b2 b3 lx ly rx ry". BLACKKAT_PADPLAY=<file>
+replays it, frame-locked by pad-read index (BLACKKAT_PADPLAY_MODE=time for
+wall-clock). Real input returns once the file ends. Recording from game start
+(title -> Continue -> slot) replays the whole session. Verified: a slot-4 load
+recorded through BLACKKAT_KEYSCRIPT replays to the same in-game spot.
+
+## Skull Islands banding: "[VU1 reserved lower] instruction=0xfffffffb" is an XGKICK overflow (2026-11-18)
+
+- `0xFFFFFFFB` is not a VU opcode. `ps2_vu1_core.cpp` `progressXgkick()` reports it as a sentinel when a PATH1 XGKICK packet overflows the 64 KB kick buffer: a GIF tag with a huge NLOOP*NREG, or a tag chain with no EOP. It then drops the packet and stops the VU1 program (`m_stopRequested`). The `pc=` values are the XGKICK sites in the microcode.
+- Only logs with Skull Islands or teleport scenes show it (teleport_1313, teleport2_1321/1650, teleport3, tp_cpu, tp_accurate). The ship and Buccaneer Bay logs (ship_rg, ship_rg2, ab_rg) have 0. The warnings always come before the first `[vif1:carry]`, and teleport_1313 had them without any carry code, so the carry didn't cause them.
+- Meaning: the GIF data in VU1 data memory at the kick address is bad, or the microprogram is stale or wrong.
+- Many of the carried "VIFcodes" look like misparsed data: the IRQ bit is set on all of them, and two are invalid UNPACK formats, 0x6B (V3 vl=3) and 0x67 (V2 vl=3). Those are signs of a VIF1 stream desync earlier in the same packet.
+- Added `patches/ps2recomp-xgkick-overflow-diag.patch`, which prints `[xgkick:overflow]` with the offending GIF tag.
+- Added `patches/ps2recomp-vif1-mpg-addr-mask.patch`. VU1 MPG ADDR is now masked to 11 bits, as the VU0 path already did. Before this, ADDR >= 0x800 skipped the upload without any message. The patch logs `[vif1:mpg] addr has upper bits` when this happens.
+- UNPACK payload size now matches PCSX2 (`Vif_Unpack.cpp` `vifUnpackSetup`/`nVifT`). Patch: `patches/ps2recomp-vif1-unpack-size-pcsx2.patch`.
+  - Reserved formats with VL=3 and VN<3 read 0 bytes per vector. We used to read 16-bit components for them.
+  - WL=0 now means 256, and CL=0 is kept as 0. We used to force both to 1.
+  - Two of the carried commands were reserved-format UNPACKs: `eb7ce35b` (V3-?, need 748) and `e77bd2d7` (V2-?, need 496). PCSX2 gives both 0 bytes, so we were eating real VIFcodes after them.
+  - Unusual cases are logged as `[vif1:unpack-odd]`. `PS2X_VIF_UNPACK_PCSX2SIZE=0` restores the old sizing.
+- Run 2026-11-18 18:xx (`build/tp_diag.log`): the scene drew more, then the game froze. That run had MPG masking on, and VU1 micro memory got clobbered (`reserved upper pc=0x0 0x4effffff`).
+  - The first reserved-format UNPACK came at pos=4 of a 16384-byte VIF1 transfer. Its words look like 16-bit texels (`e33adf3a`, `50505050`), so texture data was being parsed as VIFcodes.
+  - PCSX2 check: `nVifT` really gives VL=3/VN<3 a size of 0. But PCSX2 maps 0x67/0x77/0x7B to `vifCode_Null`, a bad-VIFcode error and stall, and its unpacker for the others is `UNPACK_INVALID`. So reserved formats only appear once the stream is already out of sync. Re-sizing them is not a fix.
+  - New defaults: MPG with ADDR >= 0x800 is skipped and logged (`PS2X_VIF1_MPG_MASK=1` masks instead). PCSX2 UNPACK sizing is off (`PS2X_VIF_UNPACK_PCSX2SIZE=1` turns it on).
+  - `patches/ps2recomp-vif1-desync-trace.patch` adds a 32-entry VIF1 ring trace (`[vif1:trace]`, off with `PS2X_VIF1_TRACE=0`). It is dumped once per anomaly kind: 0 reserved UNPACK, 1 MPG upper bits, 2 carry over 64 KB, 3 unknown VIFcode, 4 XGKICK overflow. Each dump shows the transfer src, qwc and chain size, plus the raw bytes around the last code.
+- Likely root cause of the teleport/Skull Islands corruption (from `build/tp_diag2.log` `[vif1:trace]`):
+  - The first bad code is at pos=0 of VIF1 xfer#2173, a normal-mode transfer with src=01161680, qwc=1024, 16 KB, made entirely of texel-looking words.
+  - The transfer just before it, xfer#2172, is normal mode with src=009f8ef0, qwc=8: `NOP NOP FLUSH DIRECT 7`, then 7 qw of GIF data. That is a GS transfer-register setup (BITBLTBUF/TRXPOS/TRXREG/TRXDIR).
+  - So xfer#2173 looks like a GS->memory download: VIF1 DMA with CHCR.DIR=0, after TRXDIR=1.
+  - The DMA code ignored CHCR.DIR and parsed the destination buffer (old texels) as VIFcodes. That gave the desync, the reserved UNPACKs, the bad MPG/carries and the XGKICK overflows, and the readback never filled the buffer, which explains the mosaic after re-upload.
+  - Fix in `patches/ps2recomp-vif1-readback-dir0.patch`: VIF1 normal mode with DIR=0 now drains the queued VIF1 work, copies `GS::consumeLocalToHostBytes` into MADR, and completes the channel. It logs `[vif1:readback]`, and `PS2X_VIF1_READBACK=0` restores the old behaviour. The patch also clears the VIF1 carry on FBRST.RST.
+  - Not yet confirmed: the 7 qw GIF payload was not dumped. The first `[vif1:readback]` line will show chcr, and DIR=0 confirms it.

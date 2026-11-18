@@ -1,0 +1,45 @@
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -733,10 +733,38 @@
+             // STCYCL controls write cycles for UNPACK.
+             uint32_t cl = vif1_regs.cycle & 0xFFu;
+             uint32_t wl = (vif1_regs.cycle >> 8) & 0xFFu;
+-            if (cl == 0u)
+-                cl = 1u;
+-            if (wl == 0u)
+-                wl = 1u;
++            // Payload size as PCSX2 (Vif_Unpack.cpp vifUnpackSetup / nVifT): WL=0 means 256,
++            // CL=0 is kept (fill write with no source data), and the reserved formats
++            // S-?/V2-?/V3-? (VL=3, VN<3) read 0 bytes per vector. The old code forced
++            // CL/WL 0 -> 1 and read 16-bit components for the reserved formats, which
++            // makes the parser eat the following VIFcodes as payload (stream desync).
++            // PS2X_VIF_UNPACK_PCSX2SIZE=0 restores the old sizing.
++            static const bool s_pcsx2Size = []() {
++                const char *e = std::getenv("PS2X_VIF_UNPACK_PCSX2SIZE");
++                return !(e && e[0] == '0');
++            }();
++            const bool reservedFormat = (vl == 3u && vn != 3u);
++            if ((reservedFormat || cl == 0u || wl == 0u))
++            {
++                static uint32_t s_oddLogged = 0;
++                if (s_oddLogged++ < 20)
++                    std::fprintf(stderr, "[vif1:unpack-odd] cmd=%08x %s cl=%u wl=%u num=%u pos=%u size=%u\n",
++                                 cmd, reservedFormat ? "reserved-format" : "cl/wl=0", cl, wl, writeVectorCount, pos, sizeBytes);
++            }
++            if (s_pcsx2Size)
++            {
++                if (reservedFormat)
++                    bytesPerVector = 0u;
++                if (wl == 0u)
++                    wl = 256u;
++            }
++            else
++            {
++                if (cl == 0u)
++                    cl = 1u;
++                if (wl == 0u)
++                    wl = 1u;
++            }
+ 
+             uint32_t sourceVectorCount = writeVectorCount;
+             if (cl < wl)

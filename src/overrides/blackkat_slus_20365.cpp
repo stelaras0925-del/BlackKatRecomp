@@ -834,11 +834,140 @@ namespace
         return ap;
     }
 
+    // BLACKKAT_PADREC=<file>: record pad 0 (buttons + analog sticks, bytes 2..7 of the
+    // scePadRead buffer) every time it changes, as "readIndex ms mode b2 b3 b4 b5 b6 b7" (hex bytes).
+    // BLACKKAT_PADPLAY=<file>: replay such a file on pad 0, replacing the real input while it
+    // runs. Steps by pad-read index (frame-locked, default) or by time with
+    // BLACKKAT_PADPLAY_MODE=time. Real input comes back after the last line.
+    struct PadRecLine { uint64_t idx, ms; uint8_t mode; uint8_t b[6]; };
+    struct PadRec
+    {
+        FILE *rec = nullptr;
+        std::vector<PadRecLine> play;
+        bool byTime = false;
+        bool on() const { return rec || !play.empty(); }
+    };
+    PadRec &padRec()
+    {
+        static PadRec pr = []()
+        {
+            PadRec r;
+            if (const char *f = std::getenv("BLACKKAT_PADREC"); f && *f)
+            {
+                r.rec = std::fopen(f, "w");
+                std::cerr << "[padrec] recording pad 0 to " << f << (r.rec ? "" : " FAILED") << std::endl;
+                if (r.rec)
+                    std::fprintf(r.rec, "# blackkat pad recording: readIndex ms mode b2 b3 lx ly rx ry (b2/b3 active-low)\n");
+            }
+            if (const char *f = std::getenv("BLACKKAT_PADPLAY"); f && *f)
+            {
+                if (FILE *in = std::fopen(f, "r"))
+                {
+                    char line[256];
+                    while (std::fgets(line, sizeof(line), in))
+                    {
+                        PadRecLine l{};
+                        unsigned m, b[6];
+                        unsigned long long idx, ms;
+                        if (line[0] != '#' && std::sscanf(line, "%llu %llu %x %x %x %x %x %x %x", &idx, &ms, &m, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 9)
+                        {
+                            l.idx = idx; l.ms = ms; l.mode = static_cast<uint8_t>(m);
+                            for (int i = 0; i < 6; ++i) l.b[i] = static_cast<uint8_t>(b[i]);
+                            r.play.push_back(l);
+                        }
+                    }
+                    std::fclose(in);
+                }
+                const char *mode = std::getenv("BLACKKAT_PADPLAY_MODE");
+                r.byTime = mode && std::string(mode) == "time";
+                std::cerr << "[padrec] replaying " << r.play.size() << " pad changes from " << f << " by " << (r.byTime ? "time" : "pad-read index") << std::endl;
+            }
+            return r;
+        }();
+        return pr;
+    }
+    void padRecApply(uint8_t *data)
+    {
+        PadRec &pr = padRec();
+        static uint64_t s_idx = 0;
+        static const auto t0 = std::chrono::steady_clock::now();
+        const uint64_t idx = s_idx++;
+        const uint64_t ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+        if (!pr.play.empty())
+        {
+            static size_t s_next = 0;
+            static bool s_active = false, s_done = false;
+            // Load-gap anchors: a recorded change right after a >1.5 s pause in pad reads
+            // (a loading screen) marks the first read after that load. When the replay
+            // sees its own load pause, re-align the pad-read index to that anchor, so a
+            // different number of menu/loading reads does not shift the in-game input.
+            static std::vector<uint64_t> s_anchors = [&]()
+            {
+                std::vector<uint64_t> a;
+                for (size_t i = 1; i < pr.play.size(); ++i)
+                    if (pr.play[i].ms > pr.play[i - 1].ms + 1500u && pr.play[i].idx <= pr.play[i - 1].idx + 3u)
+                        a.push_back(pr.play[i].idx);
+                return a;
+            }();
+            static size_t s_anchorNext = 0;
+            static int64_t s_offset = 0;
+            static uint64_t s_lastMs = 0;
+            if (!pr.byTime && s_anchorNext < s_anchors.size() && idx > 0 && ms > s_lastMs + 1500u)
+            {
+                const uint64_t mapped = static_cast<uint64_t>(static_cast<int64_t>(idx) + s_offset);
+                if (mapped + 300u >= s_anchors[s_anchorNext])
+                {
+                    s_offset = static_cast<int64_t>(s_anchors[s_anchorNext]) - static_cast<int64_t>(idx);
+                    std::cerr << "[padrec] load pause at read " << idx << " -> aligned to recorded read " << s_anchors[s_anchorNext] << std::endl;
+                    ++s_anchorNext;
+                }
+            }
+            s_lastMs = ms;
+            const uint64_t now = pr.byTime ? ms : static_cast<uint64_t>(static_cast<int64_t>(idx) + s_offset);
+            while (s_next < pr.play.size() && (pr.byTime ? pr.play[s_next].ms : pr.play[s_next].idx) <= now)
+            {
+                ++s_next;
+                s_active = true;
+            }
+            if (s_active && !s_done)
+            {
+                const PadRecLine &l = pr.play[s_next - 1];
+                if (s_next >= pr.play.size() && now > (pr.byTime ? l.ms + 1000 : l.idx + 60))
+                {
+                    s_done = true;
+                    std::cerr << "[padrec] replay finished at read " << idx << ", t=" << ms << "ms" << std::endl;
+                }
+                else
+                {
+                    const bool analog = (data[1] >> 4) == 7u;
+                    data[2] = l.b[0];
+                    data[3] = l.b[1];
+                    if (analog)
+                        for (int i = 2; i < 6; ++i) data[2 + i] = l.b[i];
+                }
+            }
+        }
+        if (pr.rec)
+        {
+            static uint8_t s_last[7] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+            if (std::memcmp(s_last, data + 1, 7) != 0)
+            {
+                std::memcpy(s_last, data + 1, 7);
+                std::fprintf(pr.rec, "%llu %llu %02x %02x %02x %02x %02x %02x %02x\n", (unsigned long long)idx, (unsigned long long)ms,
+                             data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+                std::fflush(pr.rec);
+            }
+        }
+    }
+
     void blackkatScePadRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ctx->pc = getRegU32(ctx, 31);
         const uint32_t port = getRegU32(ctx, 4), slot = getRegU32(ctx, 5), dataAddr = getRegU32(ctx, 6);
         ps2_stubs::scePadRead(rdram, ctx, runtime);
+        if (padRec().on() && port == 0u && slot == 0u && getRegU32(ctx, 2) != 0u)
+            if (uint8_t *pd = getMemPtr(rdram, dataAddr))
+                padRecApply(pd);
         const AutoPress &ap = autoPress();
         if (!ap.on || port != 0u || slot != 0u || getRegU32(ctx, 2) == 0u)
             return;
@@ -1024,7 +1153,7 @@ namespace
                       << (sndOk ? "bound" : "FAILED") << std::endl;
         }
 
-        if (autoPress().on)
+        if (autoPress().on || padRec().on())
         {
             const bool padOk = runtime.replaceFunction(kScePadRead, &blackkatScePadRead);
             std::cerr << "[blackkat] autopress: " << autoPress().steps.size() << " step(s) every "

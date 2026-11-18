@@ -1,0 +1,50 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1456,6 +1456,31 @@
+     }
+ }
+ 
++// 0xFFFFFFFB "reserved lower" is not a VU opcode: it is this file's sentinel for a
++// PATH1 XGKICK packet that overflows the 64 KB kick buffer (a GIFtag with a huge
++// NLOOP*NREG, or a tag chain with no EOP). Log the offending tag so the bad VU data
++// (bad UNPACK / wrong kick address) can be traced. First 40 only.
++static void logXgkickOverflow(const void *vu, const char *why, uint32_t src, uint32_t copied,
++                              const uint8_t *pkt, uint32_t tagOff)
++{
++    static std::atomic<int> s_n{0};
++    if (s_n.fetch_add(1, std::memory_order_relaxed) >= 40)
++        return;
++    uint64_t lo = 0, hi = 0, lo0 = 0;
++    std::memcpy(&lo, pkt + tagOff, 8);
++    std::memcpy(&hi, pkt + tagOff + 8, 8);
++    std::memcpy(&lo0, pkt, 8);
++    std::fprintf(stderr,
++                 "[xgkick:overflow] %s vu=%p src=0x%x copied=%u tagOff=%u tag=%016llx_%016llx "
++                 "nloop=%u eop=%u flg=%u nreg=%u | firstTag=%016llx nloop0=%u flg0=%u nreg0=%u\n",
++                 why, vu, src, copied, tagOff,
++                 (unsigned long long)hi, (unsigned long long)lo,
++                 (unsigned)(lo & 0x7FFFu), (unsigned)((lo >> 15) & 1u), (unsigned)((lo >> 58) & 3u),
++                 (unsigned)((lo >> 60) & 0xFu),
++                 (unsigned long long)lo0, (unsigned)(lo0 & 0x7FFFu), (unsigned)((lo0 >> 58) & 3u),
++                 (unsigned)((lo0 >> 60) & 0xFu));
++}
++
+ void VU1Interpreter::progressXgkick()
+ {
+     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
+@@ -1467,6 +1492,7 @@
+         m_xgkick.cycleCredit -= 2u;
+         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
+         {
++            logXgkickOverflow(this, "no-EOP>64KB", m_xgkick.sourceAddress, m_xgkick.copiedBytes, m_xgkick.packet.data(), 0u);
+             reportReservedInstruction(false, 0xFFFFFFFBu);
+             m_xgkick.active = false;
+             return;
+@@ -1510,6 +1536,7 @@
+ 
+             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
+             {
++                logXgkickOverflow(this, "huge-tag", m_xgkick.sourceAddress, m_xgkick.copiedBytes, m_xgkick.packet.data(), qwordOffset);
+                 reportReservedInstruction(false, 0xFFFFFFFBu);
+                 m_xgkick.active = false;
+                 return;
