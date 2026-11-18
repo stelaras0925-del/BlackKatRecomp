@@ -574,6 +574,187 @@ namespace
 
     // FMV start (0x1E1828(player, name, 0)): log the clip name so front-end
     // state changes are visible in the log. Wraps the generated function.
+    // BLACKKAT_SKINLOG=N (debug): log the first N calls of the EE skinning
+    // routine 0x1BC920 (3-matrix vertex transform, called from 0x1E3748):
+    // inputs, matrices and a few transformed vertices.
+    constexpr uint32_t kSkinPos = 0x001BC920u;
+    PS2Runtime::RecompiledFunction g_origSkinPos = nullptr;
+
+    void blackkatSkinLog(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const int s_max = []() { const char *e = std::getenv("BLACKKAT_SKINLOG"); return e ? std::atoi(e) : 0; }();
+        static int s_n = 0;
+        const uint32_t src = getRegU32(ctx, 4), idx = getRegU32(ctx, 5), m1 = getRegU32(ctx, 6), m2 = getRegU32(ctx, 7),
+                       m3 = getRegU32(ctx, 8), dst = getRegU32(ctx, 9), cnt = getRegU32(ctx, 10), ra = getRegU32(ctx, 31);
+        g_origSkinPos(rdram, ctx, runtime);
+        if (s_n >= s_max || ctx->pc != ra)
+            return;
+        ++s_n;
+        auto f = [&](uint32_t a) { float v = 0; if (const uint8_t *p = getMemPtr(rdram, a)) std::memcpy(&v, p, 4); return v; };
+        auto b = [&](uint32_t a) { int v = 0; if (const uint8_t *p = getMemPtr(rdram, a)) v = static_cast<int8_t>(*p); return v; };
+        std::fprintf(stderr, "[skin] #%d src=%x idx=%x m=%x,%x,%x dst=%x n=%u\n", s_n, src, idx, m1, m2, m3, dst, cnt);
+        for (uint32_t m : {m1, m2, m3})
+            std::fprintf(stderr, "[skin]   M %x: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n", m,
+                         f(m), f(m + 4), f(m + 8), f(m + 12), f(m + 16), f(m + 20), f(m + 24), f(m + 28),
+                         f(m + 32), f(m + 36), f(m + 40), f(m + 44), f(m + 48), f(m + 52), f(m + 56), f(m + 60));
+        for (uint32_t i = 0; i < cnt && i < 4; ++i)
+            std::fprintf(stderr, "[skin]   v%u i=%d in=(%g %g %g %g) out=(%g %g %g)\n", i, b(idx + i),
+                         f(src + i * 16), f(src + i * 16 + 4), f(src + i * 16 + 8), f(src + i * 16 + 12),
+                         f(dst + i * 12), f(dst + i * 12 + 4), f(dst + i * 12 + 8));
+    }
+
+    // BLACKKAT_BONELOG=N (debug): log the bone matrix concatenation 0x1BC790
+    // (out = local(a0) * parent(a1)) when called from the skeleton update 0x1A89A8.
+    constexpr uint32_t kMatMul = 0x001BC790u;
+    PS2Runtime::RecompiledFunction g_origMatMul = nullptr;
+
+    void blackkatBoneLog(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const int s_max = []() { const char *e = std::getenv("BLACKKAT_BONELOG"); return e ? std::atoi(e) : 0; }();
+        static int s_n = 0;
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6), ra = getRegU32(ctx, 31);
+        auto f = [&](uint32_t a) { float v = 0; if (const uint8_t *p = getMemPtr(rdram, a)) std::memcpy(&v, p, 4); return v; };
+        const float lt[4] = {f(a0 + 48), f(a0 + 52), f(a0 + 56), f(a0 + 60)};
+        const float lr0[4] = {f(a0), f(a0 + 4), f(a0 + 8), f(a0 + 12)};
+        g_origMatMul(rdram, ctx, runtime);
+        static const float s_lo = []() { const char *e = std::getenv("BLACKKAT_BONELOG_X"); return e ? std::strtof(e, nullptr) : -1e30f; }();
+        const float px = f(a1 + 48);
+        if (s_n >= s_max || px < s_lo || px > s_lo + 200.0f)
+            return;
+        ++s_n;
+        std::fprintf(stderr, "[bone] #%d ra=%x local=%x r0=(%g %g %g %g) t=(%g %g %g %g) parent=%x t=(%g %g %g %g) out=%x t=(%g %g %g %g)\n",
+                     s_n, ra, a0, lr0[0], lr0[1], lr0[2], lr0[3], lt[0], lt[1], lt[2], lt[3], a1, f(a1 + 48), f(a1 + 52), f(a1 + 56), f(a1 + 60),
+                     a2, f(a2 + 48), f(a2 + 52), f(a2 + 56), f(a2 + 60));
+    }
+
+    // BLACKKAT_PARTLOG=N (debug): log the first N model draws (0x1E3588) whose first
+    // bone matrix lies near BLACKKAT_PARTLOG_X,Z (+-2 units): per part the 64-bit
+    // flags at +0x78, +0x86, bone indices and the batch chain at +0x6C.
+    constexpr uint32_t kModelSkin = 0x001E3588u;
+    PS2Runtime::RecompiledFunction g_origModelSkin = nullptr;
+
+    void blackkatPartLog(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const int s_max = []() { const char *e = std::getenv("BLACKKAT_PARTLOG"); return e ? std::atoi(e) : 0; }();
+        static const float s_x = []() { const char *e = std::getenv("BLACKKAT_PARTLOG_X"); return e ? std::strtof(e, nullptr) : 0.0f; }();
+        static const float s_z = []() { const char *e = std::getenv("BLACKKAT_PARTLOG_Z"); return e ? std::strtof(e, nullptr) : 0.0f; }();
+        static int s_n = 0;
+        const uint32_t obj = getRegU32(ctx, 4);
+        auto u32 = [&](uint32_t a) { uint32_t v = 0; if (const uint8_t *p = getMemPtr(rdram, a)) std::memcpy(&v, p, 4); return v; };
+        auto u64 = [&](uint32_t a) { uint64_t v = 0; if (const uint8_t *p = getMemPtr(rdram, a)) std::memcpy(&v, p, 8); return v; };
+        auto u16 = [&](uint32_t a) { uint16_t v = 0; if (const uint8_t *p = getMemPtr(rdram, a)) std::memcpy(&v, p, 2); return v; };
+        auto f = [&](uint32_t a) { float v = 0; if (const uint8_t *p = getMemPtr(rdram, a)) std::memcpy(&v, p, 4); return v; };
+        bool hit = false;
+        const uint32_t parts = u32(obj), nparts = u16(obj + 4), skel = u32(obj + 0x1C);
+        const uint32_t mats = skel ? u32(skel + 0x10) : 0u;
+        if (s_n < s_max && parts && nparts && mats)
+        {
+            const int16_t b0 = static_cast<int16_t>(u16(parts + 0x80));
+            const uint32_t m = mats + static_cast<uint32_t>(b0) * 128u;
+            hit = std::fabs(f(m + 48) - s_x) < 2.0f && std::fabs(f(m + 56) - s_z) < 2.0f;
+        }
+        if (hit)
+        {
+            ++s_n;
+            std::fprintf(stderr, "[part] #%d obj=%x flags6=%04x parts=%x n=%u skel=%x mats=%x ra=%x\n", s_n, obj, u16(obj + 6), parts, nparts, skel, mats, getRegU32(ctx, 31));
+            for (uint32_t i = 0; i < nparts && i < 64; ++i)
+            {
+                const uint32_t pp = parts + i * 0x90u;
+                const uint64_t fl = u64(pp + 0x78);
+                uint32_t nb = 0, nv = 0;
+                for (uint32_t b = u32(pp + 0x6C); b && nb < 256; b = u32(b + 0x20)) { ++nb; nv += u32(b + 0x24) >> 5; }
+                const int16_t i0 = static_cast<int16_t>(u16(pp + 0x80));
+                const uint32_t m0 = mats + static_cast<uint32_t>(i0) * 128u;
+                std::fprintf(stderr, "[part]   %2u fl=%016llx cnt=%llu f86=%04x bones=%d,%d,%d skinb=%u skinv=%u m0t=(%.3f %.3f %.3f)\n", i,
+                             (unsigned long long)fl, (unsigned long long)((fl >> 47) & 0x3FF), u16(pp + 0x86), i0,
+                             static_cast<int16_t>(u16(pp + 0x82)), static_cast<int16_t>(u16(pp + 0x84)), nb, nv, f(m0 + 48), f(m0 + 52), f(m0 + 56));
+            }
+        }
+        g_origModelSkin(rdram, ctx, runtime);
+        if (hit)
+        {
+            for (uint32_t i = 0; i < nparts && i < 128; ++i)
+            {
+                const uint32_t pp = parts + i * 0x90u;
+                for (uint32_t b = u32(pp + 0x6C), k = 0; b && k < 4; b = u32(b + 0x20), ++k)
+                {
+                    const uint32_t pk = u32(b + 0x1C);
+                    std::fprintf(stderr, "[partpk] %3u.%u batch=%x pkt=%x len=%x e=%x q0=%016llx %016llx q1=%016llx %016llx\n", i, k, b, pk, u32(b + 0x24), u16(b + 0xE),
+                                 (unsigned long long)u64(pk), (unsigned long long)u64(pk + 8), (unsigned long long)u64(pk + 16), (unsigned long long)u64(pk + 24));
+                }
+            }
+        }
+    }
+
+    // BLACKKAT_DMALOG=lo:hi (debug): log 0x154DC0 (bucket DMA tag append) calls whose
+    // CALL target (a1 >> 32) is in [lo,hi), and 0x15AE68 (part draw) calls whose part
+    // pointer (a0) is in [lo2,hi2) given by BLACKKAT_DMALOG_PARTS=lo:hi.
+    constexpr uint32_t kDmaAppend = 0x00154DC0u;
+    constexpr uint32_t kPartDraw = 0x0015AE68u;
+    PS2Runtime::RecompiledFunction g_origDmaAppend = nullptr;
+    PS2Runtime::RecompiledFunction g_origPartDraw = nullptr;
+    PS2Runtime::RecompiledFunction g_origUvAnim = nullptr;
+    unsigned g_dmaAppendCalls = 0, g_uvAnimCalls = 0;
+    bool g_inKatPart = false;
+    void blackkatUvAnimLog(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++g_uvAnimCalls;
+        const uint32_t a0 = getRegU32(ctx, 4), ra = getRegU32(ctx, 31), sp = getRegU32(ctx, 29);
+        g_origUvAnim(rdram, ctx, runtime);
+        if (g_inKatPart)
+            std::fprintf(stderr, "[uvanim] batch=%x ra=%x -> pc=%x sp %x->%x\n", a0, ra, ctx->pc, sp, getRegU32(ctx, 29));
+    }
+    bool parseRange(const char *e, uint32_t &lo, uint32_t &hi)
+    {
+        if (!e) return false;
+        char *x = nullptr;
+        lo = static_cast<uint32_t>(std::strtoul(e, &x, 16));
+        hi = (x && *x == ':') ? static_cast<uint32_t>(std::strtoul(x + 1, nullptr, 16)) : 0u;
+        return hi > lo;
+    }
+    void blackkatDmaAppendLog(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t lo = 0, hi = 0;
+        static const bool on = parseRange(std::getenv("BLACKKAT_DMALOG"), lo, hi);
+        static unsigned n = 0;
+        const uint64_t a1 = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(ctx->r[5]));
+        const uint32_t tgt = static_cast<uint32_t>(a1 >> 32);
+        auto u32 = [&](uint32_t a) { uint32_t v = 0; if (const uint8_t *p = getMemPtr(rdram, a)) std::memcpy(&v, p, 4); return v; };
+        if (on && tgt >= lo && tgt < hi && n < 20000u)
+        {
+            ++n;
+            const uint32_t b = getRegU32(ctx, 4);
+            const uint32_t ent = 0x7F8968u + b * 12u;
+            std::fprintf(stderr, "[dmaapp] tgt=%x tag=%08x bucket=%u a2=%x a3=%x list=%x bkt={%x %x %x} ra=%x\n", tgt, static_cast<uint32_t>(a1), b, getRegU32(ctx, 6),
+                         getRegU32(ctx, 7), u32(0x723210u), u32(ent), u32(ent + 4), u32(ent + 8), getRegU32(ctx, 31));
+        }
+        ++g_dmaAppendCalls;
+        g_origDmaAppend(rdram, ctx, runtime);
+    }
+    void blackkatPartDrawLog(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t lo = 0, hi = 0;
+        static const bool on = parseRange(std::getenv("BLACKKAT_DMALOG_PARTS"), lo, hi);
+        static unsigned n = 0;
+        const uint32_t a0 = getRegU32(ctx, 4);
+        if (on && a0 >= lo && a0 < hi && n < 20000u)
+        {
+            ++n;
+            uint64_t fl = 0;
+            uint16_t f86 = 0;
+            if (const uint8_t *p = getMemPtr(rdram, a0 + 0x78)) std::memcpy(&fl, p, 8);
+            if (const uint8_t *p = getMemPtr(rdram, a0 + 0x86)) std::memcpy(&f86, p, 2);
+            std::fprintf(stderr, "[partdraw] part=%x idx=%u fl=%016llx f86=%04x ra=%x\n", a0, (a0 - lo) / 0x90u, (unsigned long long)fl, f86, getRegU32(ctx, 31));
+            const unsigned d0 = g_dmaAppendCalls, u0 = g_uvAnimCalls;
+            g_inKatPart = true;
+            g_origPartDraw(rdram, ctx, runtime);
+            g_inKatPart = false;
+            std::fprintf(stderr, "[partdraw]   -> pc=%x appends=%u uvanim=%u\n", ctx->pc, g_dmaAppendCalls - d0, g_uvAnimCalls - u0);
+            return;
+        }
+        g_origPartDraw(rdram, ctx, runtime);
+    }
+
     constexpr uint32_t kFmvStart = 0x001E1828u;
     PS2Runtime::RecompiledFunction g_origFmvStart = nullptr;
 
@@ -851,6 +1032,36 @@ namespace
                       << (padOk ? "bound" : "FAILED") << std::endl;
         }
         g_origFmvStart = runtime.lookupFunction(kFmvStart);
+        if (const char *bl = std::getenv("BLACKKAT_BONELOG"); bl && std::atoi(bl) > 0)
+        {
+            g_origMatMul = runtime.lookupFunction(kMatMul);
+            if (g_origMatMul)
+                runtime.replaceFunction(kMatMul, &blackkatBoneLog);
+        }
+        if (const char *pl = std::getenv("BLACKKAT_PARTLOG"); pl && std::atoi(pl) > 0)
+        {
+            g_origModelSkin = runtime.lookupFunction(kModelSkin);
+            if (g_origModelSkin)
+                runtime.replaceFunction(kModelSkin, &blackkatPartLog);
+        }
+        if (std::getenv("BLACKKAT_DMALOG") || std::getenv("BLACKKAT_DMALOG_PARTS"))
+        {
+            g_origDmaAppend = runtime.lookupFunction(kDmaAppend);
+            g_origPartDraw = runtime.lookupFunction(kPartDraw);
+            if (g_origDmaAppend)
+                runtime.replaceFunction(kDmaAppend, &blackkatDmaAppendLog);
+            if (g_origPartDraw)
+                runtime.replaceFunction(kPartDraw, &blackkatPartDrawLog);
+            g_origUvAnim = runtime.lookupFunction(0x00156760u);
+            if (g_origUvAnim)
+                runtime.replaceFunction(0x00156760u, &blackkatUvAnimLog);
+        }
+        if (const char *sl = std::getenv("BLACKKAT_SKINLOG"); sl && std::atoi(sl) > 0)
+        {
+            g_origSkinPos = runtime.lookupFunction(kSkinPos);
+            if (g_origSkinPos)
+                runtime.replaceFunction(kSkinPos, &blackkatSkinLog);
+        }
         if (const char *sw = std::getenv("BLACKKAT_FMV_STOP_WAIT"); !(sw && sw[0] == '1'))
         {
             g_origFmvStop = runtime.lookupFunction(kFmvStop);

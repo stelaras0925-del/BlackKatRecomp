@@ -705,3 +705,45 @@ replaced DecodeFrame body) that store the callback result into the abort flag
 (player+0x50) and return 0 to the real caller. BLACKKAT_FMV_CB_TRAMPOLINE=0
 restores the old behaviour. Verified: menu -> Continue -> slot 4 loads into
 Buccaneer Bay on foot (build/slot4_fix_1237.log, shots build/shots/slot4fix_*).
+
+## Teleport hung: VIF1 UNPACK split across DMA transfers — PARTIAL FIX 2026-11-18 (patches/ps2recomp-vif1-carry.patch)
+
+Symptom: using a teleport (Buccaneer Bay -> Skull Islands) hung or showed garbage.
+A VIF1 UNPACK/DIRECT whose data ran past the end of one DMA transfer was dropped
+and the remaining data of the next transfer was parsed as VIF codes.
+
+Fix (ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp, backup .pre-carry.bak): the
+VIF1 interpreter carries an unfinished command and its remaining data into the
+next transfer, as the hardware does. PS2X_VIF1_CARRY=0 turns it off.
+Result: teleport works. build/teleport2_1321.log: 20 carry events, all with
+garbage command words; 3061 "reserved lower" VU1 errors starting at log line
+3017, before the first carry (line 3036). So VU1 code corruption that starts
+before any carry is still open; the carry only stops the hang.
+
+## Characters missing parts, trees/rocks missing: 64-bit BLTZ/BGEZ/BLEZ/BGTZ tested as 32-bit — FIXED 2026-11-18 (patches/ps2recomp-regimm-branch-64bit.patch)
+
+Symptom: Kat drawn as a small blob (only her sword, pelvis and a few pieces),
+trees and rocks missing on Skull Islands, stray polygons.
+
+Cause: the recompiler emitted BLTZ/BGEZ/BLEZ/BGTZ (and their -L/-AL forms) as
+`GPR_S32(ctx, rs) < 0` etc. The R5900 tests the full 64-bit register. The model
+code loads 64-bit part flags (`ld v1, 0x78(part)`) and uses `bltz` on them
+(bit 63 = part hidden). When the low word of the flags had bit 31 set, the part
+was treated as hidden:
+- FUN_0015AE68 (draw part, `bltz` at 0x15AE90) skipped the part, so no DMA
+  CALL tag was added for it (FUN_00154DC0). 116 of Kat's 127 parts were skipped.
+- FUN_001E3588 (skin model, `bltz` at 0x1E3618) skipped skinning those parts,
+  so once drawn they were still in bind-local space and collapsed to one point.
+Found with BLACKKAT_DMALOG / BLACKKAT_DMALOG_PARTS (src/overrides) and
+PS2X_DMA_WATCH / PS2X_DMA_CHAINLOG (ps2_memory.cpp), all env-gated diagnostics.
+
+Fix: control_flow_emitter.cpp now emits GPR_S64 for those branches. All other
+GPR writes are 64-bit faithful (SET_GPR_U32/S32 sign-extend, ZE32 only for
+lbu/lhu/lwu, setReturn* sign-extend), so for 32-bit values the result is the same.
+Applied for now by editing only the 32 generated files where the branch
+register comes from a 64-bit op in the same block (ld/dsra32/dsll32/dsrl32/
+dsll/mflo/pextlw): originals in build/generated.pre-s64/. A full ps2_recomp
+regen is still needed to cover all 4347 branch sites (registers set in another
+block) and keep build/generated consistent with the generator.
+Verified: slot-4 save on foot, Kat fully drawn (build/shots/ab_s64b_*,
+before: ab_dl4_*); Kat VU1 0xbd8 runs per frame went from ~10 to ~85.
