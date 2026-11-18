@@ -1,3 +1,4 @@
+#include <algorithm>
 // SPDX-License-Identifier: GPL-3.0-only
 //
 // Host entry for the Black Kat recompilation. Recompiled guest code is not
@@ -25,6 +26,7 @@
 #include <ucontext.h>
 #include <execinfo.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 namespace
 {
@@ -165,9 +167,94 @@ namespace
                     })
             .detach();
     }
+
+    // BLACKKAT_WATCH="guestStart,guestEnd[,seconds]": write-watch on guest RDRAM. The host pages
+    // backing the range are made read-only; each write fault records the host RIP (offset from the
+    // exe base, for addr2line -> generated FUN_xxx) plus the guest address, unprotects the page and
+    // a helper thread re-protects every 2 ms. Writes blackkat_watch.txt after <seconds> (default 40).
+    struct WatchHit { uint64_t rip; uint32_t guest; uint32_t ms; };
+    constexpr size_t kWatchMax = 1u << 16;
+    WatchHit g_watchHits[kWatchMax];
+    std::atomic<size_t> g_watchN{0};
+    uintptr_t g_watchLo = 0, g_watchHi = 0, g_watchRam = 0;
+    struct sigaction g_watchPrev{};
+    std::chrono::steady_clock::time_point g_watchT0;
+
+    void watchHandler(int sig, siginfo_t *si, void *uc)
+    {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
+        if (a >= g_watchLo && a < g_watchHi)
+        {
+            const size_t i = g_watchN.fetch_add(1, std::memory_order_relaxed);
+            if (i < kWatchMax)
+            {
+                const auto *u = static_cast<const ucontext_t *>(uc);
+                g_watchHits[i].rip = static_cast<uint64_t>(u->uc_mcontext.gregs[REG_RIP]);
+                g_watchHits[i].guest = static_cast<uint32_t>(a - g_watchRam);
+                g_watchHits[i].ms = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                              std::chrono::steady_clock::now() - g_watchT0).count());
+            }
+            mprotect(reinterpret_cast<void *>(a & ~uintptr_t(4095)), 4096, PROT_READ | PROT_WRITE);
+            return;
+        }
+        if (g_watchPrev.sa_flags & SA_SIGINFO)
+        {
+            if (g_watchPrev.sa_sigaction) { g_watchPrev.sa_sigaction(sig, si, uc); return; }
+        }
+        else if (g_watchPrev.sa_handler != SIG_DFL && g_watchPrev.sa_handler != SIG_IGN && g_watchPrev.sa_handler)
+        {
+            g_watchPrev.sa_handler(sig);
+            return;
+        }
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+
+    void startWatch(uint8_t *rdram)
+    {
+        const char *e = std::getenv("BLACKKAT_WATCH");
+        if (!e || !*e)
+            return;
+        unsigned long gs = 0, ge = 0; int secs = 40;
+        if (std::sscanf(e, "%lx,%lx,%d", &gs, &ge, &secs) < 2 || ge <= gs)
+            return;
+        g_watchRam = reinterpret_cast<uintptr_t>(rdram);
+        g_watchLo = (g_watchRam + gs + 4095) & ~uintptr_t(4095);
+        g_watchHi = (g_watchRam + ge) & ~uintptr_t(4095);
+        if (g_watchHi <= g_watchLo)
+            return;
+        g_watchT0 = std::chrono::steady_clock::now();
+        struct sigaction sa{};
+        sa.sa_sigaction = watchHandler;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &g_watchPrev);
+        std::cerr << "[blackkat] write-watch guest 0x" << std::hex << (g_watchLo - g_watchRam) << "-0x"
+                  << (g_watchHi - g_watchRam) << std::dec << " for " << secs << "s" << std::endl;
+        std::thread([secs]()
+                    {
+                        const auto end = g_watchT0 + std::chrono::seconds(secs);
+                        while (std::chrono::steady_clock::now() < end)
+                        {
+                            mprotect(reinterpret_cast<void *>(g_watchLo), g_watchHi - g_watchLo, PROT_READ);
+                            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        }
+                        mprotect(reinterpret_cast<void *>(g_watchLo), g_watchHi - g_watchLo, PROT_READ | PROT_WRITE);
+                        const size_t n = std::min(g_watchN.load(), kWatchMax);
+                        const uintptr_t base = exeBase();
+                        if (FILE *f = std::fopen("blackkat_watch.txt", "w"))
+                        {
+                            for (size_t i = 0; i < n; ++i)
+                                std::fprintf(f, "%u %08x %llx\n", g_watchHits[i].ms, g_watchHits[i].guest,
+                                             static_cast<unsigned long long>(g_watchHits[i].rip - base));
+                            std::fclose(f);
+                        }
+                        std::cerr << "[blackkat] write-watch wrote " << n << " hits" << std::endl; })
+            .detach();
+    }
 }
 
-// Debug: BLACKKAT_FAKEKEY="x,enter,down" synthesises real key events through
+// Debug: BLACKKAT_FAKEKEY=="x,enter,down" synthesises real key events through
 // raylib's own GLFW key callback (the exact path a physical key takes:
 // GLFW -> raylib KeyCallback -> CORE key state -> IsKeyDown). One step every
 // BLACKKAT_FAKEKEY_MS (default 1500), held BLACKKAT_FAKEKEY_HOLD_MS (150),
@@ -178,6 +265,65 @@ extern "C"
     BlackkatGlfwKeyFun glfwSetKeyCallback(void *window, BlackkatGlfwKeyFun cb);
     void *GetWindowHandle(void);
 }
+// Debug: BLACKKAT_KEYSCRIPT="7000:x:200,8500:down:150,9000:x+e:300" presses key(s) at absolute
+// times (ms since start), held for the given ms. Keys: x z c v enter up down left right space
+// q e lshift rshift tab w a s d; '+' joins keys pressed together.
+static int blackkatKeyCode(const std::string &t)
+{
+    static const std::pair<const char *, int> m[] = {{"x", 88}, {"z", 90}, {"c", 67}, {"v", 86}, {"enter", 257},
+        {"up", 265}, {"down", 264}, {"left", 263}, {"right", 262}, {"space", 32}, {"q", 81}, {"e", 69},
+        {"lshift", 340}, {"rshift", 344}, {"tab", 258}, {"w", 87}, {"a", 65}, {"s", 83}, {"d", 68}};
+    for (const auto &kv : m)
+        if (t == kv.first)
+            return kv.second;
+    return 0;
+}
+static void blackkatStartKeyScript()
+{
+    const char *e = std::getenv("BLACKKAT_KEYSCRIPT");
+    if (!e || !e[0])
+        return;
+    struct Step { int at; std::vector<int> keys; int hold; };
+    std::vector<Step> steps;
+    std::stringstream ss(e);
+    std::string item;
+    while (std::getline(ss, item, ','))
+    {
+        const size_t a = item.find(':'), b = item.rfind(':');
+        if (a == std::string::npos || b == a)
+            continue;
+        Step st{std::atoi(item.substr(0, a).c_str()), {}, std::atoi(item.substr(b + 1).c_str())};
+        std::stringstream ks(item.substr(a + 1, b - a - 1));
+        std::string k;
+        while (std::getline(ks, k, '+'))
+            if (int c = blackkatKeyCode(k))
+                st.keys.push_back(c);
+        if (!st.keys.empty())
+            steps.push_back(st);
+    }
+    std::sort(steps.begin(), steps.end(), [](const Step &x, const Step &y) { return x.at < y.at; });
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread([steps, t0]()
+                {
+        void *win = nullptr;
+        for (int i = 0; i < 400 && !(win = GetWindowHandle()); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (!win) { std::cerr << "[keyscript] no window" << std::endl; return; }
+        BlackkatGlfwKeyFun cb = glfwSetKeyCallback(win, nullptr);
+        glfwSetKeyCallback(win, cb);
+        if (!cb) { std::cerr << "[keyscript] no raylib key callback" << std::endl; return; }
+        for (const Step &st : steps)
+        {
+            std::this_thread::sleep_until(t0 + std::chrono::milliseconds(st.at));
+            std::cerr << "[keyscript] t=" << st.at << " press";
+            for (int k : st.keys) { std::cerr << " " << k; cb(win, k, 0, 1, 0); }
+            std::cerr << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(st.hold));
+            for (int k : st.keys) cb(win, k, 0, 0, 0);
+        } })
+        .detach();
+}
+
 static void blackkatStartFakeKeys()
 {
     const char *e = std::getenv("BLACKKAT_FAKEKEY");
@@ -288,6 +434,8 @@ int main(int argc, char *argv[])
         }
 
         blackkatStartFakeKeys();
+        blackkatStartKeyScript();
+        startWatch(runtime.memory().getRDRAM());
 
         // Debug: BLACKKAT_RAMDUMP="20,50" writes guest RDRAM (32 MB) to
         // ramdump_<sec>.bin in the working directory after each delay.

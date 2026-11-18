@@ -651,3 +651,57 @@ Measured (t=30–56 s, VU1 thread on), VIF writes/s | vsync/s:
 - GPU GS: 15.59 | 28.26 (7b97dc8) -> 17.40 | 36.67
 - CPU GS: 9.44 | 19.90 (7b97dc8) -> 9.44 | 24.55 (CPU GS rasteriser-bound)
 - `PS2X_VU1_BC_CHECK=1`: 0 mismatches (GPU 280k runs, CPU 240k runs).
+
+## Front-end Continue / Options froze on a black screen: FIXED (2026-11-18, src/overrides, patches/blackkat-continue-fmv-transition.patch)
+
+- Symptom: choosing Continue (memory-card load page) or another page change left the screen black; DMA stopped.
+- Cause: the front end (0x1E6C40) plays a short transition clip when a page changes. It sets 0x3A3DEC = 1 while
+  that clip plays and only switches to the new page when the clip reports end of stream (DecodeFrame -> 1).
+  Our FMV stub (`blackkatFmvFrameEnd`, DecodeFrame at 0x1E1B00) never reported the end for these clips, so the
+  flag stayed 1 forever and the new page was never drawn.
+- Fix: while 0x3A3DEC != 0, the stub returns end-of-stream after `BLACKKAT_FMV_TRANSITION_FRAMES` frames
+  (default 40, so the X press that opened the page is released before the page reads the pad; 0 = old behaviour).
+- Result: the load page appears and reads /BASLUS-20365/01-04.HDR from game/mc0. The four slots there are all
+  empty ("--------", files from 2026-11-11), so choosing one starts mission 1; no progress save exists yet.
+  Backup of the card: game/mc0.bak-20261118.
+
+## Terrain / sea floor as tall square columns: FIXED (2026-11-18, patches/ps2recomp-onfoot-geom.patch)
+
+- Symptom: island cliffs, on-foot terrain and the sea floor drawn as tall square columns / blocks (every 4th
+  row and column of vertices dropped to height 0). Same with every VU1/VIF A/B switch, so not a speed feature.
+- Cause: `FPU_CVT_W_S` (EE FPU CVT.W.S) in ps2xRuntime/include/ps2_runtime_macros.h used `nearbyintf`, i.e.
+  round-half-to-even. The EE always truncates toward zero. The terrain builder at 0x163058 upsamples the
+  129x129 byte heightmap (struct 0x32FDF0 -> 0x12E4720) to a 258x258 float grid (0x12E8840) with a weight
+  table on the scratchpad, splitting each coordinate (step 0.5) into int + fraction with cvt.w.s. With
+  rounding, x = 1.5, 3.5, 5.5, ... gave int 2, 4, 6 and fraction -0.5 -> weight-row index -1 -> weights read
+  from 0x6FFFFFF0 (zero) -> height 0 for every 4th row and column. The mesh builders copy that grid, so all
+  terrain meshes got spikes down to 0.
+- Found with BLACKKAT_WATCH (write-watch on guest RAM, src/main.cpp) -> entry_001633dc / FUN_00163058, and a
+  Python model of the function reproducing the zero pattern.
+- Fix: truncate toward zero and saturate to INT32_MIN/INT32_MAX when |x| >= 2^31 (exponent >= 158), as the EE
+  does. VU0 VFTOI already used _mm_cvttps_epi32 (truncation) and is unchanged.
+- The header is included by every generated file: a full recompile of build/generated is needed after
+  applying the patch (no regeneration needed; 848 generated functions use FPU_CVT_W_S).
+- Result: zeros in the 258x258 grid went from ~29k to 8 (real values); island terrain smooth on the ship level.
+
+## Loading a save (load page -> slot) hung on a black screen — FIXED 2026-11-18
+
+Symptom: picking a filled slot on the Continue/load page showed a black screen
+forever; the log showed the slot file (0N.SAV, 120004 bytes) being opened/read
+again every ~3 frames (sceMcOpen fd numbers climbing into the thousands).
+The save file itself was fine (fully written, header "Buccaneer Bay 05:27").
+
+Cause: the load page's frame callback (0x1EC8F0) is run from the DecodeFrame
+stub (0x1E1B00 override) through dispatchGuestBranch. Its save load (0x1BDAC8)
+waits on sceMcSync, so the callback gets preempted; when the scheduler resumed
+it, its `jr ra` returned straight to the stub's caller 0x1E7984 with v0 = 1.
+The front end read that as "clip ended" instead of DecodeFrame = 2 (abort set
+from the callback result), restarted the page clip and ran the load again.
+
+Fix (src/overrides/blackkat_slus_20365.cpp, patch
+patches/blackkat-load-save-fmv-cb-preempt.patch): the pump and frame-callback
+calls now return through trampolines at 0x1E1B08 / 0x1E1B10 (inside the
+replaced DecodeFrame body) that store the callback result into the abort flag
+(player+0x50) and return 0 to the real caller. BLACKKAT_FMV_CB_TRAMPOLINE=0
+restores the old behaviour. Verified: menu -> Continue -> slot 4 loads into
+Buccaneer Bay on foot (build/slot4_fix_1237.log, shots build/shots/slot4fix_*).

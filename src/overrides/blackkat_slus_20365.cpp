@@ -328,6 +328,61 @@ namespace
     // stream so the caller stops/loops the movie and carries on.
     constexpr uint32_t kFmvDecodeFrame = 0x001E1B00u;
 
+    // Return trampolines for the guest calls made from the DecodeFrame stub
+    // (pump 0x2B31E0 and the page frame callback). If such a call is preempted
+    // (the load page's callback 0x1EC8F0 waits on sceMcSync inside the save
+    // load 0x1BDAC8), the scheduler later resumes it and its "jr ra" used to
+    // land straight on the stub's caller (0x1E7984) with the callback's v0.
+    // The load callback returns 1 ("leave front end"), which the front end
+    // then read as "clip ended" instead of abort=1/DecodeFrame=2, so it
+    // restarted the page clip and re-ran the load forever: black screen after
+    // picking a save slot. The calls now return here (addresses inside the
+    // replaced DecodeFrame body, never reached by guest code) and finish the
+    // stub's work: abort flag = callback result, DecodeFrame returns 0.
+    // BLACKKAT_FMV_CB_TRAMPOLINE=0 restores the old behaviour.
+    constexpr uint32_t kFmvPumpReturn = 0x001E1B08u;
+    constexpr uint32_t kFmvFrameCbReturn = 0x001E1B10u;
+    uint32_t g_fmvCbPlayer = 0u;
+    uint32_t g_fmvCbRa = 0u;
+
+    bool fmvCbTrampolineOn()
+    {
+        static const bool on = []() {
+            const char *e = std::getenv("BLACKKAT_FMV_CB_TRAMPOLINE");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+
+    void blackkatFmvPumpReturn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        // Pump finished after a preemption: report "frame decoded"; the
+        // callback runs on the next DecodeFrame call.
+        static unsigned logged = 0;
+        if (logged++ < 20)
+            std::cerr << "[blackkat] FMV pump resumed -> ra=0x" << std::hex << g_fmvCbRa << std::dec << std::endl;
+        setReturnS32(ctx, 0);
+        SET_GPR_U32(ctx, 31, g_fmvCbRa);
+        ctx->pc = g_fmvCbRa;
+    }
+
+    void blackkatFmvFrameCbReturn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        const uint32_t res = getRegU32(ctx, 2);
+        if (uint32_t *pl = reinterpret_cast<uint32_t *>(getMemPtr(rdram, g_fmvCbPlayer)))
+            pl[0x50 / 4] = res;
+        static unsigned logged = 0;
+        if (logged++ < 40)
+            std::cerr << "[blackkat] FMV frame cb resumed -> 0x" << std::hex << res << " (player=0x" << g_fmvCbPlayer
+                      << " ra=0x" << g_fmvCbRa << ")" << std::dec << std::endl;
+        setReturnS32(ctx, 0);
+        SET_GPR_U32(ctx, 31, g_fmvCbRa);
+        ctx->pc = g_fmvCbRa;
+    }
+
     void blackkatFmvFrameEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ctx->pc = getRegU32(ctx, 31);
@@ -404,6 +459,40 @@ namespace
             s_player = player;
             s_count = 0;
         }
+        // Front-end page transitions (Continue -> load page, Options, ...): the
+        // front end (0x1E7988..0x1E7C58) sets 0x3A3DEC = 1 while a transition clip
+        // plays and only moves to the new page when that clip reports end of
+        // stream (DecodeFrame -> 1). The page callback skips all drawing while
+        // 0x3A3DEC != 0, so with the stub never ending a clip the screen froze on
+        // the main menu (Continue "did nothing"). End transition clips after
+        // BLACKKAT_FMV_TRANSITION_FRAMES flag-0 frames (default 40, so the X press that
+        // opened the page is released before the page reads the pad; 0 = old hang).
+        {
+            static const uint32_t s_transFrames = []() -> uint32_t {
+                const char *e = std::getenv("BLACKKAT_FMV_TRANSITION_FRAMES");
+                return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 40u;
+            }();
+            static uint32_t s_transCount = 0;
+            uint32_t inTransition = 0;
+            std::memcpy(&inTransition, rdram + 0x3A3DECu, 4);
+            if (s_transFrames != 0u && inTransition != 0u)
+            {
+                if (++s_transCount >= s_transFrames)
+                {
+                    s_transCount = 0;
+                    static unsigned transLogged = 0;
+                    if (transLogged++ < 20)
+                        std::cerr << "[blackkat] FMV transition clip ended (player=0x" << std::hex << player
+                                  << std::dec << ")" << std::endl;
+                    setReturnS32(ctx, 1);
+                    return;
+                }
+            }
+            else
+            {
+                s_transCount = 0;
+            }
+        }
         if (s_fmvFrames != 0u && ++s_count >= s_fmvFrames)
         {
             s_count = 0;
@@ -416,21 +505,30 @@ namespace
         }();
         if (s_pump && runtime)
         {
+            const bool tramp = fmvCbTrampolineOn();
+            const uint32_t pumpRet = tramp ? kFmvPumpReturn : ra;
+            g_fmvCbPlayer = player;
+            g_fmvCbRa = ra;
             SET_GPR_U32(ctx, 4, 0u);
+            SET_GPR_U32(ctx, 31, pumpRet);
             ctx->pc = 0x002B31E0u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002B31E0u, ra - 8u, ra,
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002B31E0u, ra - 8u, pumpRet,
                                               PS2Runtime::GuestBranchKind::DirectCall, "FMVPUMP"))
-                return; // preempted: resumes at ra
+                return; // preempted: resumes at pumpRet (trampoline -> ra)
             SET_GPR_U32(ctx, 31, ra);
             ctx->pc = ra;
             const uint32_t cb = pl ? pl[0] : 0u;
             if (cb != 0u && runtime->hasFunction(cb))
             {
+                const uint32_t cbRet = tramp ? kFmvFrameCbReturn : ra;
+                g_fmvCbPlayer = player;
+                g_fmvCbRa = ra;
                 SET_GPR_U32(ctx, 4, player);
+                SET_GPR_U32(ctx, 31, cbRet);
                 ctx->pc = cb;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, cb, ra - 8u, ra,
+                if (!runtime->dispatchGuestBranch(rdram, ctx, cb, ra - 8u, cbRet,
                                                   PS2Runtime::GuestBranchKind::IndirectCall, "FMVFRAMECB"))
-                    return;
+                    return; // preempted: resumes at cbRet (trampoline sets abort, returns 0 to ra)
                 const uint32_t res = getRegU32(ctx, 2);
                 pl = reinterpret_cast<uint32_t *>(getMemPtr(rdram, player));
                 if (pl)
@@ -731,7 +829,9 @@ namespace
         if (const char *pf = std::getenv("BLACKKAT_PLAY_FMV"); !(pf && pf[0] == '1'))
         {
             const bool fmvOk = runtime.replaceFunction(kFmvPlayFile, &blackkatFmvSkip) &&
-                               runtime.replaceFunction(kFmvDecodeFrame, &blackkatFmvFrameEnd);
+                               runtime.replaceFunction(kFmvDecodeFrame, &blackkatFmvFrameEnd) &&
+                               runtime.replaceFunction(kFmvPumpReturn, &blackkatFmvPumpReturn) &&
+                               runtime.replaceFunction(kFmvFrameCbReturn, &blackkatFmvFrameCbReturn);
             std::cerr << "[blackkat] SLUS_203.65 v1.00 override: FMV skip (no IPU emulation) "
                       << (fmvOk ? "bound" : "FAILED") << std::endl;
         }
