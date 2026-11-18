@@ -1,0 +1,307 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,3 +1,4 @@
++#include <emmintrin.h>
+ #include "runtime/ps2_vu1.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -20,6 +21,10 @@
+ #include <memory>
+ #include <ps2_log.h>
+ 
++// VU1 cycles executed by run() (VU1 unit, not the compare-mode reference), for
++// [vu1thread:stats] "VU1 Mcyc per busy second" (throughput independent of the scene's load).
++std::atomic<uint64_t> g_ps2xVu1RunCycles{0};
++
+ namespace
+ {
+     constexpr bool kVu1FastDefault = true;
+@@ -278,6 +283,133 @@
+         static const bool on = []() { const char *e = std::getenv("PS2X_VU1_STATICSTALL"); return !(e && e[0] == '0'); }();
+         return on;
+     }
++    // PS2X_VU1_SIMD=0: per-lane scalar loop in the block-cache FMAC fast path instead of SSE2.
++    bool vu1SimdOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_SIMD"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // PS2X_VU1_FLATRDY=0: decode each ready-cycle slot (vf/vi/acc) with branches instead of
++    // indexing the three adjacent ready arrays as one flat array (vf=reg*4+lane, vi=128+reg,
++    // acc=144+lane: exactly the member layout, checked at run time).
++    bool vu1FlatRdyOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_FLATRDY"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // PS2X_VU1_INLINEADV=0: call advanceOneCycle() after every pair instead of the inlined copy
++    // (same steps: cycle++, commit unless the hint says nothing is due, PATH1 progress if active).
++    bool vu1InlineAdvOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_INLINEADV"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // PS2X_VU1_SKIPCOMMIT=0: commit pipelines at the top of every pair again even when the
++    // previous pair's advanceOneCycle() already committed for this same cycle.
++    bool vu1SkipCommitOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_SKIPCOMMIT"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++// SSE2 version of the fastUpper per-lane FMAC loop (ADD/SUB/MUL/MADD/MSUB). Same IEEE single
++// operations in the same order per lane (no FMA), so results are bit-identical; the same lanes
++// fall back (return false) as in the scalar loop. Lanes outside dest get flags 0.
++static inline __m128 vu1NormPs(__m128 v)
++{
++    const __m128i b = _mm_castps_si128(v);
++    const __m128i sign = _mm_and_si128(b, _mm_set1_epi32(static_cast<int>(0x80000000u)));
++    const __m128i e = _mm_and_si128(_mm_srli_epi32(b, 23), _mm_set1_epi32(0xFF));
++    const __m128i isZ = _mm_cmpeq_epi32(e, _mm_setzero_si128());
++    const __m128i isM = _mm_cmpeq_epi32(e, _mm_set1_epi32(0xFF));
++    const __m128i maxv = _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF));
++    __m128i r = _mm_or_si128(_mm_andnot_si128(_mm_or_si128(isZ, isM), b), _mm_and_si128(isZ, sign));
++    r = _mm_or_si128(r, _mm_and_si128(isM, maxv));
++    return _mm_castsi128_ps(r);
++}
++static inline __m128i vu1ExpOut(__m128 r) // lanes with exponent < 3 or > 252
++{
++    const __m128i e = _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(r), 23), _mm_set1_epi32(0xFF));
++    return _mm_or_si128(_mm_cmplt_epi32(e, _mm_set1_epi32(3)), _mm_cmpgt_epi32(e, _mm_set1_epi32(252)));
++}
++static inline bool vu1FmacSimd(int kind, uint8_t dest, bool zeroOn, const float *vsRaw, const float t[4],
++                               const float *accRaw, float res[4], uint8_t laneFlags[4], uint32_t &sticky)
++{
++    const __m128i destMask = _mm_set_epi32((dest & 1u) ? -1 : 0, (dest & 2u) ? -1 : 0, (dest & 4u) ? -1 : 0, (dest & 8u) ? -1 : 0);
++    const __m128 S = vu1NormPs(_mm_loadu_ps(vsRaw));
++    const __m128 T = _mm_loadu_ps(t);
++    const __m128 zero = _mm_setzero_ps();
++    const __m128i signBit = _mm_set1_epi32(static_cast<int>(0x80000000u));
++    __m128 R;
++    __m128i zcase = _mm_setzero_si128();
++    __m128i fail;
++    __m128i stickyLanes = _mm_setzero_si128(); // per lane sticky bits (1/2)
++    if (kind <= 2)
++    {
++        R = kind == 0 ? _mm_add_ps(S, T) : kind == 1 ? _mm_sub_ps(S, T) : _mm_mul_ps(S, T);
++        if (zeroOn)
++        {
++            const __m128 c = kind == 2 ? _mm_or_ps(_mm_cmpeq_ps(S, zero), _mm_cmpeq_ps(T, zero))
++                           : kind == 0 ? _mm_cmpeq_ps(S, _mm_xor_ps(T, _mm_castsi128_ps(signBit)))
++                                       : _mm_cmpeq_ps(S, T);
++            zcase = _mm_castps_si128(c);
++        }
++        fail = _mm_andnot_si128(zcase, vu1ExpOut(R));
++    }
++    else
++    {
++        const __m128 A = vu1NormPs(_mm_loadu_ps(accRaw));
++        const __m128 P = _mm_mul_ps(S, T);
++        R = kind == 3 ? _mm_add_ps(A, P) : _mm_sub_ps(A, P);
++        const __m128i Pb = _mm_castps_si128(P);
++        const __m128i pSign = _mm_srli_epi32(_mm_and_si128(Pb, signBit), 30); // 2 if negative
++        if (zeroOn)
++            zcase = _mm_castps_si128(_mm_or_ps(_mm_cmpeq_ps(S, zero), _mm_cmpeq_ps(T, zero)));
++        // non-zero-case checks
++        const __m128i pe = _mm_and_si128(_mm_srli_epi32(Pb, 23), _mm_set1_epi32(0xFF));
++        const __m128i ae = _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(A), 23), _mm_set1_epi32(0xFF));
++        __m128i f = _mm_or_si128(_mm_or_si128(_mm_cmplt_epi32(pe, _mm_set1_epi32(3)), _mm_cmpgt_epi32(pe, _mm_set1_epi32(252))),
++                                 _mm_cmpgt_epi32(ae, _mm_set1_epi32(252)));
++        // !(|r| * 2^20 >= |a| + |r|) in double
++        const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
++        const __m128 Ra = _mm_and_ps(R, absMask), Aa = _mm_and_ps(A, absMask);
++        const __m128d k20 = _mm_set1_pd(1048576.0);
++        const __m128d rlo = _mm_cvtps_pd(Ra), rhi = _mm_cvtps_pd(_mm_movehl_ps(Ra, Ra));
++        const __m128d alo = _mm_cvtps_pd(Aa), ahi = _mm_cvtps_pd(_mm_movehl_ps(Aa, Aa));
++        const __m128d oklo = _mm_cmpge_pd(_mm_mul_pd(rlo, k20), _mm_add_pd(alo, rlo));
++        const __m128d okhi = _mm_cmpge_pd(_mm_mul_pd(rhi, k20), _mm_add_pd(ahi, rhi));
++        const __m128i ok = _mm_castps_si128(_mm_shuffle_ps(_mm_castpd_ps(oklo), _mm_castpd_ps(okhi), _MM_SHUFFLE(2, 0, 2, 0)));
++        f = _mm_or_si128(f, _mm_andnot_si128(ok, _mm_set1_epi32(-1)));
++        f = _mm_or_si128(f, vu1ExpOut(R));
++        fail = _mm_andnot_si128(zcase, f);
++        // sticky: zero case 1|sign(P), else sign(P)
++        stickyLanes = _mm_or_si128(pSign, _mm_and_si128(zcase, _mm_set1_epi32(1)));
++    }
++    fail = _mm_and_si128(fail, destMask);
++    if (_mm_movemask_epi8(fail) != 0)
++        return false;
++    const __m128i Rb = _mm_castps_si128(R);
++    const __m128i rSign = _mm_srli_epi32(_mm_and_si128(Rb, signBit), 30); // 2 if negative
++    __m128i fl;
++    if (kind <= 2)
++        fl = _mm_or_si128(rSign, _mm_and_si128(zcase, _mm_set1_epi32(1)));
++    else
++    {
++        // zero case: Z if |r| == 0; normal case: r is in range (never zero)
++        const __m128i rz = _mm_cmpeq_epi32(_mm_and_si128(Rb, _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128());
++        fl = _mm_or_si128(rSign, _mm_and_si128(_mm_and_si128(zcase, rz), _mm_set1_epi32(1)));
++    }
++    fl = _mm_and_si128(fl, destMask);
++    stickyLanes = _mm_and_si128(stickyLanes, destMask);
++    alignas(16) uint32_t flv[4], stv[4];
++    _mm_store_si128(reinterpret_cast<__m128i *>(flv), fl);
++    _mm_store_si128(reinterpret_cast<__m128i *>(stv), stickyLanes);
++    for (int c = 0; c < 4; ++c)
++        laneFlags[c] = static_cast<uint8_t>(flv[c]);
++    sticky |= stv[0] | stv[1] | stv[2] | stv[3];
++    _mm_storeu_ps(res, R);
++    return true;
++}
++
+     // PS2X_VU1_FASTZERO=0: FMAC lanes with an exactly-zero product/sum go through the generic path again.
+     bool vu1FastZeroOn()
+     {
+@@ -2670,6 +2802,15 @@
+     const bool loopOn = tl_runXlat != nullptr && vu1LoopOn();
+     const bool zeroOn = tl_runXlat != nullptr && vu1FastZeroOn();
+     const bool fastLowerOn = tl_runXlat != nullptr && vu1FastLowerOn();
++    const bool simdOn = vu1SimdOn();
++    const bool skipCommitOn = vu1SkipCommitOn();
++    uint64_t committedCycle = ~0ull;
++    static const bool s_noHintRun = []() { const char *e = std::getenv("PS2X_VU1_NOHINT"); return e && e[0] == '1'; }();
++    const bool inlineAdv = vu1InlineAdvOn() && !s_noHintRun;
++    uint64_t *const flatRdy = &m_vfReady[0][0];
++    const bool flatRdyOn = vu1FlatRdyOn() &&
++                           reinterpret_cast<const char *>(&m_viReady[0]) == reinterpret_cast<const char *>(flatRdy + 128) &&
++                           reinterpret_cast<const char *>(&m_accReady[0]) == reinterpret_cast<const char *>(flatRdy + 144);
+     const auto fastUpper = [&](uint32_t instr) -> bool {
+         const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
+         const bool toAcc = op >= 0x3Cu;
+@@ -2832,6 +2973,12 @@
+         float res[4];
+         uint8_t laneFlags[4] = {0u, 0u, 0u, 0u};
+         uint32_t sticky = 0u;
++        if (simdOn)
++        {
++            if (!vu1FmacSimd(kind, dest, zeroOn, m_state.vf[fs], t, m_state.acc, res, laneFlags, sticky))
++                return false;
++        }
++        else
+         for (uint32_t c = 0; c < 4u; ++c)
+         {
+             if ((dest & laneForComponent(c)) == 0u)
+@@ -3077,12 +3224,19 @@
+     // between runs), so whether it is current is checked once.
+     const bool staticStallOn = tl_runXlat != nullptr && vu1StaticStallOn() && !tl_runXlat->noRegStall.empty();
+     uint32_t ssLastPc = 0xFFFFFFF0u, ssSeq = 0u;
++    // tl_runXlat does not change during the loop: read the thread-local and its vectors once.
++    const Vu1Xlat *const runXl = tl_runXlat;
++    const Vu1PairStall *const stallArr = runXl ? runXl->stall.data() : nullptr;
++    const size_t stallCount = runXl ? runXl->stall.size() : 0u;
++    const uint8_t *const noRegArr = staticStallOn ? runXl->noRegStall.data() : nullptr;
++    const uint32_t ssWindow = runXl ? runXl->window : 0u;
+     const bool decodedCurrent = tl_runXlat != nullptr && m_decodedCodeCacheValid && m_cachedVuCode == vuCode &&
+                                 m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
+                                 m_cachedCodeGeneration == memory->getVU1CodeGeneration();
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+-        commitReadyPipelines();
++        if (!skipCommitOn || committedCycle != m_cycle)
++            commitReadyPipelines();
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
+@@ -3104,9 +3258,9 @@
+         }
+         const DecodedInstructionPair &decoded = *decodedPtr;
+         const Vu1PairStall *pairStall = nullptr;
+-        if (loopOn && decodedPtr != &decodedCopy && (m_state.pc / 8u) < tl_runXlat->stall.size())
++        if (loopOn && decodedPtr != &decodedCopy && (m_state.pc / 8u) < stallCount)
+         {
+-            pairStall = &tl_runXlat->stall[m_state.pc / 8u];
++            pairStall = &stallArr[m_state.pc / 8u];
+             if (pairStall->nRead == 0xFFu)
+                 pairStall = nullptr;
+         }
+@@ -3116,8 +3270,8 @@
+         else
+             ssSeq = 0u;
+         ssLastPc = m_state.pc;
+-        const bool skipRegScan = staticStallOn && pairStall && ssSeq >= tl_runXlat->window &&
+-                                 tl_runXlat->noRegStall[m_state.pc / 8u] != 0u;
++        const bool skipRegScan = staticStallOn && pairStall && ssSeq >= ssWindow &&
++                                 noRegArr[m_state.pc / 8u] != 0u;
+         if (s_vu1Prof)
+             vu1ProfNotePair(m_state.pc, decoded.lower, decoded.upper);
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+@@ -3143,6 +3297,12 @@
+             {
+                 // Same result as calculatePairReadyCycle(decoded), from the precomputed slot list.
+                 uint64_t r = m_cycle;
++                if (flatRdyOn)
++                {
++                    for (uint32_t k = 0, nr = skipRegScan ? 0u : pairStall->nRead; k < nr; ++k)
++                        r = std::max(r, flatRdy[pairStall->read[k]]);
++                }
++                else
+                 for (uint32_t k = 0, nr = skipRegScan ? 0u : pairStall->nRead; k < nr; ++k)
+                 {
+                     const uint32_t slot = pairStall->read[k];
+@@ -3309,7 +3469,12 @@
+         }
+         else if (!s_fastNoStall)
+         {
+-            if (pairStall)
++            if (pairStall && flatRdyOn)
++            {
++                for (uint32_t k = 0; k < pairStall->nWrite; ++k)
++                    flatRdy[pairStall->write[k]] = m_cycle + pairStall->writeLat[k];
++            }
++            else if (pairStall)
+             {
+                 for (uint32_t k = 0; k < pairStall->nWrite; ++k)
+                 {
+@@ -3381,7 +3546,18 @@
+             m_pendingHaltT = tHalt;
+         }
+ 
+-        advanceOneCycle();
++        if (inlineAdv)
++        {
++            ++m_cycle;
++            m_state.cycles = m_cycle;
++            if (!(g_vu1HintOwner == this && m_cycle < g_vu1CommitHint))
++                commitReadyPipelines();
++            if (m_xgkick.active)
++                progressXgkick();
++        }
++        else
++            advanceOneCycle();
++        committedCycle = m_cycle;
+         if (programEnded)
+             break;
+     }
+@@ -3434,6 +3610,8 @@
+                          (unsigned long long)g_bcSkipped.load());
+         }
+     }
++    if (m_unit == Unit::VU1 && !tl_bcSuppress)
++        g_ps2xVu1RunCycles.fetch_add(m_cycle - profStartCycle, std::memory_order_relaxed);
+     m_state.cycles = m_cycle;
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
+--- a/ps2xRuntime/src/lib/ps2_vu1_async.inl
++++ b/ps2xRuntime/src/lib/ps2_vu1_async.inl
+@@ -21,6 +21,8 @@
+ #include <thread>
+ #include <pthread.h>
+ 
++extern std::atomic<uint64_t> g_ps2xVu1RunCycles;
++
+ namespace ps2x_vu1async
+ {
+     namespace
+@@ -443,10 +445,12 @@
+                     reasons += " " + kv.first + "=" + std::to_string(kv.second);
+                 s.waitReasons.clear();
+             }
++            const uint64_t busyNsSnap = s.workerBusyNs.exchange(0);
+             std::fprintf(stderr,
+-                         "[vu1thread:stats] jobs=%llu (big %llu, %.1f MB) worker busy %.0f%% | EE drains=%llu waited=%llu (%.0f ms) busyPolls=%llu spin %.0f ms inlineGif=%llu |%s\n",
++                         "[vu1thread:stats] jobs=%llu (big %llu, %.1f MB) worker busy %.0f%% VU1 %.1f Mcyc/busy-s | EE drains=%llu waited=%llu (%.0f ms) busyPolls=%llu spin %.0f ms inlineGif=%llu |%s\n",
+                          (unsigned long long)s.jobs.exchange(0), (unsigned long long)s.bigJobs.exchange(0),
+-                         s.jobBytes.exchange(0) / 1048576.0, 100.0 * (s.workerBusyNs.exchange(0) / 1e9) / span,
++                         s.jobBytes.exchange(0) / 1048576.0, 100.0 * (busyNsSnap / 1e9) / span,
++                         busyNsSnap ? (g_ps2xVu1RunCycles.exchange(0) * 1e3 / double(busyNsSnap)) : 0.0,
+                          (unsigned long long)s.drains.exchange(0), (unsigned long long)s.drainsWaited.exchange(0),
+                          s.drainWaitNs.exchange(0) / 1e6, (unsigned long long)s.busyPolls.exchange(0), s.eeSpinNs.exchange(0) / 1e6, (unsigned long long)s.inlineGif.exchange(0), reasons.c_str());
+             if (gsStageOn())

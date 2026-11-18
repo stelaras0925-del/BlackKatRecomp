@@ -889,3 +889,20 @@ recorded through BLACKKAT_KEYSCRIPT replays to the same in-game spot.
   `PS2X_VU1_BC_STATS=1` / `PS2X_VU1_BC_CHECK=1` print `[vu1:bc] static no-stall: X of N pairs (window W)`.
 - Verify: `PS2X_VU1_BC_CHECK=1` (reference path has no xlat, so it uses the full scan; cycles are compared) must
   report 0 mismatches.
+
+## VU1 interpreter: SIMD FMAC, skip-commit, flat ready slots, inlined advance (Nov 19 2026, uncommitted)
+Patch: `patches/ps2recomp-vu1-simd-skipcommit-flatrdy.patch` (ps2_vu1_core.cpp, ps2_vu1_async.inl).
+- `PS2X_VU1_SIMD` (default on, `=0` = scalar per-lane loop): SSE2 bit-exact ADD/SUB/MUL/MADD/MSUB
+  in fastUpper (same zero-case/fallback rules, double-precision MADD cancellation check).
+  Offline test /tmp/simdtest: 40M cases, both rounding modes, 0 mismatches.
+- `PS2X_VU1_SKIPCOMMIT` (default on): skip the loop-top commitReadyPipelines() when the
+  end-of-pair advance already committed for this cycle.
+- `PS2X_VU1_FLATRDY` (default on): index m_vfReady/m_viReady/m_accReady as one flat array
+  (slot encoding = member layout, verified at run time, else falls back) in the stall scan/writes.
+- `PS2X_VU1_INLINEADV` (default on; off if PS2X_VU1_NOHINT=1): inlined advanceOneCycle with the
+  commit-hint check before the call and progressXgkick only when a kick is active.
+- Hoisted tl_runXlat reads out of the pair loop (no behaviour change, no toggle).
+- New metric in `PS2X_VU1_THREAD_STATS=1`: `VU1 N Mcyc/busy-s` (VU1 cycles run per worker-busy
+  second; scene-independent throughput).
+Result (same session, 61 s vt_one runs, GS_GPU=1): all off 19.9 Mcyc/busy-s, vifw/s 11.36;
+all on 29.0 Mcyc/busy-s (+45%), vifw/s 15.6. BC_CHECK: 280000 runs, 0 mismatches.
