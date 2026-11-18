@@ -1,0 +1,231 @@
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -471,6 +471,138 @@
+             return c;
+         }
+ 
++        // ---- SNDDRV.IRX SNDI_memcpy native port (PS2X_IOP_SNDCPY) ----------------------------
++        // [iop:prof] (2026-11-18) showed this hand-written memmove (module +0x4df0, called by
++        // SNDIOP_mix for every block) as the hottest interpreted IOP code once the mixer was
++        // native. It only moves bytes and clobbers caller-saved registers, so it is run as a
++        // host memmove when the guest would give the same result (non-overlapping, or
++        // overlapping in the direction its own src<dst test picks). Detected by module name
++        // plus all 201 code words (one relocated J skipped).
++        // PS2X_IOP_SNDCPY=0 disables, =check lets the interpreter run and compares the bytes.
++        static constexpr uint32_t kSndCpyOffset = 0x4df0u;
++        uint32_t sndCpyPc = 0u;
++        uint64_t sndCpyCalls = 0u;
++        struct CpyCheck
++        {
++            bool pending = false;
++            CpuState *cpu = nullptr;
++            uint32_t ra = 0u, sp = 0u, dst = 0u;
++            std::vector<uint8_t> expect;
++            uint64_t checked = 0u, bad = 0u;
++        } cpyCheck;
++        static int sndCpyMode()
++        {
++            static const int mode = []() {
++                const char *e = std::getenv("PS2X_IOP_SNDCPY");
++                if (e && e[0] == '0') return 0;
++                if (e && (e[0] == 'c' || e[0] == 'C')) return 2;
++                return 1;
++            }();
++            return mode;
++        }
++        void detectSndCpy(const Module &m)
++        {
++            if (sndCpyMode() == 0)
++                return;
++            std::string upper = m.name;
++            for (char &c : upper)
++                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++            if (upper.find("SNDDRV") == std::string::npos)
++                return;
++            static const uint32_t kWords[] = {0x00a4082au,0x1420007bu,0x00a41025u,0x30420003u,0x1440004bu,0x00000000u,0x20c6ffc0u,0x04c00025u,0x00000000u,0x8ca80000u,0x8ca90004u,0x8caa0008u,0x8cab000cu,0x8cac0010u,0x8cad0014u,0x8cae0018u,0x8caf001cu,0xac880000u,0xac890004u,0xac8a0008u,0xac8b000cu,0xac8c0010u,0xac8d0014u,0xac8e0018u,0xac8f001cu,0x8ca80020u,0x8ca90024u,0x8caa0028u,0x8cab002cu,0x8cac0030u,0x8cad0034u,0x8cae0038u,0x8caf003cu,0xac880020u,0xac890024u,0xac8a0028u,0xac8b002cu,0xac8c0030u,0xac8d0034u,0xac8e0038u,0xac8f003cu,0x20c6ffc0u,0x20a50040u,0x04c1ffddu,0x20840040u,0x20c60030u,0x04c0000du,0x00000000u,0x8ca80000u,0x8ca90004u,0x8caa0008u,0x8cab000cu,0xac880000u,0xac890004u,0xac8a0008u,0xac8b000cu,0x20c6fff0u,0x20a50010u,0x04c1fff5u,0x20840010u,0x20c6000cu,0x04c00007u,0x00000000u,0x8ca80000u,0x20c6fffcu,0xac880000u,0x20a50004u,0x04c1fffbu,0x20840004u,0x20c60003u,0x04c00007u,0x00000000u,0x80a80000u,0x20c6ffffu,0xa0880000u,0x20a50001u,0x04c1fffbu,0x20840001u,0x03e00008u,0x00000000u,0x20c6fff0u,0x04c00015u,0x00000000u,0x88a80003u,0x98a80000u,0x88a90007u,0x98a90004u,0x88aa000bu,0x98aa0008u,0x88ab000fu,0x98ab000cu,0xa8880003u,0xb8880000u,0xa8890007u,0xb8890004u,0xa88a000bu,0xb88a0008u,0xa88b000fu,0xb88b000cu,0x20c6fff0u,0x20a50010u,0x04c1ffedu,0x20840010u,0x20c6000cu,0x04c00009u,0x00000000u,0x88a80003u,0x98a80000u,0x20c6fffcu,0xa8880003u,0xb8880000u,0x20a50004u,0x04c1fff9u,0x20840004u,0x20c60003u,0x04c00007u,0x00000000u,0x80a80000u,0x20c6ffffu,0xa0880000u,0x20a50001u,0x04c1fffbu,0x20840001u,0x03e00008u,0x00000000u,0x00a63820u,0x0087082au,0x1020ff82u,0x00000000u,0x00a62820u,0x00862020u,0x00a41025u,0x30420003u,0x14400015u,0x00000000u,0x20c6fff0u,0x04c0000du,0x00000000u,0x8ca8fff0u,0x8ca9fff4u,0x8caafff8u,0x8cabfffcu,0xac88fff0u,0xac89fff4u,0xac8afff8u,0xac8bfffcu,0x20a5fff0u,0x20c6fff0u,0x04c1fff5u,0x2084fff0u,0x20c6000cu,0x04c00025u,0x00000000u,0x08001431u,0x00000000u,0x20c6fff0u,0x04c00015u,0x00000000u,0x88a8fff3u,0x98a8fff0u,0x88a9fff7u,0x98a9fff4u,0x88aafffbu,0x98aafff8u,0x88abffffu,0x98abfffcu,0xa888fff3u,0xb888fff0u,0xa889fff7u,0xb889fff4u,0xa88afffbu,0xb88afff8u,0xa88bffffu,0xb88bfffcu,0x20c6fff0u,0x20a5fff0u,0x04c1ffedu,0x2084fff0u,0x20c6000cu,0x04c00009u,0x00000000u,0x88a8ffffu,0x98a8fffcu,0x20c6fffcu,0xa888ffffu,0xb888fffcu,0x20a5fffcu,0x04c1fff9u,0x2084fffcu,0x20c60003u,0x04c00006u,0x20c6ffffu,0x80a8ffffu,0x20a5ffffu,0xa088ffffu,0x04c1fffbu,0x2084ffffu,0x03e00008u,0x00000000u,0x03e00008u,0x00000000u};
++            const uint32_t fn = m.base + kSndCpyOffset;
++            for (uint32_t i = 0; i < sizeof(kWords) / sizeof(kWords[0]); ++i)
++            {
++                if (i == (0x5054u - kSndCpyOffset) / 4u)
++                    continue; // relocated "j bmbu4a"
++                if (memory.fetch32(fn + i * 4u) != kWords[i])
++                {
++                    log(LogLevel::Warning, "[IOP] SNDDRV.IRX found but SNDI_memcpy differs; native memcpy off");
++                    return;
++                }
++            }
++            sndCpyPc = physicalAddress(fn);
++            std::ostringstream out;
++            out << "[IOP] SNDI_memcpy native port " << (sndCpyMode() == 2 ? "in CHECK mode" : "on") << " at 0x" << std::hex << sndCpyPc;
++            log(LogLevel::Info, out.str());
++        }
++        // Guest instruction count of one call (same paths as the MIPS code), charged as cycles.
++        static uint64_t sndCpyCost(bool backward, bool aligned, uint32_t n, bool viaBmb)
++        {
++            if (!backward)
++                return (viaBmb ? 4u : 0u) + (aligned ? 21u + (n / 64u) * 36u + ((n % 64u) / 16u) * 12u + ((n % 16u) / 4u) * 6u + (n % 4u) * 6u
++                                                     : 18u + (n / 16u) * 20u + ((n % 16u) / 4u) * 8u + (n % 4u) * 6u);
++            if (aligned)
++                return 16u + (n / 16u) * 12u + ((n % 16u) / 4u) * 8u + (n % 4u) * 6u + 8u;
++            return 10u + (backward ? 6u : 0u) + (n / 16u) * 20u + ((n % 16u) / 4u) * 8u + (n % 4u) * 6u + 8u;
++        }
++        bool trySndCpy(CpuState &cpu)
++        {
++            if (cpu.branchPending)
++                return false;
++            if (cpyCheck.pending)
++                return false; // a check is still waiting for its return (should not nest)
++            const uint32_t dst = cpu.gpr[4], src = cpu.gpr[5];
++            const int32_t n = static_cast<int32_t>(cpu.gpr[6]);
++            if (n <= 0 || n > 0x40000)
++                return false;
++            const uint32_t pd = physicalAddress(dst), ps = physicalAddress(src);
++            if (pd + static_cast<uint32_t>(n) > kRamSize || ps + static_cast<uint32_t>(n) > kRamSize)
++                return false;
++            // Direction exactly as the guest decides it (signed compares).
++            const bool backward = static_cast<int32_t>(src) < static_cast<int32_t>(dst) &&
++                                  static_cast<int32_t>(dst) < static_cast<int32_t>(src + static_cast<uint32_t>(n));
++            // Only take the fast path where the guest's chunked copy equals memmove: forward needs
++            // src >= dst when the ranges overlap, backward needs src < dst.
++            const bool overlap = ps < pd + static_cast<uint32_t>(n) && pd < ps + static_cast<uint32_t>(n);
++            if (overlap && ((!backward && ps < pd) || (backward && ps > pd)))
++                return false;
++            if (cpu.pendingLoad)
++            {
++                if (cpu.pendingLoadReg != 0u)
++                    cpu.gpr[cpu.pendingLoadReg] = cpu.pendingLoadValue;
++                cpu.pendingLoad = false;
++            }
++            ++sndCpyCalls;
++            std::vector<uint8_t> &buf = cpyCheck.expect;
++            buf.resize(static_cast<size_t>(n));
++            for (int32_t i = 0; i < n; ++i)
++                buf[static_cast<size_t>(i)] = memory.read8(ps + static_cast<uint32_t>(i));
++            if (sndCpyMode() == 2)
++            {
++                cpyCheck.pending = true;
++                cpyCheck.cpu = &cpu;
++                cpyCheck.ra = cpu.gpr[31];
++                cpyCheck.sp = cpu.gpr[29];
++                cpyCheck.dst = pd;
++                return false; // interpreter runs it; compared on return
++            }
++            for (int32_t i = 0; i < n; ++i)
++                memory.write8(pd + static_cast<uint32_t>(i), buf[static_cast<size_t>(i)]);
++            const bool aligned = ((src | dst) & 3u) == 0u;
++            const uint64_t c = sndCpyCost(backward, aligned, static_cast<uint32_t>(n), static_cast<int32_t>(src) < static_cast<int32_t>(dst));
++            totalInstructions += c;
++            totalCycles += c;
++            cpu.pc = cpu.gpr[31];
++            cpu.branchPending = false;
++            return true;
++        }
++        void cpyCheckCompare()
++        {
++            cpyCheck.pending = false;
++            size_t diffs = 0;
++            for (size_t i = 0; i < cpyCheck.expect.size(); ++i)
++                if (memory.read8(cpyCheck.dst + static_cast<uint32_t>(i)) != cpyCheck.expect[i])
++                    ++diffs;
++            ++cpyCheck.checked;
++            if (diffs)
++                ++cpyCheck.bad;
++            if (diffs || cpyCheck.checked <= 3u || (cpyCheck.checked % 2000u) == 0u)
++                std::fprintf(stderr, "[iop:sndcpy] check #%llu: %zu bytes, %zu differ%s; bad calls so far %llu\n",
++                             static_cast<unsigned long long>(cpyCheck.checked), cpyCheck.expect.size(), diffs,
++                             diffs ? " MISMATCH" : "", static_cast<unsigned long long>(cpyCheck.bad));
++        }
++
+         void detectSndMix(const Module &m)
+         {
+             if (sndMixMode() == 0)
+@@ -687,6 +819,14 @@
+             }
+             if (sndCheck.pending && sndCheck.cpu == &cpu && cpu.pc == sndCheck.ra && cpu.gpr[29] == sndCheck.sp)
+                 sndCheckCompare();
++            if (sndCpyPc != 0u && (cpu.pc & 0x1FFFFFFFu) == sndCpyPc && trySndCpy(cpu))
++            {
++                ++totalInstructions;
++                ++totalCycles;
++                return !cpu.stopped;
++            }
++            if (cpyCheck.pending && cpyCheck.cpu == &cpu && cpu.pc == cpyCheck.ra && cpu.gpr[29] == cpyCheck.sp)
++                cpyCheckCompare();
+ 
+             // decode() returns nothing unless the word at pc is `jr ra`; check that inline first.
+             if (const auto import = (iopFastPath() && memory.fetch32(cpu.pc) != 0x03E00008u)
+@@ -887,7 +1027,7 @@
+         void profTick()
+         {
+             static auto last = std::chrono::steady_clock::now();
+-            static uint64_t lastInstr = 0, lastCycles = 0, lastSnd = 0;
++            static uint64_t lastInstr = 0, lastCycles = 0, lastSnd = 0, lastCpy = 0;
+             const auto now = std::chrono::steady_clock::now();
+             const double dt = std::chrono::duration<double>(now - last).count();
+             if (dt < 1.0)
+@@ -902,9 +1042,9 @@
+                     v.push_back({g_iopProfHist[i], i << 2});
+                 }
+             std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first > b.first; });
+-            std::fprintf(stderr, "[iop:prof] instr/s=%.2fM cyc/s=%.2fM sndmix/s=%.0f imports/s=%.0f slices/s=%.0f idleSkips/s=%.0f top:",
++            std::fprintf(stderr, "[iop:prof] instr/s=%.2fM cyc/s=%.2fM debt=%llu sndmix/s=%.0f sndcpy/s=%.0f imports/s=%.0f slices/s=%.0f idleSkips/s=%.0f top:",
+                          double(totalInstructions - lastInstr) / dt / 1e6, double(totalCycles - lastCycles) / dt / 1e6,
+-                         double(sndMixCalls - lastSnd) / dt, double(g_iopProfImports) / dt,
++                         (unsigned long long)cycleDebt, double(sndMixCalls - lastSnd) / dt, double(sndCpyCalls - lastCpy) / dt, double(g_iopProfImports) / dt,
+                          double(g_iopProfSlices) / dt, double(g_iopProfIdle) / dt);
+             for (size_t i = 0; i < v.size() && i < 16u; ++i)
+             {
+@@ -924,12 +1064,36 @@
+             lastInstr = totalInstructions;
+             lastCycles = totalCycles;
+             lastSnd = sndMixCalls;
++            lastCpy = sndCpyCalls;
+             g_iopProfImports = g_iopProfSlices = g_iopProfIdle = 0;
+             std::fill(g_iopProfHist.begin(), g_iopProfHist.end(), 0u);
+         }
+ 
++        // PS2X_IOP_CYCLE_DEBT (default on): cycles a slice runs past its target (a native port
++        // charging thousands of cycles at once, an interrupt handler, ...) are paid back from
++        // the next runCycles budgets. Without this every overshoot was free IOP time: with the
++        // native SNDDRV mixer the IOP clock ran ~2.6x ahead of the EE (40M cycles/s against
++        // ~15M owed), mixing 2.6x more audio blocks and interpreting ~17M instr/s.
++        // PS2X_IOP_CYCLE_DEBT=0 restores the old behaviour.
++        static bool cycleDebtOn()
++        {
++            static const bool on = []() { const char *e = std::getenv("PS2X_IOP_CYCLE_DEBT"); return !(e && e[0] == '0'); }();
++            return on;
++        }
++        uint64_t cycleDebt = 0u;
++
+         void runCycles(uint64_t cycles) noexcept
+         {
++            if (cycleDebtOn())
++            {
++                if (cycleDebt >= cycles)
++                {
++                    cycleDebt -= cycles;
++                    return;
++                }
++                cycles -= cycleDebt;
++                cycleDebt = 0u;
++            }
+             try
+             {
+                 const uint64_t target = totalCycles + cycles;
+@@ -967,6 +1131,8 @@
+                     if (totalCycles == before)
+                         ++totalCycles;
+                 }
++                if (cycleDebtOn() && totalCycles > target)
++                    cycleDebt = totalCycles - target;
+             }
+             catch (...)
+             {
+@@ -1018,6 +1184,7 @@
+             result.startResult = static_cast<int32_t>(startResult);
+             modules[module.id] = std::move(module);
+             detectSndMix(modules[result.moduleId]);
++            detectSndCpy(modules[result.moduleId]);
+ 
+             std::ostringstream out;
+             out << "[IOP] loaded IRX id=" << result.moduleId

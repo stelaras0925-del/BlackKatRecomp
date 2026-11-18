@@ -1,0 +1,133 @@
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -27,6 +27,7 @@
+ #include <cstdlib>
+ #include <vector>
+ #include <cstdio>
++#include <chrono>
+ 
+ namespace
+ {
+@@ -49,6 +50,19 @@
+         }();
+         return on;
+     }
++    // PS2X_PROF=1: once per second print IOP instructions/cycles, idle skips, native SNDDRV
++    // mixer calls and the hottest IOP PCs (every 16th instruction sampled) as module+offset.
++    bool iopProfOn()
++    {
++        static const bool on = []() {
++            const char *e = std::getenv("PS2X_PROF");
++            return e && *e && *e != '0';
++        }();
++        return on;
++    }
++    std::vector<uint32_t> g_iopProfHist;
++    uint32_t g_iopProfCtr = 0;
++    uint64_t g_iopProfIdle = 0, g_iopProfSlices = 0, g_iopProfImports = 0;
+     std::vector<uint32_t> g_iopPcHist;
+     uint64_t g_iopSlices = 0, g_iopSliceInstr = 0, g_iopIdleSkips = 0, g_iopStatInstr = 0;
+     void iopPcStatNote(uint32_t pc)
+@@ -680,6 +694,8 @@
+                                         : imports.decode(cpu.pc))
+             {
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
++                if (iopProfOn())
++                    ++g_iopProfImports;
+                 ++totalInstructions;
+                 ++totalCycles;
+                 if (disposition == ImportDisposition::JumpToGuest)
+@@ -691,6 +707,12 @@
+ 
+             if (iopPcStats())
+                 iopPcStatNote(cpu.pc);
++            if (iopProfOn() && ((++g_iopProfCtr & 15u) == 0u))
++            {
++                if (g_iopProfHist.empty())
++                    g_iopProfHist.assign(1u << 19, 0u);
++                ++g_iopProfHist[(cpu.pc & 0x1FFFFFu) >> 2];
++            }
+             const bool running = cpuCore.executeInstruction(cpu);
+             if (!iopFastPath() || memory.hasDmaStart())
+                 schedulePendingDma();
+@@ -862,6 +884,50 @@
+             servicingGuestCallbacks = false;
+         }
+ 
++        void profTick()
++        {
++            static auto last = std::chrono::steady_clock::now();
++            static uint64_t lastInstr = 0, lastCycles = 0, lastSnd = 0;
++            const auto now = std::chrono::steady_clock::now();
++            const double dt = std::chrono::duration<double>(now - last).count();
++            if (dt < 1.0)
++                return;
++            last = now;
++            std::vector<std::pair<uint32_t, uint32_t>> v;
++            uint64_t sampled = 0;
++            for (uint32_t i = 0; i < g_iopProfHist.size(); ++i)
++                if (g_iopProfHist[i])
++                {
++                    sampled += g_iopProfHist[i];
++                    v.push_back({g_iopProfHist[i], i << 2});
++                }
++            std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first > b.first; });
++            std::fprintf(stderr, "[iop:prof] instr/s=%.2fM cyc/s=%.2fM sndmix/s=%.0f imports/s=%.0f slices/s=%.0f idleSkips/s=%.0f top:",
++                         double(totalInstructions - lastInstr) / dt / 1e6, double(totalCycles - lastCycles) / dt / 1e6,
++                         double(sndMixCalls - lastSnd) / dt, double(g_iopProfImports) / dt,
++                         double(g_iopProfSlices) / dt, double(g_iopProfIdle) / dt);
++            for (size_t i = 0; i < v.size() && i < 16u; ++i)
++            {
++                const uint32_t pc = v[i].second;
++                const char *mod = "?";
++                uint32_t off = pc;
++                for (const auto &[id, m] : modules)
++                    if (pc >= (m.base & 0x1FFFFFu) && pc < (m.base & 0x1FFFFFu) + m.size)
++                    {
++                        mod = m.name.c_str();
++                        off = pc - (m.base & 0x1FFFFFu);
++                        break;
++                    }
++                std::fprintf(stderr, " %05x(%s+%x)=%.1f%%", pc, mod, off, 100.0 * v[i].first / double(sampled ? sampled : 1));
++            }
++            std::fprintf(stderr, "\n");
++            lastInstr = totalInstructions;
++            lastCycles = totalCycles;
++            lastSnd = sndMixCalls;
++            g_iopProfImports = g_iopProfSlices = g_iopProfIdle = 0;
++            std::fill(g_iopProfHist.begin(), g_iopProfHist.end(), 0u);
++        }
++
+         void runCycles(uint64_t cycles) noexcept
+         {
+             try
+@@ -883,12 +949,16 @@
+                         nextWake = timrman.nextEventCycle(nextWake);
+                         if (iopPcStats())
+                             ++g_iopIdleSkips;
++                        if (iopProfOn())
++                            ++g_iopProfIdle;
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+                     }
+                     const uint64_t before = totalCycles;
+                     if (iopPcStats())
+                         ++g_iopSlices;
++                    if (iopProfOn())
++                        ++g_iopProfSlices;
+                     const uint64_t beforeInstr = totalInstructions;
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                     if (iopPcStats())
+@@ -1060,6 +1130,12 @@
+ 
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+     {
++        if (iopProfOn())
++        {
++            static uint32_t s_tick = 0;
++            if ((++s_tick & 4095u) == 0u)
++                m_impl->profTick();
++        }
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+         const uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;

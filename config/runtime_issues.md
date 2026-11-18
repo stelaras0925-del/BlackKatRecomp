@@ -809,3 +809,83 @@ recorded through BLACKKAT_KEYSCRIPT replays to the same in-game spot.
   - The DMA code ignored CHCR.DIR and parsed the destination buffer (old texels) as VIFcodes. That gave the desync, the reserved UNPACKs, the bad MPG/carries and the XGKICK overflows, and the readback never filled the buffer, which explains the mosaic after re-upload.
   - Fix in `patches/ps2recomp-vif1-readback-dir0.patch`: VIF1 normal mode with DIR=0 now drains the queued VIF1 work, copies `GS::consumeLocalToHostBytes` into MADR, and completes the channel. It logs `[vif1:readback]`, and `PS2X_VIF1_READBACK=0` restores the old behaviour. The patch also clears the VIF1 carry on FBRST.RST.
   - Not yet confirmed: the 7 qw GIF payload was not dumped. The first `[vif1:readback]` line will show chcr, and DIR=0 confirms it.
+
+## IOP speed: QUANTUM=32 default + native SNDDRV mixer (2026-11-18, patches/ps2recomp-iop-quantum32-default.patch, patches/ps2recomp-iop-snddrv-native-mixer.patch)
+
+- `PS2X_IOP_QUANTUM` now defaults to 32. Stelios played through the teleport and Skull Islands with it and saw no glitches. Earlier measurement: GPU vsync/s 36.7 -> 46.6. `PS2X_IOP_QUANTUM=1` restores the old per-dispatch interleaving.
+- `PS2X_IOP_PCSTATS=1` (`build/is_gpu.log`) showed almost every IOP instruction spread evenly over 0x4fc40-0x4fd68.
+  - That is SNDDRV.IRX (base 0x49e00), function `SNDIOP_ee36_iop36` (module offset 0x5c54, from the IRX symtab). It is the sound driver's 36->48 kHz 3:4 resampler and mixer.
+  - Each call processes 2x2 blocks of 192 s16 source samples plus int32 accumulators (>>7) into 256 saturated s16 outputs, keeps 2 s16 history values, and zeroes the accumulators. That is 15,200 interpreted instructions per call.
+  - It is not an idle loop, so idle-skipping can't remove it.
+- Fix: the call now runs natively in C++ with the same memory effects, in the same order.
+  - Detection: module name SNDDRV, plus a 192-word fingerprint of the function's non-relocated code. Table, state and pointer-table addresses are decoded from the relocated lui/addiu/lw words.
+  - Calls are hooked at function entry (not in a branch delay slot; a pending load is committed first). After the native run the CPU returns to `ra`, and 15,200 IOP cycles/instructions are charged so guest timing stays the same (`PS2X_IOP_SNDMIX_CYCLES=N` overrides).
+  - Toggles: `PS2X_IOP_SNDMIX=0` disables it. `PS2X_IOP_SNDMIX=check` lets the interpreter run the call and compares every byte the native port would write, logging `[iop:sndmix] check #N ... differ`.
+- Offline check: `build/sndmix_test/harness.cpp` runs a small MIPS-I interpreter over the real SNDDRV.IRX code against the extracted port, for 200 random trials including saturation. All 200 matched byte for byte, at 15,200 instructions per call.
+- Expected: IOP emulation was most of the EE thread (73% in the earlier profile), and nearly all IOP instructions were in this function. The IOP cost on the EE thread should mostly disappear; the rest is scheduler and timer bookkeeping.
+
+## Per-thread CPU profiling: PS2X_PROF=1 (2026-11-18, patches/ps2recomp-thread-prof.patch)
+
+- `PS2X_PROF=1` starts a reporter thread (`src/main.cpp`, `startThreadProf`). Once a second it prints
+  `[prof] t=N total=T Name=pct ...`: CPU% per thread name, read from `/proc/self/task/*/schedstat`
+  (100 = one core busy). GSRast workers are summed as `GSRast*`. It reads /proc only and adds no hooks to
+  hot paths. Off unless the variable is set.
+- New thread names: `GSGpu` (GPU GS backend thread, `gs_gpu_backend.inl`) and `GSRast<k>` (CPU raster
+  workers, `gs_frontend.cpp`). `GameThread`, `VU1Worker` and `GSStage` already had names. The main/window
+  thread shows as `blackkat`.
+- Combine it with `BLACKKAT_PROF=start,dur` (SIGPROF hot spots by tid, `python3 tools/prof_report.py` /
+  `build/prof_report_tid.py`) and `PS2X_VU1_THREAD_STATS=1` (EE wait-for-VU1 time, GS stage wait).
+- Note for speed comparisons: guest vsync/s is EE-cycle paced (the EE spins on CHCR/STAT while VU1 works), so
+  use vif writes/s (~game frames/s) as well. speed_test vs speed_old (in-game +2..+6 s): vsync 26.4 vs 23.2
+  (+14%), vif/s 19.0 vs 12.5 (+52%).
+
+## IOP profile in PS2X_PROF (2026-11-18, patches/ps2recomp-iop-prof.patch, applies inside third_party/PS2Recomp)
+
+- Finding from prof_run (t=25..45 s, gameplay): the EE GameThread (87% CPU) spends ~66% of its samples in the IOP
+  interpreter (`IopEmulator::runCycles` 6622 of 9977; `executeInstruction` self 3016), even with the native
+  SNDDRV mixer on. Spinning on VU1 is small (`chcrReadWhileBusy` ~4.5%); recompiled game code is the rest.
+  So the game thread is not mainly waiting for VU1. It is emulating a busy IOP.
+- VU1 worker (82-84% CPU) split: `run` self 3037, `doUpper` lambda 2713, `pairReady` (stall scan) 2229,
+  `commitReadyPipelines` 1398, `fastLower` 884, `updateFmacFlags` 478 (of 11869).
+- `PS2X_PROF=1` now also prints `[iop:prof]` once a second: IOP instr/s, cycles/s, native mixer calls/s,
+  import calls/s, slices/s, idle skips/s, and the top 16 IOP PCs (every 16th instruction sampled), each as
+  `pc(module+offset)=share`. Off unless PS2X_PROF is set.
+
+## IOP clock ran 2.6x ahead after the native mixer: cycle debt + native SNDI_memcpy (2026-11-18, patches/ps2recomp-iop-cycledebt-sndcpy.patch, applies inside third_party/PS2Recomp on top of ps2recomp-iop-prof.patch)
+
+- iopprof_run (`PS2X_PROF=1`): IOP cyc/s ~40M while the EE only owed ~15M (122 EE Mcyc/s / 8); sndmix/s ~1500,
+  idleSkips 0. Cause: `runCycles` set `target = totalCycles + cycles`, so cycles run past a target were never
+  repaid. The native mixer charges 15200 cycles in one step, so every call gave the IOP free time. The sound
+  driver's mixing is paced by IOP time (SPU auto-DMA callback -> threadmain -> SNDIOP_processtagbuf ->
+  SNDIOP_mix), so it mixed ~2.6x more blocks, and the rest of that path (SNDI_memcpy, SNDIOP_updatevoices
+  +0x82d8, LIBSD +0x3558 voice-address read) was interpreted 2.6x as often (~17M real instr/s).
+- Fix 1, `PS2X_IOP_CYCLE_DEBT` (default on): overshoot is kept as debt and paid from the next budgets. IOP time
+  follows the EE again, like before the native mixer. `PS2X_IOP_CYCLE_DEBT=0` reverts.
+- Fix 2, `PS2X_IOP_SNDCPY` (default on): SNDDRV `SNDI_memcpy` (+0x4df0, hand-written memmove, hottest
+  interpreted band +0x4e14..0x4ea0) runs as a host byte move. Detected by module name plus all 201 code words
+  (relocated `j` at +0x5054 skipped). Falls back to the interpreter for n<=0, n>256 KB, out-of-RAM ranges, or
+  overlap in a direction where the guest's chunked copy would not equal memmove. Charges the guest's instruction
+  count (formula; harness mean error 0.6%, backward overlap copies less exact). `=0` disables, `=check` runs the
+  interpreter and compares the destination bytes on return (`[iop:sndcpy] check #N`).
+- Offline: `build/sndmix_test/cpy_harness.cpp` runs the real SNDI_memcpy code from game/SNDDRV.IRX in the MIPS
+  mini interpreter against memmove: 19874 random calls (aligned/unaligned, overlapping both ways), 0 mismatches.
+- `[iop:prof]` now also prints `debt=` and `sndcpy/s`.
+
+## VU1 static no-stall proof + EE spin counter (2026-11-18, patches/ps2recomp-vu1-staticstall-eespin.patch, applies inside third_party/PS2Recomp)
+
+- debt_run: EE Mcyc/s 122 -> 245 and vsync/s 24.9 -> 49.9 after the IOP cycle-debt fix, but vifw/s stayed 12.3 and
+  GameThread stayed ~87%. Doubling the EE's throughput did not change drawn frames, so the EE is not what limits
+  them: it now spins/advances vsyncs faster while waiting. Prime suspect: the VU1 worker (83-85%; it also counts
+  time waiting for the GS stage as busy), then the GS (GSGpu 52%).
+- `PS2X_VU1_THREAD_STATS=1` (existing, every 5 s) now also prints `spin N ms` = EE time from the first busy
+  VIF1/GIF CHCR poll until it reads not-busy (EE waiting on the worker by polling). Next to it: `worker busy %`,
+  `EE drains waited (ms)` (blocking waits), and `GS stage busy / worker waited for it`.
+- `PS2X_VU1_STATICSTALL` (default on, block-cache path only): per translated VU1 image, a pair is marked
+  no-stall when none of the `window` = (max write latency - 1) pairs before it writes a slot it reads with a
+  latency longer than the distance. At run time the check is used only when that many pairs ran at consecutive
+  pcs right before it in the current run (no jump, not the start of the run). Then the per-operand ready-cycle scan
+  in `pairReady` is skipped. The FDIV/EFU/WAITQ/WAITP/XGKICK checks stay. Every pair takes >= 1 cycle, so any older
+  write is already ready and the result (cycle count) is the same. `PS2X_VU1_STATICSTALL=0` reverts.
+  `PS2X_VU1_BC_STATS=1` / `PS2X_VU1_BC_CHECK=1` print `[vu1:bc] static no-stall: X of N pairs (window W)`.
+- Verify: `PS2X_VU1_BC_CHECK=1` (reference path has no xlat, so it uses the full scan; cycles are compared) must
+  report 0 mismatches.

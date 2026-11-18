@@ -27,6 +27,9 @@
 #include <execinfo.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <map>
+#include <cstring>
+#include <pthread.h>
 
 namespace
 {
@@ -102,6 +105,88 @@ namespace
                         },
                         &base);
         return base;
+    }
+
+    // PS2X_PROF=1: once per second print the CPU% of every thread (summed by
+    // thread name, from /proc/self/task/*/schedstat = ns on CPU), e.g.
+    //   [prof] t=31 GameThread=99 VU1Worker=41 GSStage=8 GSGpu=23 blackkat=12 ...
+    // 100 = one core fully busy. Reads /proc only; no hooks in the hot paths.
+    void startThreadProf()
+    {
+        const char *e = std::getenv("PS2X_PROF");
+        if (!e || !*e || *e == '0')
+            return;
+        std::thread([]()
+                    {
+                        pthread_setname_np(pthread_self(), "Prof");
+                        std::map<int, std::pair<std::string, uint64_t>> last;
+                        auto t0 = std::chrono::steady_clock::now();
+                        auto prev = t0;
+                        for (;;)
+                        {
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                            const auto now = std::chrono::steady_clock::now();
+                            const double wallNs = std::chrono::duration<double, std::nano>(now - prev).count();
+                            prev = now;
+                            std::map<int, std::pair<std::string, uint64_t>> cur;
+                            std::error_code ec;
+                            for (const auto &de : std::filesystem::directory_iterator("/proc/self/task", ec))
+                            {
+                                const std::string dir = de.path().string();
+                                const int tid = std::atoi(de.path().filename().c_str());
+                                unsigned long long ns = 0;
+                                char name[64] = "?";
+                                if (FILE *f = std::fopen((dir + "/schedstat").c_str(), "r"))
+                                {
+                                    if (std::fscanf(f, "%llu", &ns) != 1)
+                                        ns = 0;
+                                    std::fclose(f);
+                                }
+                                if (FILE *f = std::fopen((dir + "/comm").c_str(), "r"))
+                                {
+                                    if (std::fgets(name, sizeof(name), f))
+                                        name[strcspn(name, "\n")] = 0;
+                                    std::fclose(f);
+                                }
+                                cur[tid] = {name, ns};
+                            }
+                            if (last.empty())
+                            {
+                                last = std::move(cur); // first pass: baseline only
+                                continue;
+                            }
+                            std::map<std::string, double> byName;
+                            double total = 0.0;
+                            for (const auto &[tid, v] : cur)
+                            {
+                                auto it = last.find(tid);
+                                const uint64_t before = (it != last.end()) ? it->second.second : 0;
+                                if (it == last.end() && !last.empty())
+                                    continue; // new thread: skip its first partial second
+                                const double pct = 100.0 * double(v.second - before) / wallNs;
+                                std::string n = v.first;
+                                if (n.rfind("GSRast", 0) == 0)
+                                    n = "GSRast*";
+                                byName[n] += pct;
+                                total += pct;
+                            }
+                            last = std::move(cur);
+                            std::vector<std::pair<double, std::string>> v;
+                            for (const auto &[n, p] : byName)
+                                if (p >= 0.5)
+                                    v.push_back({p, n});
+                            std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first > b.first; });
+                            std::string line;
+                            char buf[96];
+                            for (const auto &[p, n] : v)
+                            {
+                                std::snprintf(buf, sizeof(buf), " %s=%.0f", n.c_str(), p);
+                                line += buf;
+                            }
+                            std::fprintf(stderr, "[prof] t=%.0f total=%.0f%s\n",
+                                         std::chrono::duration<double>(now - t0).count(), total, line.c_str());
+                        } })
+            .detach();
     }
 
     void startProfiler()
@@ -381,6 +466,7 @@ int main(int argc, char *argv[])
 {
     setupTerminateLogger();
     startProfiler();
+    startThreadProf();
 
     try
     {
