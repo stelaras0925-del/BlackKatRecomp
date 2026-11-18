@@ -906,3 +906,25 @@ Patch: `patches/ps2recomp-vu1-simd-skipcommit-flatrdy.patch` (ps2_vu1_core.cpp, 
   second; scene-independent throughput).
 Result (same session, 61 s vt_one runs, GS_GPU=1): all off 19.9 Mcyc/busy-s, vifw/s 11.36;
 all on 29.0 Mcyc/busy-s (+45%), vifw/s 15.6. BC_CHECK: 280000 runs, 0 mismatches.
+
+## VU1 interpreter: NOP exit, jump-history stall proof, fixed slot scan, single stall wait (Nov 19 2026, uncommitted)
+Patch: `patches/ps2recomp-vu1-nopexit-jumpproof-fixedscan-stallonce.patch` (ps2_vu1_core.cpp only).
+All default on; `=0` restores the previous code path.
+- `PS2X_VU1_NOPEXIT`: upper NOP (low 11 bits 0x2FF / 0x33C, 33% of upper ops) returns at the top
+  of doUpper (only sets m_currentUpperInstruction, as the fastUpper NOP path did). No measurable gain alone.
+- `PS2X_VU1_JUMPPROOF`: after a jump from a delay-slot pair s that ran after >= window-1 straight
+  pairs, the static no-stall proof is applied to target pairs t..t+window-1 along the known
+  history (t+i-1..t, s, s-1, ...), cached per (image, t, s) in a 1024-entry thread-local table.
+  No measurable gain alone (hot pairs mostly have real dependencies inside the window).
+- `PS2X_VU1_FIXEDSCAN` (needs FLATRDY): pairs with <= 8 reads / writes use a fixed 8-slot unrolled
+  ready scan / ready write (unused entries are slot 0 = VF0.x, latency 0, so they can never add a
+  stall). About +4% VU1 Mcyc/busy-s.
+- `PS2X_VU1_STALLONCE`: after advanceTo(readyCycle) for a fast-mode slot-list pair that is not
+  XGKICK, the ready cycle is not recomputed (all terms are fixed until issue, advanceTo lands
+  exactly). About +4%.
+- Tried and dropped: an inlined copy of commitReadyPipelines' mask path in the inlined advance
+  (+0.7%, noise) - not in the patch.
+Result (same session, 61 s vt_one, GS_GPU=1): all four off 28.0 Mcyc/busy-s, vifw/s 15.19; all on
+30.2 Mcyc/busy-s (+8%), vifw/s 16.15. BC_CHECK (121 s): 620000 runs, 0 mismatches.
+Remaining profile: per-pair interpreter overhead is spread over the loop (no single hot spot);
+VU1 stall cycles are ~44% of VU1 cycles. Next real step is a per-microprogram/block executor.
