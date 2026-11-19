@@ -1,0 +1,152 @@
+--- a/src/overrides/blackkat_slus_20365.cpp
++++ b/src/overrides/blackkat_slus_20365.cpp
+@@ -300,8 +300,19 @@
+     //   0x2B3B50 -> 0x2B3E00 -> 0x2C78C0 -> 0x2C77E8). Callers: main intro
+     //   (0x1014F4), 0x101CA8, 0x1E6784; all ignore the (void) result and free
+     //   the player themselves. Skip by returning at once.
+-    // BLACKKAT_PLAY_FMV=1 keeps the original.
++    // Movies play by default now (IPU model on): BLACKKAT_PLAY_FMV=0 (or PS2X_IPU=0) restores these stubs.
+     constexpr uint32_t kFmvPlayFile = 0x001E1F88u;
++    // BLACKKAT_PLAY_FMV: default 1 (play movies through the IPU model); 0 = skip them (stubs).
++    // PS2X_IPU=0 (IPU model off) also selects the stubs, since the player would spin forever.
++    bool blackkatPlayFmv()
++    {
++        static const bool on = []() {
++            const char *pf = std::getenv("BLACKKAT_PLAY_FMV");
++            const char *ipu = std::getenv("PS2X_IPU");
++            return !(pf && pf[0] == '0') && !(ipu && ipu[0] == '0');
++        }();
++        return on;
++    }
+ 
+     void blackkatFmvSkip(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+@@ -594,6 +605,95 @@
+         g_origFmvStop(rdram, ctx, runtime);
+     }
+ 
++    // FMV idle skip (BLACKKAT_FMV_IDLE_CYCLES, default 16384, 0 = off). EA's movie player spins in two
++    // polling loops, both only reached while it has nothing to do:
++    //  * 0x1E1E70: pump(0x2B31E0); chunk = 0x2B2868(stream); if (!chunk && !0x2B2B90(stream)) repeat
++    //    (waits for the CD stream to deliver the next MPC chunk; 0x2B2B90 has no other caller and is
++    //    only called when no chunk is ready);
++    //  * 0x1E1D80: pump; while (GS CSR & FIELD) repeat (waits for the next field/vsync).
++    // Each iteration costs ~1 us of host time but only a few hundred EE cycles, so emulated time (and
++    // with it the IOP/CD and vsync) crawled. Charge extra EE cycles per idle iteration so the wait ends
++    // after a handful of iterations; deadlines (vsync etc.) still fire at the next checkpoint.
++    constexpr uint32_t kStreamWaitCheck = 0x002B2B90u;
++    constexpr uint32_t kTaskPump = 0x002B31E0u;
++    PS2Runtime::RecompiledFunction g_origStreamWaitCheck = nullptr;
++    PS2Runtime::RecompiledFunction g_origTaskPump = nullptr;
++    uint32_t fmvIdleCycles()
++    {
++        static const uint32_t v = []() -> uint32_t {
++            const char *e = std::getenv("BLACKKAT_FMV_IDLE_CYCLES");
++            return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 16384u;
++        }();
++        return v;
++    }
++    uint64_t g_fmvIdleCharged = 0;
++
++    void blackkatStreamWaitCheck(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_origStreamWaitCheck(rdram, ctx, runtime);
++        if (getRegU32(ctx, 2) == 0u && runtime) // stream not finished, no chunk yet: idle
++        {
++            runtime->eeScheduler().accountCycles(fmvIdleCycles());
++            g_fmvIdleCharged += fmvIdleCycles();
++        }
++    }
++
++    void blackkatTaskPump(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t ra = getRegU32(ctx, 31);
++        g_origTaskPump(rdram, ctx, runtime);
++        if (ra == 0x001E1D88u && runtime) // FIELD wait loop in DecodeFrame
++        {
++            runtime->eeScheduler().accountCycles(fmvIdleCycles());
++            g_fmvIdleCharged += fmvIdleCycles();
++        }
++    }
++
++    // FMV frame pacing (BLACKKAT_FMV_PACE, default 1, 0 = off). DecodeFrame (0x1E1B00) decodes one
++    // picture and then only waits while GS CSR FIELD is set (odd field); during an even field it
++    // returns at once. On hardware the IPU decode takes most of a field, so that gives ~29.97 fps.
++    // Here the IPU is instant, so several pictures went out per even field: the video ran ahead
++    // until the CD stream ran dry (38 pictures in the first 54 vsyncs, ~66 pictures / 2.2 s ahead of
++    // the audio, then stutter while waiting for data). Hold each call until 2 vsyncs after the
++    // previous one (absolute schedule, rebased after a stall of > 8 vsyncs or a new player) by
++    // blocking the EE thread in the scheduler's vsync wait and re-entering 0x1E1B00 afterwards.
++    PS2Runtime::RecompiledFunction g_origFmvDecodeFrame = nullptr;
++    bool fmvPaceOn()
++    {
++        static const bool on = []() {
++            const char *e = std::getenv("BLACKKAT_FMV_PACE");
++            return !(e && e[0] == '0');
++        }();
++        return on;
++    }
++    uint64_t g_fmvPaceSlot = 0;
++    uint32_t g_fmvPacePlayer = 0;
++    bool g_fmvPaceValid = false;
++    uint64_t g_fmvPaceWaits = 0, g_fmvPaceRebases = 0;
++
++    void blackkatFmvDecodePaced(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t player = getRegU32(ctx, 4);
++        const uint64_t now = runtime->eeScheduler().currentVSyncTick();
++        if (!g_fmvPaceValid || player != g_fmvPacePlayer || now > g_fmvPaceSlot + 8u || now + 64u < g_fmvPaceSlot)
++        {
++            if (g_fmvPaceValid && g_fmvPaceRebases < 8u)
++                std::cerr << "[blackkat] FMV pace rebase at vsync " << now << " (slot " << g_fmvPaceSlot << ", waits "
++                          << g_fmvPaceWaits << ")" << std::endl;
++            ++g_fmvPaceRebases;
++            g_fmvPaceSlot = now;
++            g_fmvPacePlayer = player;
++            g_fmvPaceValid = true;
++        }
++        if (now < g_fmvPaceSlot)
++        {
++            ++g_fmvPaceWaits;
++            runtime->eeWaitVSyncTicks(static_cast<uint32_t>(g_fmvPaceSlot - now), kFmvDecodeFrame); // re-enters here
++        }
++        g_fmvPaceSlot += 2u;
++        g_origFmvDecodeFrame(rdram, ctx, runtime);
++    }
++
+     // FMV start (0x1E1828(player, name, 0)): log the clip name so front-end
+     // state changes are visible in the log. Wraps the generated function.
+     // BLACKKAT_SKINLOG=N (debug): log the first N calls of the EE skinning
+@@ -1181,7 +1281,7 @@
+                       << kReentryCount << ")" << std::endl;
+         }
+ 
+-        if (const char *pf = std::getenv("BLACKKAT_PLAY_FMV"); !(pf && pf[0] == '1'))
++        if (!blackkatPlayFmv())
+         {
+             const bool fmvOk = runtime.replaceFunction(kFmvPlayFile, &blackkatFmvSkip) &&
+                                runtime.replaceFunction(kFmvDecodeFrame, &blackkatFmvFrameEnd) &&
+@@ -1236,6 +1336,23 @@
+             if (g_origSkinPos)
+                 runtime.replaceFunction(kSkinPos, &blackkatSkinLog);
+         }
++        if (fmvIdleCycles() != 0u)
++        {
++            g_origStreamWaitCheck = runtime.lookupFunction(kStreamWaitCheck);
++            g_origTaskPump = runtime.lookupFunction(kTaskPump);
++            const bool ok = g_origStreamWaitCheck && g_origTaskPump &&
++                            runtime.replaceFunction(kStreamWaitCheck, &blackkatStreamWaitCheck) &&
++                            runtime.replaceFunction(kTaskPump, &blackkatTaskPump);
++            std::cerr << "[blackkat] SLUS_203.65 v1.00 override: FMV idle skip (" << fmvIdleCycles()
++                      << " cycles/idle poll) " << (ok ? "bound" : "FAILED") << std::endl;
++        }
++        if (blackkatPlayFmv() && fmvPaceOn())
++        {
++            g_origFmvDecodeFrame = runtime.lookupFunction(kFmvDecodeFrame);
++            const bool ok = g_origFmvDecodeFrame && runtime.replaceFunction(kFmvDecodeFrame, &blackkatFmvDecodePaced);
++            std::cerr << "[blackkat] SLUS_203.65 v1.00 override: FMV frame pacing (2 vsyncs/picture) "
++                      << (ok ? "bound" : "FAILED") << std::endl;
++        }
+         if (const char *sw = std::getenv("BLACKKAT_FMV_STOP_WAIT"); !(sw && sw[0] == '1'))
+         {
+             g_origFmvStop = runtime.lookupFunction(kFmvStop);

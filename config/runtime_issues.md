@@ -1173,3 +1173,97 @@ effects, ~58/s) + their CPU decode, Present conversion (CT16 ReadCT16) on non-re
   of a hard cut; 64-frame crossfade after an underrun or a kHigh skip). Underruns only occur in the
   first ~5 s of a session.
 - Patch: patches/ps2recomp-spu2-gauss-default-out.patch (vs *.pre-gauss.bak).
+
+## IPU (MPEG decoder) — clean-room model, `PS2X_IPU=1` (2026-11-19)
+
+Patch: `patches/ps2recomp-ipu-and-test-window.patch` (apply in `third_party/PS2Recomp`, `patch -p1`).
+Written from public register/command docs (PS2Tek "IPU I/O registers"/"IPU commands", MPEG-1/2 specs);
+no PCSX2 code. ffmpeg was only used as a black-box reference for tests.
+
+* New `ps2xRuntime/src/lib/ps2_ipu.inl` (included by `ps2_memory.cpp`): IPU_CMD/CTRL/BP/TOP, in/out FIFOs
+  (0x10007010/0x10007000), DMA ch4 toIPU (normal + source chain) and ch3 fromIPU (incl. D_CTRL stall → GIF).
+  Commands: BCLR, IDEC, BDEC, VDEC (MBA/MBtype I/P/B/D, CBP, MV, DMV), FDEC, SETIQ, SETVQ, CSC (RGB32/RGB16,
+  dither, TH0/TH1 alpha), PACK, SETTH. IPU holds at most 10 qwords (EA code rewinds toIPU MADR by IFC+FP).
+* Off (default): old behaviour, i.e. the fromIPU fill workaround for the sea texture.
+* Flags: `PS2X_IPU=1`; `PS2X_IPU_LOG=1|2`, `PS2X_IPU_LOG_MAX=N` (default 300 cmds); `PS2X_IPU_DUMP=<dir>`
+  (toIPU blocks, IDEC RGB16 output, CSC input).
+* Not done: IPU interrupt (INTC bit 8) is not raised; the game polls, so not needed so far.
+
+Results
+* Sea detail texture (EE 0x872200..0x892200 → GS 0x33C0): all 263 IDECs decode 256 MBs (column-major
+  MB order, GIF chain places them). Offline IDEC vs ffmpeg PSNR 45–53 dB (CSC rounding, maxdiff 5).
+  Speed (vt_rate2 avg): baseline 57.7 vsync/s, vifw 9.4; IPU 58.5 / 9.5. IDEC ≈1.9 ms per frame, ≈1% CPU.
+* FMV (`PS2X_IPU=1 BLACKKAT_PLAY_FMV=1`; BLACKKAT_PLAY_FMV is the existing override flag that removes
+  the FMV stubs): EA_WW_E.MPC plays through the IPU, 0 VLC errors, movie audio plays (WAV envelope
+  corr 0.97 vs ffmpeg's decode of the EA ADPCM track). I frames are exact (CSC input == ffmpeg, mad 0),
+  but P/B frames go wrong (green garbage; chroma decays). IPU cost ≈2.4 s CPU per 30 s run.
+  Next: offline P-frame decoder (this IPU + simple MC) vs ffmpeg, to tell a BDEC/VDEC convention bug
+  (non-intra BDEC, MV result format, MBA escape value) apart from an EE MC bug (recompiled MMI).
+  Also seen in FMV runs: repeated "re-entrant preemption at 0x2b6198" with sp shrinking.
+  Keep the FMV stubs (default) until P/B frames are right.
+  **Update (same day): fixed, see "FMV P/B frames" below. Cause was not the IPU or MMI.**
+
+## `PS2X_TEST_WINDOW=hidden|unfocused` (2026-11-19)
+
+`ps2_runtime.cpp`, before InitWindow: `hidden` = FLAG_WINDOW_HIDDEN|FLAG_WINDOW_UNFOCUSED,
+`unfocused` = FLAG_WINDOW_UNFOCUSED + MinimizeWindow. No mouse grab/cursor hiding exists in the runtime.
+Rendering and screenshots work with the window hidden (KDE Wayland); content identical to a normal run.
+`build/vt_one.sh`, `build/menu_one.sh` and `/tmp/bk/s4_one.sh` default to `hidden` (scripts are
+untracked; `.pre-testwin.bak` backups next to them).
+
+## FMV P/B frames: cause was missing scratchpad chain DMA (2026-11-19)
+
+Offline check (`/tmp/bk/ipu/test_pframe.cpp`): a mini MPEG-2 driver doing all bitstream work through
+the IPU model (FDEC/VDEC/BDEC) plus a reference MC matches ffmpeg on EA_WW_E for 190 pictures
+(PSNR >= 62.9 dB, maxdiff 2 = IDCT rounding). `PS2X_IPU_TRACE=<file>` (new, logs VDEC results and
+BDEC/IDEC output hashes) showed the game's IPU stream identical to the offline one (23767 lines, 0 diffs).
+So IPU and MMI were fine. The game's frame store is raw8 MBs in column-major order; intra MBs were
+right, every predicted MB came out all-zero: EA's MC fetches reference blocks with toSPR (ch9) in
+**source-chain mode** (CHCR 0x105, tags at 0x7E4D40), which `tryProcessScratchpadDma` rejected
+(only normal mode), so nothing reached the scratchpad.
+* Fix: chain modes in `tryProcessScratchpadDma` (toSPR source chain refe/cnt/next/ref/refs/call/ret/end,
+  TTE, TIE+IRQ stop, ASP; fromSPR destination chain cnts/cnt/end). On by default; `PS2X_SPR_CHAIN=0`
+  restores the old behaviour. Normal gameplay issues no SPR DMA at all (PS2X_DMA_SPRLOG over a 61 s
+  run: 0), so only FMVs are affected. Patch: `patches/ps2recomp-spr-chain-dma.patch` (also in the
+  combined IPU patch).
+* Result: the game's CSC input is bit-identical to the offline decoder for all 40 dumped frames
+  (PSNR vs ffmpeg 64–67 dB). The intro plays correctly through to the main menu and the attract
+  movie (sizzle01_e) plays.
+* Speed: FMV playback runs at ~28 vsync/s (about 47% of real time). The EE thread is saturated:
+  scheduler/timer overhead (advanceEeTimers, steady_clock/vdso, processPendingEvents) ~30%,
+  EA player code (0x2B31E0/0x2B2868/0x2B2B90/0x2C4F38) ~20%, IPU model ~8–11% of one core
+  (17.6 s CPU in a 170 s run). Gameplay unchanged (IPU on: 57.7 vsync/s, vifw 9.7; off: 59.1/10.0).
+* WAV "stops at 13 s": not a stop. The SPU2 WAV follows emulated time; at ~28 vsync/s a 30 s run
+  gives ~13 s of audio (60 s run: 26 s, 170 s run continues). Audio envelope corr 0.97 vs ffmpeg.
+* "re-entrant preemption at 0x2b6198" during FMV: the override's FILESYS wrapper working as
+  designed. Outer sp goes down by 0x1C0 per nested CD callback while a stream read chain runs and
+  returns to 0x1FFFBD0..0x1FFFDF0 afterwards (sawtooth, deepest seen 0x1FFE260 = 7 KB). Not a leak.
+* Defaults unchanged: PS2X_IPU off, FMV stubs on (BLACKKAT_PLAY_FMV=1 to play). Candidates to flip
+  once FMV speed is acceptable.
+
+## FMV real time, A/V sync, movies on by default (2026-11-19/20)
+
+Movies now play by default: PS2X_IPU default 1 (=0 off), BLACKKAT_PLAY_FMV default 1 (=0, or PS2X_IPU=0, restores the skip stubs).
+Patches: patches/ps2recomp-fmv-realtime-sched.patch (runtime, IOP log, IPU trace/default), patches/blackkat-fmv-realtime.patch (override).
+
+Speed (EA_WW_E intro, GPU GS, IOP quantum 32): ~28 vsync/s before -> 60 vsync/s.
+- PS2X_EE_FASTEVENTS (default 1): EeScheduler::processPendingEvents returns early when nothing is due.
+- PS2X_EE_TIMER_BATCH (default 1): EE timers advanced in batches up to the next timer IRQ (max 65536 cycles);
+  timer register reads/writes flush first; GIF_STAT FQC clear cached (g_ps2xGifFqcPending). PS2X_EE_TIMER_DEBUG=1 prints batch stats.
+- PS2X_EE_IOP_BATCH (default 1): IOP handed EE cycles in quantum*8 lumps instead of every checkpoint.
+- BLACKKAT_FMV_IDLE_CYCLES (default 16384, 0 = off): the EA player's two idle polls (CD-stream wait 0x1E1E70 via 0x2B2B90,
+  FIELD wait 0x1E1D80 via the pump 0x2B31E0 with ra 0x1E1D88) charge extra EE cycles per iteration.
+  0x2C4F38 (MMI add-residual / MC) is real work, not polling.
+- Gameplay, sea battle window t=30-56 s (vt_rate2.py): before 59.98 vsync/s, vifw 25.96 (IPU on) / 26.52;
+  after 60.02 vsync/s, vifw 28.64 (stubs) / 27.76 (movies on default).
+
+A/V sync: video ran ~1.9 s ahead of the audio (pre-existing, same with all new flags off). DecodeFrame 0x1E1B00 only waits
+while CSR FIELD is set; with an instant IPU several pictures went out per even field until the CD stream ran dry
+(38 pictures in the first 54 vsyncs). BLACKKAT_FMV_PACE (default 1, 0 = off) holds each DecodeFrame call until 2 vsyncs
+after the previous one (absolute schedule, rebased after >8 vsyncs late or a new player) using eeWaitVSyncTicks and
+re-entering 0x1E1B00. Result: steady 29.97 fps, A-V -24..+38 ms over 28 s (was -1.5..-1.95 s).
+
+Checked with movies on (hidden window, /tmp mc0): intro plays to the end and the main menu appears (57.6 s);
+X / C (Circle, ESC maps to Circle too) skips; menu background movies; New Game -> SEQ_01 movie (skipped) -> sea battle;
+slot-4 load (keyscript needs an extra X at 5 s to skip the intro and +3 s on the old timings).
+Debug additions: PS2X_IPU_TRACE=<file>; [shot] and "[spu2] first ADMA block" lines carry mono= (steady clock) for A/V checks.

@@ -1,0 +1,316 @@
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -52,6 +52,18 @@
+ uint32_t (*g_ps2xGsLocalToHost)(void *ctx, uint8_t *dst, uint32_t maxBytes) = nullptr;
+ void *g_ps2xGsLocalToHostCtx = nullptr;
+ 
++// EE timer batching state (PS2X_EE_TIMER_BATCH, see advanceEeTimers). Debt/slack/FQC-pending are
++// also read by EeScheduler::accountCycles so the common checkpoint does not call in at all.
++uint64_t g_ps2xEeTimerDebt = 0u;
++uint64_t g_ps2xEeTimerSlack = 0u;
++bool g_ps2xGifFqcPending = true;
++namespace
++{
++    bool g_eeTimerFlush = false;
++    uint32_t g_eeTimerIrqStash = 0u;
++    uint32_t *g_gifStatCache = nullptr;
++}
++
+ namespace
+ {
+     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
+@@ -407,6 +419,7 @@
+ 
+         // Initialize I/O registers
+         m_ioRegisters.clear();
++        g_gifStatCache = nullptr; g_ps2xEeTimerDebt = 0u; g_ps2xEeTimerSlack = 0u; g_eeTimerIrqStash = 0u;
+ 
+         // Initialize GS registers
+         memset(&gs_regs, 0, sizeof(gs_regs));
+@@ -456,18 +469,73 @@
+     m_eeTimers = {};
+ }
+ 
+-uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
++// PS2X_EE_TIMER_BATCH (default 1, =0 reverts): the EE accounts cycles at every checkpoint (every
++// backward branch / dispatch, ~32 cycles). Instead of stepping the four timers each time (several
++// 64-bit divisions per timer), owe the cycles and step them once the debt reaches the exact number
++// of cycles until the next possible timer interrupt (cyclesUntilNextEeTimerInterrupt), or when the
++// guest reads/writes a timer register. Interrupts fire at the same checkpoint as before.
++namespace
+ {
+-    if (eeCycles == 0u)
++    bool eeTimerBatch()
+     {
+-        return 0u;
++        static const bool v = []() { const char *e = std::getenv("PS2X_EE_TIMER_BATCH"); return !(e && e[0] == '0'); }();
++        return v;
+     }
++}
++bool ps2xEeTimerBatchEnabled() { return eeTimerBatch(); }
++namespace
++{
++    constexpr uint64_t kEeTimerMaxBatch = 1u << 16;
++}
+ 
++uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
++{
+     constexpr uint32_t kGifStat = 0x10003020u;
+     constexpr uint32_t kGifFqcMask = 0x1F000000u;
+-    auto gifStatIt = m_ioRegisters.find(kGifStat);
+-    if (gifStatIt != m_ioRegisters.end())
+-        gifStatIt->second &= ~kGifFqcMask;
++    const bool batch = eeTimerBatch();
++    if (!batch)
++    {
++        if (eeCycles == 0u)
++            return 0u;
++        auto gifStatIt = m_ioRegisters.find(kGifStat);
++        if (gifStatIt != m_ioRegisters.end())
++            gifStatIt->second &= ~kGifFqcMask;
++    }
++    else
++    {
++        g_ps2xEeTimerDebt += eeCycles;
++        if (g_ps2xGifFqcPending && g_ps2xEeTimerDebt != 0u)
++        {
++            // FQC drops at the first checkpoint after a GIF transfer, as before
++            g_ps2xGifFqcPending = false;
++            if (!g_gifStatCache)
++            {
++                auto it = m_ioRegisters.find(kGifStat);
++                if (it != m_ioRegisters.end()) g_gifStatCache = &it->second;
++                // not created yet: nothing to clear (setting FQC creates it and re-arms this)
++            }
++            if (g_gifStatCache) *g_gifStatCache &= ~kGifFqcMask;
++        }
++        if ((!g_eeTimerFlush && g_ps2xEeTimerDebt < g_ps2xEeTimerSlack) || g_ps2xEeTimerDebt == 0u)
++        {
++            g_eeTimerFlush = false;
++            const uint32_t stash = g_eeTimerIrqStash;
++            g_eeTimerIrqStash = 0u;
++            return stash;
++        }
++        g_eeTimerFlush = false;
++        eeCycles = g_ps2xEeTimerDebt;
++        g_ps2xEeTimerDebt = 0u;
++        g_ps2xEeTimerSlack = 0u; // recomputed below
++        static const bool s_dbg = std::getenv("PS2X_EE_TIMER_DEBUG") != nullptr;
++        if (s_dbg)
++        {
++            static uint64_t n = 0, sum = 0;
++            ++n; sum += eeCycles;
++            if ((n & ((1u << 16) - 1u)) == 0u)
++                std::fprintf(stderr, "[eetimer] steps=%llu avg batch=%.1f cycles\n", (unsigned long long)n, (double)sum / (double)n);
++        }
++    }
+ 
+     uint32_t interruptMask = 0u;
+     for (size_t index = 0; index < m_eeTimers.size(); ++index)
+@@ -529,6 +597,12 @@
+             interruptMask |= 1u << index;
+         }
+     }
++    if (batch)
++    {
++        g_ps2xEeTimerSlack = std::min<uint64_t>(cyclesUntilNextEeTimerInterrupt(), kEeTimerMaxBatch);
++        interruptMask |= g_eeTimerIrqStash;
++        g_eeTimerIrqStash = 0u;
++    }
+     return interruptMask;
+ }
+ 
+@@ -1241,6 +1315,12 @@
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        if (eeTimerBatch())
++        {
++            g_eeTimerFlush = true;
++            g_eeTimerIrqStash |= advanceEeTimers(0u); // bring the counters up to date first
++            g_ps2xEeTimerSlack = 0u;                  // the write may change the next event
++        }
+         EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+@@ -2088,6 +2168,7 @@
+         constexpr uint32_t kGifFqcMask = 0x1F000000u;
+         uint32_t &gifStat = m_ioRegisters[kGifStat];
+         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
++        g_ps2xGifFqcPending = true;
+     }
+ 
+     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+@@ -2712,6 +2793,12 @@
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        if (eeTimerBatch() && g_ps2xEeTimerDebt != 0u)
++        {
++            g_eeTimerFlush = true;
++            g_eeTimerIrqStash |= advanceEeTimers(0u); // bring the counters up to date first
++            if (g_eeTimerIrqStash) g_ps2xEeTimerSlack = 0u; // deliver at the next checkpoint
++        }
+         const EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+--- a/ps2xRuntime/src/lib/ps2_vu1_async.inl
++++ b/ps2xRuntime/src/lib/ps2_vu1_async.inl
+@@ -686,6 +686,7 @@
+             constexpr uint32_t kGifFqcMask = 0x1F000000u;
+             uint32_t &gifStat = mem.m_ioRegisters[kGifStat];
+             gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
++            g_ps2xGifFqcPending = true;
+         }
+         auto take = [&](std::vector<PS2Memory::PendingTransfer> &list, bool gif) {
+             for (auto &p : list)
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -389,12 +389,49 @@
+     return false;
+ }
+ 
++extern uint64_t g_ps2xEeTimerDebt;
++extern uint64_t g_ps2xEeTimerSlack;
++extern bool g_ps2xGifFqcPending;
++bool ps2xEeTimerBatchEnabled();
++static uint64_t m_iopCycleDebtBatch = 0u; // single EE scheduler instance
++
+ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
+-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+-    m_runtime.advanceIopEeCycles(elapsed);
++    // PS2X_EE_TIMER_BATCH: owe the cycles inline and only call into the timers when the debt reaches
++    // the next possible timer event or a GIF FQC clear is pending (see PS2Memory::advanceEeTimers).
++    static const bool s_timerBatch = ps2xEeTimerBatchEnabled();
++    if (s_timerBatch)
++    {
++        g_ps2xEeTimerDebt += elapsed;
++        if (g_ps2xEeTimerDebt >= g_ps2xEeTimerSlack || g_ps2xGifFqcPending)
++            m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(0u);
++    }
++    else
++        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
++    // PS2X_EE_IOP_BATCH (default 1, =0 reverts): the IOP only runs once PS2X_IOP_QUANTUM IOP cycles
++    // (8 EE cycles each) are owed anyway, so hand it the cycles in quantum-sized lumps instead of
++    // calling into it at every checkpoint.
++    static const uint64_t s_iopBatch = []() -> uint64_t {
++        const char *b = std::getenv("PS2X_EE_IOP_BATCH");
++        if (b && b[0] == '0') return 0u;
++        const char *e = std::getenv("PS2X_IOP_QUANTUM");
++        const long q = e ? std::strtol(e, nullptr, 10) : 32;
++        return q > 1 ? static_cast<uint64_t>(q) * 8u : 0u;
++    }();
++    if (s_iopBatch)
++    {
++        m_iopCycleDebtBatch += elapsed;
++        if (m_iopCycleDebtBatch >= s_iopBatch)
++        {
++            const uint64_t owed = m_iopCycleDebtBatch;
++            m_iopCycleDebtBatch = 0u;
++            m_runtime.advanceIopEeCycles(owed);
++        }
++    }
++    else
++        m_runtime.advanceIopEeCycles(elapsed);
+     if (m_pendingEeTimerInterrupts != 0u)
+     {
+         m_checkpointPending.store(true, std::memory_order_release);
+@@ -1744,6 +1781,21 @@
+ void EeScheduler::processPendingEvents()
+ {
+     assertExecutor();
++    // PS2X_EE_FASTEVENTS (default 1, =0 reverts): this runs after every guest dispatch. When nothing
++    // is pending (no posted event, no timer IRQ, no stop, no cycle deadline reached) skip the mutex,
++    // steady_clock::now() and the deque swap; postEvent() always raises m_checkpointPending.
++    static const bool s_fast = []() { const char *e = std::getenv("PS2X_EE_FASTEVENTS"); return !(e && e[0] == '0'); }();
++    if (s_fast && m_pendingEeTimerInterrupts == 0u &&
++        !m_checkpointPending.load(std::memory_order_acquire) &&
++        !m_stopRequested.load(std::memory_order_acquire))
++    {
++        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
++        if (nextEventCycle == 0u || m_eeCycle < nextEventCycle)
++        {
++            applyPendingPreemption();
++            return;
++        }
++    }
+     processDueDeadlines();
+     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
+     m_pendingEeTimerInterrupts = 0u;
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2584,7 +2584,8 @@
+                         ImageCrop(&img, Rectangle{0.0f, 0.0f, static_cast<float>(cw), static_cast<float>(ch)});
+                         const std::string path = s_shotPrefix + "_" + std::to_string(s_shotSecs[s_shotNext]) + "s.png";
+                         const bool ok = ExportImage(img, path.c_str());
+-                        std::fprintf(stderr, "[shot] %s %dx%d %s\n", path.c_str(), cw, ch, ok ? "ok" : "FAILED");
++                        std::fprintf(stderr, "[shot] %s %dx%d %s mono=%.3f\n", path.c_str(), cw, ch, ok ? "ok" : "FAILED",
++                                     std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                         UnloadImage(img);
+                     }
+                     ++s_shotNext;
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -102,7 +102,8 @@
+             if (!started)
+             {
+                 started = true;
+-                std::fprintf(stderr, "[spu2] first ADMA block captured (out=%d sim=%d)\n", outOn ? 1 : 0, sim ? 1 : 0);
++                std::fprintf(stderr, "[spu2] first ADMA block captured (out=%d sim=%d) mono=%.3f\n", outOn ? 1 : 0, sim ? 1 : 0,
++                             std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                 if (sim)
+                     std::thread([this]() {
+                         // PS2X_SPU2_OUT=sim: a wall-clock consumer standing in for the audio device
+--- a/ps2xRuntime/src/lib/ps2_ipu.inl
++++ b/ps2xRuntime/src/lib/ps2_ipu.inl
+@@ -28,7 +28,7 @@
+ {
+ inline bool enabled()
+ {
+-    static const bool e = [] { const char *v = std::getenv("PS2X_IPU"); return v && v[0] == '1'; }();
++    static const bool e = [] { const char *v = std::getenv("PS2X_IPU"); return !(v && v[0] == '0'); }(); // default on, PS2X_IPU=0 = off
+     return e;
+ }
+ inline int logLevel()
+@@ -1022,6 +1022,25 @@
+     bus.setReg(0x10002034u, (avail < 32u || s.busy) ? 0x80000000u : 0u);
+ }
+ 
++// PS2X_IPU_TRACE=<file>: one line per completed VDEC/BDEC/IDEC (decode results and output hash),
++// for comparing the game's command stream against an offline driver.
++inline void traceCommand(const State &s, size_t out0)
++{
++    static FILE *f = [] { const char *p = std::getenv("PS2X_IPU_TRACE"); return (p && *p) ? std::fopen(p, "w") : nullptr; }();
++    if (!f) return;
++    const uint32_t op = s.cmd >> 28;
++    if (op == 0x3)
++        std::fprintf(f, "V%u %d len=%u\n", (s.cmd >> 26) & 3u, (int)(int16_t)(s.result & 0xFFFF), s.result >> 16);
++    else if (op == 0x2 || op == 0x1)
++    {
++        uint64_t h = 1469598103934665603ull;
++        for (size_t i = out0; i < s.out.size(); ++i) h = (h ^ s.out[i]) * 1099511628211ull;
++        std::fprintf(f, "%c q=%u mbi=%u dcr=%u dt=%u cbp=%02x ctrl=%08x h=%016llx\n", op == 2 ? 'B' : 'I', (s.cmd >> 16) & 31u,
++                     (s.cmd >> 27) & 1u, (s.cmd >> 26) & 1u, (s.cmd >> 25) & 1u, (s.ctrl >> 8) & 63u, s.ctrl & 0x07F30000u,
++                     (unsigned long long)h);
++    }
++}
++
+ inline void service(State &s, Bus &bus)
+ {
+     for (int guard = 0; guard < 4; ++guard)
+@@ -1030,10 +1049,12 @@
+         if (s.busy)
+         {
+             const auto t0 = std::chrono::steady_clock::now();
++            const size_t traceOut0 = s.out.size();
+             if (runCommand(s, bus))
+             {
+                 s.busy = false;
+                 progressed = true;
++                traceCommand(s, traceOut0);
+             }
+             s.usTotal += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+         }

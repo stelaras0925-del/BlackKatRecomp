@@ -1,0 +1,122 @@
+# Scratchpad DMA chain modes (toSPR source chain, fromSPR destination chain). Included in ps2recomp-ipu-and-test-window.patch; standalone vs the IPU-patched tree.
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1883,6 +1883,118 @@
+                          m_ioRegisters[channelBase + 0x10u], m_ioRegisters[channelBase + 0x20u] & 0xFFFFu, m_ioRegisters[channelBase + 0x80u],
+                          m_ioRegisters[channelBase + 0x30u], m_ioRegisters[0x1000E030u]);
+     }
++    if (mode == 1u)
++    {
++        // Chain modes (MPEG players fetch motion-compensation reference blocks this way).
++        // toSPR (ch9): source chain, tags in main memory at TADR. fromSPR (ch8): destination chain,
++        // tags in the scratchpad at SADR. Per the public DMAC docs (tag: QWC 0-15, PCE 26-27,
++        // ID 28-30, IRQ 31, ADDR 32-62, SPR 63). PS2X_SPR_CHAIN=0 restores the old behaviour (ignored).
++        static const bool s_chain = []() { const char *e = std::getenv("PS2X_SPR_CHAIN"); return !(e && e[0] == '0'); }();
++        if (!s_chain)
++            return false;
++        const bool tie = (chcr & 0x80u) != 0u, tte = (chcr & 0x40u) != 0u;
++        uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
++        uint32_t madr = m_ioRegisters[channelBase + 0x10u];
++        uint32_t tadr = m_ioRegisters[channelBase + 0x30u];
++        uint32_t asr[2] = {m_ioRegisters[channelBase + 0x40u], m_ioRegisters[channelBase + 0x50u]};
++        uint32_t asp = (chcr >> 4) & 3u;
++        uint64_t lastTag = 0;
++        auto ramPtr = [&](uint32_t a, uint32_t bytes) -> uint8_t * {
++            if (a & 0x80000000u)
++            {
++                const uint32_t o = a & (PS2_SCRATCHPAD_SIZE - 1u) & ~15u;
++                return (o + bytes <= PS2_SCRATCHPAD_SIZE) ? m_scratchpad + o : nullptr;
++            }
++            const uint32_t phys = a & 0x01FFFFF0u;
++            return (phys < PS2_RAM_SIZE && bytes <= PS2_RAM_SIZE - phys) ? m_rdram + phys : nullptr;
++        };
++        auto toSpr = [&](const uint8_t *src, uint32_t bytes) {
++            for (uint32_t done = 0; done < bytes;)
++            {
++                const uint32_t n = std::min(bytes - done, PS2_SCRATCHPAD_SIZE - sadr);
++                std::memcpy(m_scratchpad + sadr, src + done, n);
++                done += n;
++                sadr = (sadr + n) & (PS2_SCRATCHPAD_SIZE - 1u);
++            }
++        };
++        auto fromSpr = [&](uint32_t dst, uint32_t bytes) {
++            uint8_t *d = ramPtr(dst, bytes);
++            for (uint32_t done = 0; done < bytes;)
++            {
++                const uint32_t n = std::min(bytes - done, PS2_SCRATCHPAD_SIZE - sadr);
++                if (d) std::memcpy(d + done, m_scratchpad + sadr, n);
++                done += n;
++                sadr = (sadr + n) & (PS2_SCRATCHPAD_SIZE - 1u);
++            }
++            if (d && !(dst & 0x80000000u)) markModified(dst & 0x01FFFFF0u, bytes);
++        };
++        // a transfer left over in QWC/MADR (restart after a TIE stop) goes first
++        uint32_t qwcLeft = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
++        if (qwcLeft)
++        {
++            if (channelBase == kSprToChannel) { if (const uint8_t *src = ramPtr(madr, qwcLeft * 16u)) toSpr(src, qwcLeft * 16u); }
++            else fromSpr(madr, qwcLeft * 16u);
++            madr += qwcLeft * 16u;
++        }
++        bool done = false;
++        for (int guard = 0; guard < 65536 && !done; ++guard)
++        {
++            uint64_t tag = 0;
++            if (channelBase == kSprToChannel)
++            {
++                const uint8_t *t = ramPtr(tadr, 16u);
++                if (!t) break;
++                std::memcpy(&tag, t, 8);
++                if (tte) toSpr(t, 16u);
++            }
++            else
++            {
++                std::memcpy(&tag, m_scratchpad + sadr, 8);
++                sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
++            }
++            lastTag = tag;
++            const uint32_t q = (uint32_t)(tag & 0xFFFFu), id = (uint32_t)(tag >> 28) & 7u;
++            const bool irq = (tag >> 31) & 1u;
++            const uint32_t addr = (uint32_t)(tag >> 32) & 0xFFFFFFF0u;
++            const uint32_t bytes = q * 16u;
++            if (channelBase == kSprToChannel)
++            {
++                uint32_t data = tadr + 16u;
++                switch (id)
++                {
++                case 0: data = addr; done = true; break;                       // refe
++                case 1: tadr = data + bytes; break;                             // cnt
++                case 2: tadr = addr; break;                                     // next
++                case 3: case 4: data = addr; tadr += 16u; break;                // ref, refs
++                case 5:                                                         // call
++                    if (asp >= 2u) { done = true; break; }
++                    asr[asp++] = data + bytes; tadr = addr; break;
++                case 6:                                                         // ret
++                    if (asp) tadr = asr[--asp]; else done = true; break;
++                default: done = true; break;                                    // end
++                }
++                if (const uint8_t *src = ramPtr(data, bytes)) toSpr(src, bytes);
++                madr = data + bytes;
++            }
++            else
++            {
++                // destination chain: cnts(0)/cnt(1) continue, end(7) stops
++                fromSpr(addr, bytes);
++                madr = addr + bytes;
++                if (id == 7) done = true;
++            }
++            if (irq && tie) done = true;
++        }
++        m_ioRegisters[channelBase + 0x10u] = madr;
++        m_ioRegisters[channelBase + 0x20u] = 0u;
++        m_ioRegisters[channelBase + 0x30u] = tadr;
++        m_ioRegisters[channelBase + 0x40u] = asr[0];
++        m_ioRegisters[channelBase + 0x50u] = asr[1];
++        m_ioRegisters[channelBase + 0x80u] = sadr;
++        m_ioRegisters[channelBase] = (chcr & 0x0000FFCFu) | (asp << 4) | (uint32_t)(lastTag & 0xFFFF0000u);
++        completeDmacChannel(channelBase, channelBase == kSprFromChannel ? 8u : 9u);
++        return true;
++    }
+     if (mode != 0u)
+         return false;
+ 
