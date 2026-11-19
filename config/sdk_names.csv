@@ -1,0 +1,119 @@
+address,name,confidence,evidence,action
+0x002D7970,sceSifGetSreg,high,6-insn leaf returning word sregs[a0] from table 0x7E5AC0; polled for SREG0 in the sceSifInitRpc wait loop where the first run hung (pc 0x2c38b8),stub
+0x002D7998,sceSifInitCmd,high,"only callee-init of sceSifInitRpc; AddDmacHandler(5), sceSifSetDChain, sceSifGetReg(0x80000000)/sceSifSetReg(0x80000001,0x7E5998 cmd data) exactly as logged in build/first_run.log",stub
+0x002D7C18,sceSifExitCmd,high,"DisableDmac(5) + RemoveDmacHandler(5,saved id) + clear init flag; only caller is sceSifExitRpc",stub
+0x002D7C50,sceSifSetCmdBuffer,high,"stores (a0,a1) into cmd-data +0x14/+0x18 (user handler table/size) returning the old table; same struct used by sceSifAddCmdHandler",stub
+0x002D7C68,sceSifAddCmdHandler,high,"cid<0 -> system table (cmd data +0xC) else user table (+0x14); stores {func,data} at cid*8 (ps2sdk SifAddCmdHandler layout)",stub
+0x002D7C98,sceSifRemoveCmdHandler,high,"same table selection as sceSifAddCmdHandler, zeroes entry",stub
+0x002D7CC0,sif_send_cmd_internal,high,"shared body of sceSifSendCmd/isceSifSendCmd (a1=0/1 selects sceSifSetDma vs isceSifSetDma); no runtime handler, internal",rename
+0x002D7DF8,sceSifSendCmd,high,arg-shuffling wrapper that calls sif_send_cmd_internal with mode 0; called by EA SNDDRV ('SNDDRV_dmtransfer - sceSifSendCmd FAILED'),stub
+0x002D7E38,isceSifSendCmd,high,identical wrapper with mode 1 (interrupt variant); runtime has no isceSifSendCmd handler so name only,rename
+0x002D7E78,sceSifCmdIntrHdlr,high,"DMAC ch5 handler body (isceSifSetDChain, no callers, address registered by sceSifInitCmd); not stubbed because the stubbed sceSifInitCmd never installs it",record
+0x002D7FA0,sceSifWriteBackDCache,high,"64-byte-line D-cache writeback loop over (addr,size); 14 callers in SIF/libcdvd/libmc",stub
+0x002C3760,sceSifInitRpc,high,"boot calls it with a0=0 first (0x1005a0); calls sceSifInitCmd, sceSifSendCmd, waits on sceSifGetSreg(0) then sceSifSetReg(0x80000002,1) (ps2sdk SifInitRpc); 11 callers incl. libcdvd/libmc/libmtap/fileio bind paths; the first-run hang site",stub
+0x002C3900,sceSifExitRpc,high,calls sceSifExitCmd then clears rpc init flag,stub
+0x002C3928,sceRpcGetPacket,high,"walks rpc packet table (+4 base,+8 count, 64-byte packets) under DIntr/EIntr, marks packet busy; used by BindRpc/CallRpc; not stubbed (internal to guest sifrpc, unreachable once BindRpc/CallRpc are stubbed)",record
+0x002C39D0,sceRpcFreePacket,high,clears busy bit and +0x18 of a packet; internal,record
+0x002C39F0,sceRpcGetFPacket,high,ring index mod count *64 (ps2sdk _rpc_get_fpacket); internal,record
+0x002C3A20,sifrpc_request_end,medium,"SIF cmd handler: switches on 0x8000000A/0x80000009, iSignalSema, frees packet; internal",rename
+0x002C3AD8,sifrpc_request_rdata,medium,SIF cmd handler replying with cmd 0x8000000C via isceSifSendCmd; internal,rename
+0x002C3B38,sifrpc_search_svdata,medium,walks server queue list for sid; internal,rename
+0x002C3B88,sifrpc_request_bind,medium,SIF cmd handler building 0x80000009 reply via isceSifSendCmd; internal,rename
+0x002C3C38,sceSifBindRpc,high,"(client,sid,mode); gets packet, CreateSema/WaitSema; call sites bind sids 0x80000400 libmc,0x80000001 fileio,0x80000592/593/595/596/59A libcdvd,0x80000006 loadfile,0x80000100/101 libpad,0x80000003 iopheap,0x80000901-905 libmtap,'SND' EA",stub
+0x002C3E08,sceSifCallRpc,high,"(client,fno,mode,send,ssize,recv,rsize,endfunc,endparam); 42 callers, all with a bound client as a0",stub
+0x002C3FF8,sceSifCheckStatRpc,high,"returns 1 if client packet busy (rpc_id match and bit0), else 0; used by sceCdSync/sceMcSync",stub
+0x002B4328,sceSifResetIop,high,"sceSifStopDma, sceSifSetDma of reset packet, sceSifSetReg/GetReg, writeback; only caller is sceSifRebootIop",stub
+0x002B4458,sceSifSyncIop,high,"tests sceSifGetReg(4)&0x40000 (SIF_STAT_BOOTEND), acks with sceSifSetReg(4,0x40000), returns 1/0; boot loops on it after the reboot",stub
+0x002B44A0,sceSifRebootIop,high,"builds 'rom0:UDNL ' + image path ('too long parameter' error), calls sceSifResetIop, sceSifExitRpc/InitRpc; boot loops on it with 'cdrom0:\IOPRP224.IMG;1'",stub
+0x002C1C20,sceSifLoadModule,high,"(path,argc,args) wrapper -> loadfile internal with result ptr and mode 0; boot calls it in retry loops for SIO2MAN/MTAPMAN/PADMAN/MCMAN/MCSERV/LIBSD/SNDDRV.IRX",stub
+0x002C19F8,sif_load_module_internal,high,"loadfile worker: binds via loadfile_bind, copies path, sceSifCallRpc on loadfile client 0x7E3100",rename
+0x002C1868,loadfile_bind,high,"sceSifBindRpc(0x7E3100, 0x80000006 LOADFILE) loop + call fno 0xFF",rename
+0x002C1968,loadfile_check_version,medium,compares against libkernl '2240' version string; internal,rename
+0x002F67D8,sceSifInitIopHeap,high,"sceSifBindRpc(0x7EC680, 0x80000003 IOP heap server)",stub
+0x002F6860,sceSifAllocIopHeap,high,"sceSifCallRpc(iopheap client, fno 1); used by EA SND bank code ('COULD NOT ALLOCATE IOP RAM')",stub
+0x002F68D0,sceSifFreeIopHeap,high,"sceSifCallRpc(iopheap client, fno 2)",stub
+0x002AA778,fileio_rpc_init,high,"sceSifInitRpc(0) + sceSifBindRpc(0x7E2080,0x80000001) + call fno 0xFF, sets init flag 0x686CE8; internal (runtime has no fileio-level init handler worth binding here)",rename
+0x002AA918,fileio_check_version,medium,checks libkernl '2240' version; internal,rename
+0x002AA9A8,sceFsReset,high,zeroes fileio init flag 0x686CE8 (tested by open/close/read/write/lseek) and 4 bytes at 0x7E20A8; boot calls it right after sceSifRebootIop/sceSifSyncIop/sceSifInitRpc/sceCdInit,stub
+0x002AA9E0,sceOpen,high,fileio fno 0 (FIO open); rom0:ROMVER reader 0x2a9410 calls it then read/close ('Can't open rom0:ROMVER'),stub
+0x002AAC68,sceClose,high,fileio fno 1,stub
+0x002AB020,sceRead,high,fileio fno 2; ROMVER reader ('Can't read rom error'),stub
+0x002AB290,sceWrite,high,fileio fno 3,stub
+0x002AADE8,sceLseek,high,fileio fno 4,stub
+0x002B5510,sceCdInit,high,string 'Libcdvd bind err %d CD_Init %d' / 'Libcdvd Exit'; binds 0x80000592; boot calls sceCdInit(0) twice,stub
+0x002B59E8,sceCdMmode,high,S-cmd fno 0x22 (MMODE) on client 0x68F588; boot calls sceCdMmode(2=DVD),stub
+0x002B57F0,sceCdDiskReady,high,"string 'Libcdvd bind err CdDiskReady', 'DiskReady 0'; binds 0x8000059A",stub
+0x002B51F8,sceCdNcmdDiskReady,high,"N-cmd fno 0x0E (DISKREADY) on N client 0x68ED10, result 6 = not ready checked by sceCdRead/sceCdStop",stub
+0x002B5290,sceCdSync,high,"string 'N cmd wait'; mode 0 loops delay(0x3C)+sceSifCheckStatRpc(N client), mode 1 polls",stub
+0x002B5330,sceCdSyncS,high,string 'S cmd wait'; same pattern on S client,stub
+0x002B4A78,sceCdCallback,high,"sceCdSync(1) then swaps callback pointer at 0x7E2A80 under DIntr/EIntr, returns old; game passes 0x2AEE10",stub
+0x002B4C30,sceCdInitEeCB,high,"(prio,stack,size): game calls (0xB,0x6881C0,0x800); GetThreadId/ReferThreadStatus/CreateThread(cb thread 0x2B4B70)/StartThread",stub
+0x002B4A10,sceCdDelayThread,medium,"SetAlarm+CreateSema/WaitSema delay helper used by sceCdSync/SyncS; internal, unreachable once those are stubbed",record
+0x002B5088,cdvd_check_ncmd,high,string 'Libcdvd bind err N CMD' / 'Ncmd fail sema'; binds 0x80000595; called by every N command,rename
+0x002B53A0,cdvd_check_scmd,high,string 'Libcdvd bind err S cmd' / 'Scmd fail sema'; binds 0x80000593; called by every S command,rename
+0x002B4F00,cdvd_poweroff_cb_init,high,string 'Libcdvd bind err PowerOffCB'; binds 0x80000596; called only by sceCdInit,rename
+0x002B4B70,cdvd_callback_thread,high,thread entry created by sceCdInitEeCB; 'sceCdCbfunc= %d sceCdCbfunc_num= %d',rename
+0x002B4DA8,cdvd_sema_init,medium,"CreateSema helper used by cdvd_check_ncmd/scmd, sceCdInit, sceCdDiskReady",rename
+0x002B4AD0,cdvd_rpc_end_cb,medium,end-function passed to async N cmds (iSignalSema),rename
+0x002D6A18,sceCdRead,high,strings 'call cdread cmd'/'cdread end'; N-cmd fno 1 (READ) async with end callback,stub
+0x002D8050,sceCdStop,high,no args; N-cmd fno 7 (STOP) async; same prologue as sceCdRead (sceCdNcmdDiskReady==6 check),stub
+0x002EC5B0,sceCdGetToc,high,N-cmd fno 4 (GETTOC) on N client with recv buffer + sceSifWriteBackDCache,stub
+0x002C1FC8,sceCdReadClock,high,strings 'Libcdvd call Clock read 1/2'; S-cmd fno 1 (READCLOCK),stub
+0x002D9DA8,sceCdStatus,high,string 'status called'; S-cmd fno 0x0C (STATUS),stub
+0x002DAF98,sceCdGetError,high,S-cmd fno 4 (GETERROR),stub
+0x002DE830,sceCdGetDiskType,high,S-cmd fno 3 (GETDISKTYPE),stub
+0x002C8FC8,scePadInit,high,binds 0x80000100 and 0x80000101 in endless retry loops (hangs without an IOP pad server); 'libpad: Module version mismatch' check against scePadGetModVersion,stub
+0x002C9108,pad_rpc_init,high,pad RPC command 0x10 (INIT) on 0x80000100 client; called only by scePadInit,rename
+0x002C9C60,scePadGetModVersion,high,pad RPC command 0x12 (GET_MODVER); scePadInit compares major==4,stub
+0x002C91A8,scePadPortOpen,high,strings 'libpad: buffer addr is not 64 byte align' / 'pad port is already open'; pad RPC command 1 (OPEN),stub
+0x002C9390,pad_get_dma_area,medium,returns per-port/slot DMA frame pointer; 8 internal callers,rename
+0x002C93F0,scePadRead,high,"copies 32-byte pad frame (memcpy) for (port,slot,buf); called from game ps2pad.c poll",stub
+0x002C9470,scePadGetState,high,state from DMA frame; called once per frame by ps2pad.c,stub
+0x002C94E8,scePadSetReqState,high,called with state 2 (BUSY) after SetMainMode/SetActAlign/SetButtonInfo RPCs,stub
+0x002C9550,scePadGetReqState,high,reads request state byte; polled by the ps2pad.c state machine,stub
+0x002C95A0,scePadInfoAct,high,"game calls (port,slot,-1,0) to get actuator count; checks a2 against frame byte 0x6A and term 0..3",stub
+0x002C96C0,scePadInfoMode,high,"game calls (port,slot,1,0) and (port,slot,2,0) = InfoModeCurID / CurExID",stub
+0x002C97F8,scePadSetMainMode,high,"pad RPC command 6 (SET_MMODE), then SetReqState BUSY; game calls (port,slot,1,3) = DUALSHOCK locked",stub
+0x002C98B0,scePadSetActDirect,high,"sends actuator data via pad_set_act_dma (sceSifSetDma, 'libpad: sceSifSetDma faild'); called by game vibration code",stub
+0x002C8E98,pad_set_act_dma,high,sceSifDmaStat/sceSifSetDma helper with 'libpad: sceSifSetDma faild'; internal,rename
+0x002C9968,scePadSetActAlign,high,"pad RPC command 8 (SET_ACTALIGN), then SetReqState BUSY",stub
+0x002C9A40,scePadGetButtonMask,high,its result ^ 0x3FFFF is the scePadInfoPressMode answer,stub
+0x002C9AF8,scePadSetButtonInfo,high,"pad RPC command 0x0A (SET_BTNINFO), then SetReqState BUSY",stub
+0x002C9BA8,scePadInfoPressMode,high,"returns (scePadGetButtonMask(port,slot) ^ 0x3FFFF)==0",stub
+0x002C9C08,scePadEnterPressMode,high,"scePadSetButtonInfo(port,slot,0xFFF)",stub
+0x002EF458,sceMtapInit,high,strings 'libmtap: bind failed'; binds 0x80000901..0x80000905 in retry loops (possible next hang if MTAPMAN.IRX does not register them); no runtime handler,rename
+0x002EF6D8,sceMtapPortOpen,high,string 'sceMtapPortOpen: rpc error',rename
+0x002EF748,sceMtapGetModVersion,high,string 'sceMtapGetModVersion: rpc error',rename
+0x002A7C30,sceMcInit,high,"strings 'bind error libmc', 'libmc: too old release of mcserv.irx/mcman.irx'; binds 0x80000400, fno 0xFE (Init)",stub
+0x002A85C0,sceMcGetInfo,high,mcserv fno 0x01 (GetInfo),stub
+0x002A7DE8,sceMcOpen,high,"mcserv fno 0x02 (Open), copies path",stub
+0x002A7F20,sceMcMkdir,high,"calls sceMcOpen(...,mode 0x40) and sets current cmd 0x0B (ps2sdk mcMkDir)",stub
+0x002A7F58,sceMcClose,high,mcserv fno 0x03 (Close),stub
+0x002A8010,sceMcSeek,high,mcserv fno 0x04 (Seek),stub
+0x002A8178,sceMcRead,high,mcserv fno 0x05 (Read) + sceSifWriteBackDCache,stub
+0x002A8298,sceMcWrite,high,mcserv fno 0x06 (Write) + FlushCache,stub
+0x002A8928,sceMcChdir,high,"mcserv fno 0x0C (Chdir), copies path",stub
+0x002A8748,sceMcGetDir,high,"mcserv fno 0x0D (GetDir), copies path",stub
+0x002A8B40,sceMcDelete,high,"mcserv fno 0x0F (Delete), copies path",stub
+0x002A8A78,sceMcFormat,high,mcserv fno 0x10 (Format),stub
+0x002A8488,sceMcSync,high,"(mode,cmd*,result*): returns -1 if no current cmd, else sceSifCheckStatRpc on mc client; 14 callers",stub
+0x002BA4B0,sceGsExecLoadImage,high,string 'sceGsExecLoadImage: DMA Ch.2 does not terminate',record
+0x002BA9B8,sceGsSetDefLoadImage,high,string 'sceGsSetDefLoadImage: too big size',record
+0x002BEC50,sceGsSyncPath,high,strings 'sceGsSyncPath: DMA Ch.1/Ch.2/VIF1/VU1/GIF does not terminate',record
+0x002C0988,sceDmaSync,medium,string 'libdma: sync timeout',record
+0x002BA958,DIntr,high,"di loop on COP0 Status.EIE, returns previous state; paired with EIntr around SIF/cdvd critical sections",rename
+0x002BA9A0,EIntr,high,ei; returns Status.EIE,rename
+0x002DE160,printf,high,"vfprintf(_impure_ptr->_stdout, fmt, ap); used by libmc/libpad/libcdvd/libgraph error messages",stub
+0x002EC940,vfprintf,high,"(FILE*,fmt,ap) core; also called by sprintf/vsprintf with a string FILE, so it must NOT be bound to the runtime vfprintf",record
+0x002BF280,sprintf,high,"newlib sprintf: string FILE (flags 0x208, size 0x7FFFFFFF) -> vfprintf, NUL-terminates; 55 callers",optional
+0x002BF2F0,vsprintf,high,same string-FILE pattern with va_list,optional
+0x002C336C,memset,high,"R5900 newlib memset (byte replicate, 16-byte sq loop, returns a0); 387 callers",optional
+0x002B0224,memcpy,high,"R5900 newlib memcpy (lq/sq 32-byte loop, ld/sd 8-byte, byte tail, returns dest)",optional
+0x002B03E8,strlen,high,single-arg 0x0101../0x8080.. zero-byte scan,optional
+0x002B02D4,strcpy,medium,"(dst,src) word copy with zero-byte detect, returns dst",optional
+0x002BABA0,strncpy,medium,"(dst,src,n) zero-detect copy with length checks",optional
+0x002C3248,strcasecmp,high,"ctype _U test (+0x20 fold) on both strings, returns difference",optional
+0x002C3300,strstr,high,"returns haystack for empty needle, else pointer to first match or 0",optional
+0x002B9770,rand,high,"newlib rand: next = next*0x41C64E6D + 0x3039 stored in _impure_ptr, & 0x7FFFFFFF; leave guest so RNG state stays deterministic",record
+0x002EFED0,__assert,high,"string 'assertion ""%s"" failed: file ""%s"", line %d'",rename
+0x002B42D0,strupr,high,in-place lower->upper via ctype _L bit; no runtime handler,rename

@@ -1,0 +1,27 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..c755bcb 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1396,6 +1396,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    const uint32_t entrySp = getRegU32(ctx, 29);
+     targetFn(rdram, ctx, this);
+ 
+     if (isStopRequested() || ctx->pc == 0u)
+@@ -1403,7 +1404,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
+-    if (ctx->pc == entryPc)
++    // "pc unchanged" means a handler returned without setting pc, but only if
++    // the stack pointer is also back where it was at the call. A re-entrant
++    // call to the same function (F -> callback -> F) that is preempted at the
++    // inner call unwinds with pc == F as well, but with the inner caller's sp;
++    // treating that as a return runs the outer caller's epilogue on the wrong
++    // frame (ra loaded as 0, thread dies at PC 0).
++    if (ctx->pc == entryPc && getRegU32(ctx, 29) == entrySp)
+     {
+         ctx->pc = fallthroughPc;
+     }

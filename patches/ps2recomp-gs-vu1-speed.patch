@@ -1,0 +1,285 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..1cb3ae0 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_psmct16.h"
+@@ -296,7 +297,23 @@ namespace
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        // lround() is a libm call per channel per bilinear texel (hot in
++        // gameplay); for the non-negative range that matters this is the same
++        // round-half-away-from-zero result, negatives clamp to 0 either way.
++        const float x = top + (bottom - top) * fy;
++        return clampU8(x <= 0.0f ? 0 : static_cast<int>(x + 0.5f));
++    }
++
++    inline int fastFloorToInt(float f)
++    {
++        const int i = static_cast<int>(f);
++        return i - (f < static_cast<float>(i) ? 1 : 0);
++    }
++
++    inline int fastCeilToInt(float f)
++    {
++        const int i = static_cast<int>(f);
++        return i + (f > static_cast<float>(i) ? 1 : 0);
+     }
+ }
+ 
+@@ -670,6 +687,15 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
+     if (!m_vram)
+         return 0u;
+ 
++    // PS2X_GS_TEXCACHE_OFF=1: read texels straight from VRAM. The one-page
++    // cache copies 8 KB on every page change, which bilinear taps and
++    // swizzled access patterns hit constantly (memcpy ~6% of gameplay time).
++    static const bool s_direct = []() {
++        const char *e = std::getenv("PS2X_GS_TEXCACHE_OFF");
++        return e && e[0] == '1';
++    }();
++    if (s_direct)
++        return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
+     return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
+ }
+ 
+@@ -1120,8 +1146,8 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+ 
+     const float sampleU = texUf - 0.5f;
+     const float sampleV = texVf - 0.5f;
+-    const int u0 = static_cast<int>(std::floor(sampleU));
+-    const int v0 = static_cast<int>(std::floor(sampleV));
++    const int u0 = fastFloorToInt(sampleU);
++    const int v0 = fastFloorToInt(sampleV);
+     const int u1 = u0 + 1;
+     const int v1 = v0 + 1;
+     const float fx = sampleU - static_cast<float>(u0);
+@@ -1311,10 +1337,50 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
+ 
++    // Per-row span: the three edge tests are linear in px, so compute the x
++    // range where all can pass (widened by one pixel to absorb rounding) and
++    // only run the exact per-pixel test inside it, instead of scanning the
++    // whole bounding box (thin/diagonal triangles wasted most iterations).
++    const float a0 = (fy1 - fy2) * winding * invAbsDenom;
++    const float a1 = (fy2 - fy0) * winding * invAbsDenom;
++    const float a2 = -(a0 + a1);
+     for (int y = minY; y <= maxY; ++y)
+     {
+         float py = static_cast<float>(y) + 0.5f;
+-        for (int x = minX; x <= maxX; ++x)
++        const float b0 = ((fy1 - fy2) * (-fx2) + (fx2 - fx1) * (py - fy2)) * winding * invAbsDenom;
++        const float b1 = ((fy2 - fy0) * (-fx2) + (fx0 - fx2) * (py - fy2)) * winding * invAbsDenom;
++        const float b2 = 1.0f - b0 - b1;
++        float pxLo = static_cast<float>(minX) + 0.5f;
++        float pxHi = static_cast<float>(maxX) + 0.5f;
++        bool empty = false;
++        const float as[3] = {a0, a1, a2};
++        const float bs[3] = {b0, b1, b2};
++        for (int e = 0; e < 3; ++e)
++        {
++            const float a = as[e];
++            const float lim = -kEdgeEpsilon - bs[e];
++            if (std::fabs(a) < 1.0e-12f)
++            {
++                if (0.0f < lim - 1.0e-3f)
++                    empty = true;
++                continue;
++            }
++            const float bound = lim / a;
++            if (a > 0.0f)
++                pxLo = std::max(pxLo, bound);
++            else
++                pxHi = std::min(pxHi, bound);
++        }
++        if (empty || !(pxLo <= pxHi + 2.0f))
++            continue;
++        int spanX0 = minX, spanX1 = maxX;
++        if (pxLo > static_cast<float>(minX) && pxLo < static_cast<float>(maxX) + 1.0f)
++            spanX0 = std::max(minX, fastFloorToInt(pxLo - 0.5f) - 1);
++        if (pxHi < static_cast<float>(maxX) && pxHi > static_cast<float>(minX) - 1.0f)
++            spanX1 = std::min(maxX, fastCeilToInt(pxHi - 0.5f) + 1);
++        if (pxLo >= static_cast<float>(maxX) + 1.0f || pxHi <= static_cast<float>(minX) - 1.0f)
++            continue;
++        for (int x = spanX0; x <= spanX1; ++x)
+         {
+             float px = static_cast<float>(x) + 0.5f;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f..e3b26e3 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
+@@ -1698,7 +1699,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+     const uint64_t tex1 = batch.state.context.tex1;
+     const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
+     const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
+-    batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
++    // PS2X_GS_NEAREST=1: force point sampling (bilinear = 4 swizzled texel
++    // reads + CLUT lookups per pixel in the CPU rasterizer). Speed over looks.
++    static const bool s_forceNearest = []() {
++        const char *e = std::getenv("PS2X_GS_NEAREST");
++        return e && e[0] == '1';
++    }();
++    batch.state.linearFilter = !s_forceNearest && (mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u);
+     return batch;
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index f19e281..01e36ee 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -14,6 +14,28 @@
+ #include <limits>
+ #include <ps2_log.h>
+ 
++namespace
++{
++    // Earliest readyCycle of any queued pipeline entry, for one interpreter
++    // instance. commitReadyPipelines() scans ~50 slots per instruction pair;
++    // with this it returns at once while nothing can be due yet. Entries are
++    // only ever added via "x.readyCycle = m_cycle + n" (hint lowered there)
++    // or removed; a stale (too low) hint only costs one extra scan.
++    const void *g_vu1HintOwner = nullptr;
++    uint64_t g_vu1CommitHint = 0;
++    inline void vu1NoteReady(const void *self, uint64_t cycle)
++    {
++        if (g_vu1HintOwner != self)
++        {
++            g_vu1HintOwner = self;
++            g_vu1CommitHint = 0;
++            return;
++        }
++        if (cycle < g_vu1CommitHint)
++            g_vu1CommitHint = cycle;
++    }
++}
++
+ namespace
+ {
+     constexpr uint8_t laneForComponent(uint32_t component)
+@@ -533,6 +555,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    vu1NoteReady(this, entry->readyCycle);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -572,6 +595,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            vu1NoteReady(this, entry.readyCycle);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -591,6 +615,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            vu1NoteReady(this, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -615,6 +640,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            vu1NoteReady(this, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -629,6 +655,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    vu1NoteReady(this, m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -643,6 +670,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            vu1NoteReady(this, entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -660,6 +688,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            vu1NoteReady(this, store.readyCycle);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -681,6 +710,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            vu1NoteReady(this, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -707,6 +737,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            vu1NoteReady(this, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -728,6 +759,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            vu1NoteReady(this, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -744,6 +776,8 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
++    if (g_vu1HintOwner == this && m_cycle < g_vu1CommitHint)
++        return;
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+         if (!entry.valid || entry.readyCycle > m_cycle)
+@@ -838,6 +872,25 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         write = {};
+     }
++
++    {
++        uint64_t next = ~0ull;
++        for (const FlagPipelineEntry &e : m_flagPipeline)
++            if (e.valid) next = std::min(next, e.readyCycle);
++        if (m_fdiv.valid) next = std::min(next, m_fdiv.readyCycle);
++        for (const ScalarPipelineEntry &e : m_efu)
++            if (e.valid) next = std::min(next, e.readyCycle);
++        for (const PendingStore &e : m_storePipeline)
++            if (e.valid) next = std::min(next, e.readyCycle);
++        for (const PendingVfWrite &e : m_vfWritePipeline)
++            if (e.valid) next = std::min(next, e.readyCycle);
++        for (const PendingViWrite &e : m_viWritePipeline)
++            if (e.valid) next = std::min(next, e.readyCycle);
++        for (const PendingAccWrite &e : m_accWritePipeline)
++            if (e.valid) next = std::min(next, e.readyCycle);
++        g_vu1HintOwner = this;
++        g_vu1CommitHint = next;
++    }
+ }
+ 
+ void VU1Interpreter::progressXgkick()

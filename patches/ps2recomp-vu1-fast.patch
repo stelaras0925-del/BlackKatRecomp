@@ -1,0 +1,107 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -16,6 +16,24 @@
+ 
+ namespace
+ {
++    constexpr bool kVu1FastDefault = true;
++
++    // PS2X_VU1_FAST=1 forces the straight-through executor, PS2X_VU1_ACCURATE=1
++    // the cycle-accurate one; otherwise kVu1FastDefault decides.
++    bool vu1FastMode()
++    {
++        static const bool fast = []() {
++            const char *f = std::getenv("PS2X_VU1_FAST");
++            if (f && f[0] == '1')
++                return true;
++            const char *a = std::getenv("PS2X_VU1_ACCURATE");
++            if (a && a[0] == '1')
++                return false;
++            return kVu1FastDefault;
++        }();
++        return fast;
++    }
++
+     // Earliest readyCycle of any queued pipeline entry, for one interpreter
+     // instance. commitReadyPipelines() scans ~50 slots per instruction pair;
+     // with this it returns at once while nothing can be due yet. Entries are
+@@ -991,6 +1009,18 @@
+     m_xgkick.sourceAddress = sourceAddress;
+     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
+     m_xgkick.issueCycle = m_cycle;
++
++    // VU1 fast mode: transfer the whole PATH1 packet at issue instead of two
++    // cycles per qword. Stores from earlier pairs are already committed (LSU
++    // latency 1), packet order on PATH1 is unchanged, and the program never
++    // has to step cycles just to drain a kick. Default on; PS2X_VU1_ACCURATE=1
++    // restores the cycle-paced transfer (PS2X_VU1_FAST=1 forces fast).
++    const bool s_fastXgkick = vu1FastMode();
++    if (s_fastXgkick)
++    {
++        m_xgkick.cycleCredit = 1u << 30;
++        progressXgkick();
++    }
+ }
+ 
+ void VU1Interpreter::advanceOneCycle()
+@@ -1687,6 +1717,7 @@
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
++    const bool fastMode = vu1FastMode() && m_unit == Unit::VU1;
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         commitReadyPipelines();
+@@ -1700,7 +1731,25 @@
+             break;
+         }
+ 
+-        uint64_t readyCycle = calculatePairReadyCycle(decoded);
++        // Fast mode: results are written straight into the register file, so
++        // only the Q/P (FDIV/EFU) resources and WAITQ/WAITP can stall.
++        auto pairReady = [&]() -> uint64_t {
++            if (!fastMode)
++                return calculatePairReadyCycle(decoded);
++            uint64_t r = m_cycle;
++            if ((decoded.lowerUsage.pipeline == PipelineFdiv || decoded.lowerUsage.waitQ) && m_fdiv.valid)
++                r = std::max(r, m_fdiv.readyCycle);
++            if (decoded.lowerUsage.pipeline == PipelineEfu)
++                r = std::max(r, m_efuResourceReady);
++            if (decoded.lowerUsage.waitP)
++                for (const ScalarPipelineEntry &entry : m_efu)
++                    if (entry.valid)
++                        r = std::max(r, entry.readyCycle);
++            if (decoded.lowerUsage.pipeline == PipelineXgkick && m_xgkick.active)
++                r = std::max(r, m_cycle + 1u);
++            return r;
++        };
++        uint64_t readyCycle = pairReady();
+         while (readyCycle > m_cycle)
+         {
+             if (readyCycle >= budgetEnd)
+@@ -1709,7 +1758,7 @@
+                 break;
+             }
+             advanceTo(readyCycle);
+-            readyCycle = calculatePairReadyCycle(decoded);
++            readyCycle = pairReady();
+         }
+         if (m_cycle >= budgetEnd)
+             break;
+@@ -1778,6 +1827,8 @@
+ 
+         m_viBranchBackupValid = false;
+ 
++        if (!fastMode)
++        {
+         if (hasUpperWrite)
+         {
+             std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
+@@ -1818,6 +1869,7 @@
+         }
+ 
+         markPairWrites(decoded);
++        }
+         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+             recordViWriteForBranch(writtenVi, oldVi);
+ 

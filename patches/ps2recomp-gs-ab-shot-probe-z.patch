@@ -1,0 +1,271 @@
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,3 +1,4 @@
++#include <chrono>
+ #include <cstdlib>
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_common.h"
+@@ -301,9 +302,21 @@
+         // gameplay); for the non-negative range that matters this is the same
+         // round-half-away-from-zero result, negatives clamp to 0 either way.
+         const float x = top + (bottom - top) * fy;
++        static const bool s_noFast = []() { const char *e = std::getenv("PS2X_GS_NOFASTMATH"); return e && e[0] == '1'; }();
++        if (s_noFast)
++            return clampU8(static_cast<int>(std::lround(x)));
+         return clampU8(x <= 0.0f ? 0 : static_cast<int>(x + 0.5f));
+     }
+ 
++    // PS2X_GS_NOSPAN=1 / PS2X_GS_NOFASTMATH=1: A/B switches for the speed patch.
++    inline bool gsEnvOn(const char *n)
++    {
++        const char *e = std::getenv(n);
++        return e && e[0] == '1';
++    }
++    const bool g_gsNoSpan = gsEnvOn("PS2X_GS_NOSPAN");
++    const bool g_gsNoFastMath = gsEnvOn("PS2X_GS_NOFASTMATH");
++
+     inline int fastFloorToInt(float f)
+     {
+         const int i = static_cast<int>(f);
+@@ -872,9 +885,65 @@
+     }
+ }
+ 
++namespace
++{
++    // PS2X_GS_PROBE="x,y[;x,y]" + PS2X_GS_PROBE_T=<sec>: for 0.3 s from that
++    // time, log every pixel write attempt at those framebuffer coords.
++    struct GsProbe
++    {
++        int n = 0;
++        int px[4] = {}, py[4] = {};
++        double t0 = 0.0;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++        int lines = 0;
++        GsProbe()
++        {
++            const char *e = std::getenv("PS2X_GS_PROBE");
++            if (!e) return;
++            const char *t = std::getenv("PS2X_GS_PROBE_T");
++            t0 = t ? std::atof(t) : 45.0;
++            const char *c = e;
++            while (*c && n < 4)
++            {
++                int xx = 0, yy = 0;
++                if (std::sscanf(c, "%d,%d", &xx, &yy) != 2) break;
++                px[n] = xx; py[n] = yy; ++n;
++                const char *sc = std::strchr(c, ';');
++                if (!sc) break;
++                c = sc + 1;
++            }
++        }
++        bool hit(int x, int y)
++        {
++            if (n == 0 || lines > 600) return false;
++            bool m = false;
++            for (int i = 0; i < n; ++i) m |= (px[i] == x && py[i] == y);
++            if (!m) return false;
++            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++            return el >= t0 && el < t0 + 0.3;
++        }
++    };
++    GsProbe g_gsProbe;
++}
++
+ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+ {
+     const auto &ctx = state.context;
++    if (g_gsProbe.hit(x, y))
++    {
++        ++g_gsProbe.lines;
++        const auto &t = ctx.tex0;
++        std::fprintf(stderr,
++                     "[gs:probe] (%d,%d) prim=%d iip=%d tme=%d fge=%d abe=%d fst=%d ctxt=%d rgba=%02x%02x%02x%02x z=0x%x fog=%u "
++                     "fb=%x/%u/psm%x msk=%x zb=%x/psm%x zmsk=%d test=%llx alpha=%llx fba=%llx pabe=%d "
++                     "tex0 tbp=%x tbw=%u psm=%x tw=%u th=%u tcc=%u tfx=%u cbp=%x cpsm=%x csm=%u texa? tex1=%llx clamp=%llx\n",
++                     x, y, (int)state.prim.type, state.prim.iip, state.prim.tme, state.prim.fge, state.prim.abe, state.prim.fst,
++                     state.prim.ctxt, r, g, b, a, (unsigned)z, fog,
++                     ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm, ctx.frame.fbmsk, ctx.zbuf.zbp, ctx.zbuf.psm, ctx.zbuf.zmask,
++                     (unsigned long long)ctx.test, (unsigned long long)ctx.alpha, (unsigned long long)ctx.fba, state.pabe,
++                     t.tbp0, t.tbw, t.psm, t.tw, t.th, t.tcc, t.tfx, t.cbp, t.cpsm, t.csm,
++                     (unsigned long long)ctx.tex1, (unsigned long long)ctx.clamp);
++    }
+     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
+         return;
+ 
+@@ -903,6 +972,38 @@
+         return;
+     }
+ 
++    // The GS clamps the interpolated Z to the Z buffer format's range before
++    // the depth test and write (Z24 -> 0xFFFFFF, Z16/Z16S -> 0xFFFF). Without
++    // this a Z16/Z24 buffer compares a full-width Z against a truncated stored
++    // value (wrong draw order) and writes wrapped low bits.
++    // PS2X_GS_ZCLAMP_OFF=1 restores the old behaviour; PS2X_GS_ZSTATS=1 logs.
++    {
++        static const bool s_noClamp = []() { const char *e = std::getenv("PS2X_GS_ZCLAMP_OFF"); return e && e[0] == '1'; }();
++        static const bool s_stats = []() { const char *e = std::getenv("PS2X_GS_ZSTATS"); return e && e[0] == '1'; }();
++        const uint32_t zfmt = zpsm & 0xFu;
++        const uint32_t zmax = (zfmt == 0u) ? 0xFFFFFFFFu : (zfmt == 1u) ? 0x00FFFFFFu : 0x0000FFFFu;
++        const uint32_t uz = static_cast<uint32_t>(z);
++        if (s_stats)
++        {
++            static uint64_t s_tot[16] = {}, s_over[16] = {};
++            static uint32_t s_zmaxSeen[16] = {};
++            static uint64_t s_all = 0;
++            ++s_tot[zfmt];
++            if (uz > zmax) ++s_over[zfmt];
++            if (uz > s_zmaxSeen[zfmt]) s_zmaxSeen[zfmt] = uz;
++            if ((++s_all & ((1ull << 23) - 1ull)) == 0ull)
++            {
++                for (int i = 0; i < 16; ++i)
++                    if (s_tot[i])
++                        std::fprintf(stderr, "[gs:zstats] zpsm=0x%x pixels=%llu overRange=%llu maxZ=0x%08x ztst=%u\n",
++                                     0x30 + i, (unsigned long long)s_tot[i], (unsigned long long)s_over[i], s_zmaxSeen[i],
++                                     static_cast<unsigned>((ctx.test >> 17) & 3u));
++            }
++        }
++        if (!s_noClamp && uz > zmax)
++            z = static_cast<int>(zmax);
++    }
++
+     const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+     const bool alphaBlendEnabled = state.prim.abe;
+     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
+@@ -1146,8 +1247,8 @@
+ 
+     const float sampleU = texUf - 0.5f;
+     const float sampleV = texVf - 0.5f;
+-    const int u0 = fastFloorToInt(sampleU);
+-    const int v0 = fastFloorToInt(sampleV);
++    const int u0 = g_gsNoFastMath ? static_cast<int>(std::floor(sampleU)) : fastFloorToInt(sampleU);
++    const int v0 = g_gsNoFastMath ? static_cast<int>(std::floor(sampleV)) : fastFloorToInt(sampleV);
+     const int u1 = u0 + 1;
+     const int v1 = v0 + 1;
+     const float fx = sampleU - static_cast<float>(u0);
+@@ -1371,6 +1472,12 @@
+             else
+                 pxHi = std::min(pxHi, bound);
+         }
++        if (g_gsNoSpan)
++        {
++            empty = false;
++            pxLo = static_cast<float>(minX) + 0.5f;
++            pxHi = static_cast<float>(maxX) + 0.5f;
++        }
+         if (empty || !(pxLo <= pxHi + 2.0f))
+             continue;
+         int spanX0 = minX, spanX1 = maxX;
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -931,7 +931,7 @@
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(x) / 16.0f;
+         vtx.y = static_cast<float>(y) / 16.0f;
+-        vtx.z = static_cast<float>(z);
++        vtx.z = static_cast<double>(z);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -968,7 +968,7 @@
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(x) / 16.0f;
+         vtx.y = static_cast<float>(y) / 16.0f;
+-        vtx.z = static_cast<float>(z);
++        vtx.z = static_cast<double>(z);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1002,7 +1002,7 @@
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
+         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
+-        vtx.z = static_cast<float>((hi >> 4) & 0xFFFFFF);
++        vtx.z = static_cast<double>((hi >> 4) & 0xFFFFFF);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1033,7 +1033,7 @@
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
+         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
+-        vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
++        vtx.z = static_cast<double>(hi & 0xFFFFFFFF);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -776,7 +776,8 @@
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
+-    if (g_vu1HintOwner == this && m_cycle < g_vu1CommitHint)
++    static const bool s_noHint = []() { const char *e = std::getenv("PS2X_VU1_NOHINT"); return e && e[0] == '1'; }();
++    if (!s_noHint && g_vu1HintOwner == this && m_cycle < g_vu1CommitHint)
+         return;
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -26,6 +26,7 @@
+ #include <chrono>
+ #include <atomic>
+ #include <thread>
++#include <vector>
+ #include <unordered_map>
+ #include <sstream>
+ 
+@@ -2460,6 +2461,52 @@
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+ 
++        // PS2X_SHOT="40,48,56": save the presented PS2 frame as PNG at those
++        // seconds after the first host frame (PS2X_SHOT_PREFIX, default
++        // "shot", may include a directory that already exists).
++        {
++            static std::vector<int> s_shotSecs;
++            static size_t s_shotNext = 0;
++            static std::string s_shotPrefix = "shot";
++            static std::chrono::steady_clock::time_point s_shotT0;
++            static bool s_shotInit = false;
++            if (!s_shotInit)
++            {
++                s_shotInit = true;
++                s_shotT0 = std::chrono::steady_clock::now();
++                if (const char *e = std::getenv("PS2X_SHOT"))
++                {
++                    std::stringstream ss(e);
++                    std::string tok;
++                    while (std::getline(ss, tok, ','))
++                        if (!tok.empty())
++                            s_shotSecs.push_back(std::atoi(tok.c_str()));
++                    std::sort(s_shotSecs.begin(), s_shotSecs.end());
++                }
++                if (const char *e = std::getenv("PS2X_SHOT_PREFIX"); e && e[0])
++                    s_shotPrefix = e;
++            }
++            if (s_shotNext < s_shotSecs.size())
++            {
++                const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_shotT0).count();
++                if (el >= s_shotSecs[s_shotNext])
++                {
++                    Image img = LoadImageFromTexture(frameTex);
++                    if (img.data)
++                    {
++                        const int cw = std::min<int>(img.width, static_cast<int>(presentWidth));
++                        const int ch = std::min<int>(img.height, static_cast<int>(presentHeight));
++                        ImageCrop(&img, Rectangle{0.0f, 0.0f, static_cast<float>(cw), static_cast<float>(ch)});
++                        const std::string path = s_shotPrefix + "_" + std::to_string(s_shotSecs[s_shotNext]) + "s.png";
++                        const bool ok = ExportImage(img, path.c_str());
++                        std::fprintf(stderr, "[shot] %s %dx%d %s\n", path.c_str(), cw, ch, ok ? "ok" : "FAILED");
++                        UnloadImage(img);
++                    }
++                    ++s_shotNext;
++                }
++            }
++        }
++
+         BeginDrawing();
+         ClearBackground(BLACK);
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));

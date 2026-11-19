@@ -1,0 +1,56 @@
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -626,12 +626,20 @@
+                 break;
+             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
+             {
+-                uint32_t copyBytes = mpgBytes;
+-                if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
+-                    copyBytes = PS2_VU1_CODE_SIZE - destAddr;
+-                if (pos + copyBytes <= sizeBytes)
++                // Micro memory addresses wrap (16 KB): an upload running past the end continues at 0.
++                const uint32_t avail = (pos < sizeBytes) ? (sizeBytes - pos) : 0u;
++                const uint32_t total = std::min<uint32_t>(mpgBytes, avail);
++                const uint32_t first = std::min<uint32_t>(total, PS2_VU1_CODE_SIZE - destAddr);
++                if (total > 0u)
+                 {
+-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
++                    std::memcpy(m_vu1Code + destAddr, data + pos, first);
++                    if (total > first)
++                    {
++                        static uint32_t s_wrapLogged = 0;
++                        if (s_wrapLogged++ < 20)
++                            std::fprintf(stderr, "[vif1:mpg] upload wraps: addr=%x bytes=%u\n", destAddr, total);
++                        std::memcpy(m_vu1Code, data + pos + first, total - first);
++                    }
+                     markVU1CodeModified();
+                 }
+             }
+@@ -646,7 +654,17 @@
+             if (qwCount == 0)
+                 qwCount = 65536;
+             const uint32_t availableQw = (sizeBytes - pos) / 16u;
++            // A DIRECT whose payload continues in the next VIF1 DMA transfer: keep it open
++            // (carry) instead of truncating, else the rest of the payload is parsed as VIFcodes.
++            if (qwCount > availableQw && carryFrom(cmdStart, cmd, 4u + qwCount * 16u))
++                break;
+             const bool truncated = qwCount > availableQw;
++            if (truncated)
++            {
++                static uint32_t s_truncLogged = 0;
++                if (s_truncLogged++ < 20)
++                    std::fprintf(stderr, "[vif1:direct] truncated cmd=%08x qw=%u avail=%u\n", cmd, qwCount, availableQw);
++            }
+             if (qwCount > availableQw)
+                 qwCount = availableQw;
+ 
+@@ -658,6 +676,9 @@
+                 const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+                 if (pendingImageQw != 0u)
+                 {
++                    static uint32_t s_pendLogged = 0;
++                    if (s_pendLogged++ < 20)
++                        std::fprintf(stderr, "[vif1:direct] IMAGE continues past DIRECT cmd=%08x qw=%u pendingQw=%u truncated=%d\n", cmd, qwCount, pendingImageQw, truncated ? 1 : 0);
+                     m_vif1PendingPath2ImageQwc = pendingImageQw;
+                     m_vif1PendingPath2DirectHl = directHl;
+                 }

@@ -1,0 +1,45 @@
+diff --git a/src/overrides/blackkat_slus_20365.cpp b/src/overrides/blackkat_slus_20365.cpp
+index e3c8006..7b61626 100644
+--- a/src/overrides/blackkat_slus_20365.cpp
++++ b/src/overrides/blackkat_slus_20365.cpp
+@@ -404,6 +404,40 @@ namespace
+             s_player = player;
+             s_count = 0;
+         }
++        // Front-end page transitions (Continue -> load page, Options, ...): the
++        // front end (0x1E7988..0x1E7C58) sets 0x3A3DEC = 1 while a transition clip
++        // plays and only moves to the new page when that clip reports end of
++        // stream (DecodeFrame -> 1). The page callback skips all drawing while
++        // 0x3A3DEC != 0, so with the stub never ending a clip the screen froze on
++        // the main menu (Continue "did nothing"). End transition clips after
++        // BLACKKAT_FMV_TRANSITION_FRAMES flag-0 frames (default 40, so the X press that
++        // opened the page is released before the page reads the pad; 0 = old hang).
++        {
++            static const uint32_t s_transFrames = []() -> uint32_t {
++                const char *e = std::getenv("BLACKKAT_FMV_TRANSITION_FRAMES");
++                return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 40u;
++            }();
++            static uint32_t s_transCount = 0;
++            uint32_t inTransition = 0;
++            std::memcpy(&inTransition, rdram + 0x3A3DECu, 4);
++            if (s_transFrames != 0u && inTransition != 0u)
++            {
++                if (++s_transCount >= s_transFrames)
++                {
++                    s_transCount = 0;
++                    static unsigned transLogged = 0;
++                    if (transLogged++ < 20)
++                        std::cerr << "[blackkat] FMV transition clip ended (player=0x" << std::hex << player
++                                  << std::dec << ")" << std::endl;
++                    setReturnS32(ctx, 1);
++                    return;
++                }
++            }
++            else
++            {
++                s_transCount = 0;
++            }
++        }
+         if (s_fmvFrames != 0u && ++s_count >= s_fmvFrames)
+         {
+             s_count = 0;

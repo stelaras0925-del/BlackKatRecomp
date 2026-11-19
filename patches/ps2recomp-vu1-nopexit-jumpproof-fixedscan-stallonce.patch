@@ -1,0 +1,203 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -289,6 +289,49 @@
+         static const bool on = []() { const char *e = std::getenv("PS2X_VU1_SIMD"); return !(e && e[0] == '0'); }();
+         return on;
+     }
++    // PS2X_VU1_JUMPPROOF=0: after a jump, scan the register ready slots of the first `window`
++    // pairs. On (default): if the jump came from a delay-slot pair s that itself ran after
++    // `window - 1` straight pairs, the history before target t is known (t+i-1..t, s, s-1, ...),
++    // so the same static no-stall proof is applied to t..t+window-1 along that history
++    // (cached per (image, t, s)).
++    bool vu1JumpProofOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_JUMPPROOF"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    struct Vu1JumpProofSlot
++    {
++        const void *xlat = nullptr;
++        uint32_t t = 0, s = 0;
++        uint32_t mask = 0;
++    };
++    thread_local Vu1JumpProofSlot tl_jumpProof[1024];
++    // PS2X_VU1_FIXEDSCAN=0: loop over exactly nRead/nWrite slots. On (default, needs FLATRDY):
++    // pairs with <= 8 reads / writes use a fixed 8-slot unrolled scan with no data-dependent
++    // loop exit. The unused list entries are 0 (VF0.x, never written by a pair), latency 0: the
++    // extra reads see a ready cycle <= now and the extra writes store "ready now" into VF0.x,
++    // so neither can add a stall.
++    bool vu1FixedScanOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_FIXEDSCAN"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // PS2X_VU1_STALLONCE=0: after a stall, recompute the pair's ready cycle. On (default): for
++    // fast-mode pairs using the slot list and not XGKICK, every term (register ready cycles,
++    // FDIV/EFU ready cycles) is fixed until the pair issues, and advanceTo() lands exactly on
++    // the target, so the recomputation would return the same cycle and is skipped.
++    bool vu1StallOnceOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_STALLONCE"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // PS2X_VU1_NOPEXIT=0: upper NOP (0x2FF / 0x33C forms) goes through the full fastUpper decode
++    // instead of returning right at the top of doUpper (same effect: only m_currentUpperInstruction).
++    bool vu1NopExitOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_NOPEXIT"); return !(e && e[0] == '0'); }();
++        return on;
++    }
+     // PS2X_VU1_FLATRDY=0: decode each ready-cycle slot (vf/vi/acc) with branches instead of
+     // indexing the three adjacent ready arrays as one flat array (vf=reg*4+lane, vi=128+reg,
+     // acc=144+lane: exactly the member layout, checked at run time).
+@@ -2803,6 +2846,7 @@
+     const bool zeroOn = tl_runXlat != nullptr && vu1FastZeroOn();
+     const bool fastLowerOn = tl_runXlat != nullptr && vu1FastLowerOn();
+     const bool simdOn = vu1SimdOn();
++    const bool nopExit = fastUpperOn && loopOn && vu1NopExitOn();
+     const bool skipCommitOn = vu1SkipCommitOn();
+     uint64_t committedCycle = ~0ull;
+     static const bool s_noHintRun = []() { const char *e = std::getenv("PS2X_VU1_NOHINT"); return e && e[0] == '1'; }();
+@@ -2811,6 +2855,8 @@
+     const bool flatRdyOn = vu1FlatRdyOn() &&
+                            reinterpret_cast<const char *>(&m_viReady[0]) == reinterpret_cast<const char *>(flatRdy + 128) &&
+                            reinterpret_cast<const char *>(&m_accReady[0]) == reinterpret_cast<const char *>(flatRdy + 144);
++    const bool fixedScan = flatRdyOn && vu1FixedScanOn();
++    const bool stallOnce = vu1StallOnceOn();
+     const auto fastUpper = [&](uint32_t instr) -> bool {
+         const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
+         const bool toAcc = op >= 0x3Cu;
+@@ -3064,6 +3110,13 @@
+     };
+     static const bool s_opStats = []() { const char *e = std::getenv("PS2X_VU1_OPSTATS"); return e && e[0] == '1'; }();
+     const auto doUpper = [&](uint32_t instr) {
++        if (nopExit && ((instr & 0x7FFu) == 0x2FFu || (instr & 0x7FFu) == 0x33Cu))
++        {
++            m_currentUpperInstruction = instr;
++            if (s_opStats)
++                vu1OpStatNote(1, instr);
++            return;
++        }
+         if (!fastUpperOn || !fastUpper(instr))
+         {
+             if (s_opStats)
+@@ -3230,6 +3283,48 @@
+     const size_t stallCount = runXl ? runXl->stall.size() : 0u;
+     const uint8_t *const noRegArr = staticStallOn ? runXl->noRegStall.data() : nullptr;
+     const uint32_t ssWindow = runXl ? runXl->window : 0u;
++    const bool jumpProofOn = staticStallOn && vu1JumpProofOn() && ssWindow > 0u && ssWindow <= 16u;
++    uint32_t jmpMask = 0u;
++    const auto jumpProofMask = [&](uint32_t t, uint32_t src) -> uint32_t {
++        Vu1JumpProofSlot &slot = tl_jumpProof[(t * 37u + src) & 1023u];
++        if (slot.xlat == runXl && slot.t == t && slot.s == src)
++            return slot.mask;
++        uint32_t mask = 0u;
++        const uint32_t n = static_cast<uint32_t>(stallCount);
++        for (uint32_t i = 0; i < ssWindow; ++i)
++        {
++            const uint32_t k = t + i;
++            if (k >= n || stallArr[k].nRead == 0xFFu)
++                break;
++            const Vu1PairStall &rk = stallArr[k];
++            bool safe = true;
++            for (uint32_t d = 1; d <= ssWindow && safe; ++d)
++            {
++                const uint32_t j = d <= i ? k - d : src - (d - i - 1u);
++                if (j >= n || stallArr[j].nRead == 0xFFu)
++                {
++                    safe = false;
++                    break;
++                }
++                const Vu1PairStall &wj = stallArr[j];
++                for (uint32_t w = 0; w < wj.nWrite && safe; ++w)
++                {
++                    if (wj.writeLat[w] <= d)
++                        continue;
++                    for (uint32_t r = 0; r < rk.nRead; ++r)
++                        if (rk.read[r] == wj.write[w])
++                        {
++                            safe = false;
++                            break;
++                        }
++                }
++            }
++            if (safe)
++                mask |= 1u << i;
++        }
++        slot = {runXl, t, src, mask};
++        return mask;
++    };
+     const bool decodedCurrent = tl_runXlat != nullptr && m_decodedCodeCacheValid && m_cachedVuCode == vuCode &&
+                                 m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
+                                 m_cachedCodeGeneration == memory->getVU1CodeGeneration();
+@@ -3268,10 +3363,17 @@
+         if (m_state.pc == ssLastPc + 8u)
+             ++ssSeq;
+         else
++        {
++            // ssSeq still describes the jump's source pair here.
++            jmpMask = (jumpProofOn && ssSeq + 1u >= ssWindow && ssLastPc != 0xFFFFFFF0u)
++                          ? jumpProofMask(m_state.pc / 8u, ssLastPc / 8u)
++                          : 0u;
+             ssSeq = 0u;
++        }
+         ssLastPc = m_state.pc;
+-        const bool skipRegScan = staticStallOn && pairStall && ssSeq >= ssWindow &&
+-                                 noRegArr[m_state.pc / 8u] != 0u;
++        const bool skipRegScan = staticStallOn && pairStall &&
++                                 (ssSeq >= ssWindow ? noRegArr[m_state.pc / 8u] != 0u
++                                                    : ((jmpMask >> ssSeq) & 1u) != 0u);
+         if (s_vu1Prof)
+             vu1ProfNotePair(m_state.pc, decoded.lower, decoded.upper);
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+@@ -3297,7 +3399,16 @@
+             {
+                 // Same result as calculatePairReadyCycle(decoded), from the precomputed slot list.
+                 uint64_t r = m_cycle;
+-                if (flatRdyOn)
++                if (fixedScan && !skipRegScan && pairStall->nRead <= 8u)
++                {
++                    const uint8_t *rd = pairStall->read;
++                    const uint64_t a0 = std::max(flatRdy[rd[0]], flatRdy[rd[1]]);
++                    const uint64_t a1 = std::max(flatRdy[rd[2]], flatRdy[rd[3]]);
++                    const uint64_t a2 = std::max(flatRdy[rd[4]], flatRdy[rd[5]]);
++                    const uint64_t a3 = std::max(flatRdy[rd[6]], flatRdy[rd[7]]);
++                    r = std::max(r, std::max(std::max(a0, a1), std::max(a2, a3)));
++                }
++                else if (flatRdyOn)
+                 {
+                     for (uint32_t k = 0, nr = skipRegScan ? 0u : pairStall->nRead; k < nr; ++k)
+                         r = std::max(r, flatRdy[pairStall->read[k]]);
+@@ -3350,6 +3461,9 @@
+                 break;
+             }
+             advanceTo(readyCycle);
++            if (stallOnce && pairStall && fastMode && !s_fastNoStall &&
++                decoded.lowerUsage.pipeline != PipelineXgkick)
++                break;
+             readyCycle = pairReady();
+         }
+         if (m_cycle >= budgetEnd)
+@@ -3469,7 +3583,21 @@
+         }
+         else if (!s_fastNoStall)
+         {
+-            if (pairStall && flatRdyOn)
++            if (pairStall && fixedScan && pairStall->nWrite <= 8u)
++            {
++                const uint8_t *wr = pairStall->write;
++                const uint8_t *wl = pairStall->writeLat;
++                const uint64_t c = m_cycle;
++                flatRdy[wr[0]] = c + wl[0];
++                flatRdy[wr[1]] = c + wl[1];
++                flatRdy[wr[2]] = c + wl[2];
++                flatRdy[wr[3]] = c + wl[3];
++                flatRdy[wr[4]] = c + wl[4];
++                flatRdy[wr[5]] = c + wl[5];
++                flatRdy[wr[6]] = c + wl[6];
++                flatRdy[wr[7]] = c + wl[7];
++            }
++            else if (pairStall && flatRdyOn)
+             {
+                 for (uint32_t k = 0; k < pairStall->nWrite; ++k)
+                     flatRdy[pairStall->write[k]] = m_cycle + pairStall->writeLat[k];

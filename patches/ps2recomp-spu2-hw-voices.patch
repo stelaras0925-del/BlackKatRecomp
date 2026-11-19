@@ -1,0 +1,506 @@
+--- a/third_party/PS2Recomp/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/third_party/PS2Recomp/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -204,6 +204,412 @@
+     Spu2Out &spu2Out() { static Spu2Out s; return s; }
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// Minimal SPU2 hardware voice emulation (PS2X_SPU2_VOICES, default on with capture; =0 off).
++// Black Kat streams music + its software-mixed voices through ADMA, but in-game SFX (cannon,
++// sword...) are keyed on real SPU2 voices (KON with nonzero VOL/PITCH/SSA). This models:
++// 2 MB SPU RAM filled by non-ADMA DMA ch4/ch7 (to TSA) and the data port (core+0x1AC), VAG
++// ADPCM decode with loop flags, pitch (linear interpolation), ADSR, fixed volume, KON/KOFF and
++// VMIX dry/wet enables. The 48 voices are rendered per ADMA block (512 frames, game time) and
++// mixed into the captured stream. No reverb, no noise, no pitch modulation, sweep volumes are
++// treated as full scale. PS2X_SPU2_VOICE_GAIN=<float> scales the voice mix (default 1.0).
++// PS2X_SPU2_VOICELOG=1 logs the first key-ons with decoded parameters.
++// ---------------------------------------------------------------------------------------------
++namespace
++{
++    struct Spu2Voices
++    {
++        static constexpr uint32_t kRamHalfwords = 1u << 20; // 2 MB
++        std::vector<uint16_t> ram = std::vector<uint16_t>(kRamHalfwords, 0);
++        bool on = true;
++        float gain = 1.0f;
++        bool log = false;
++        uint32_t logN = 0, koffLog = 0, endLog = 0;
++        uint32_t tsa[2] = {0, 0};
++        uint32_t endx[2] = {0, 0};
++        uint64_t uploads = 0, uploadBytes = 0, keyOns = 0, portWrites = 0, renders = 0;
++        float peak = 0.0f;
++
++        struct Voice
++        {
++            bool active = false;
++            uint32_t addr = 0;     // current block address (halfwords)
++            uint32_t lsa = 0;      // loop start (halfwords)
++            bool lsaSet = false;   // LSA written by the game after KON
++            int16_t buf[28] = {};
++            int32_t s1 = 0, s2 = 0;
++            int bufPos = 28;       // next sample index in buf
++            uint8_t flags = 0;
++            uint32_t counter = 0;  // 12.12 pitch counter
++            int16_t prev = 0, cur = 0;
++            int phase = 0;         // 0 off, 1 attack, 2 decay, 3 sustain, 4 release
++            int32_t env = 0;
++            uint32_t envCounter = 0;
++            uint32_t played = 0;
++            uint8_t core = 0, idx = 0;
++        } v[2][24];
++
++        Spu2Voices()
++        {
++            const char *e = std::getenv("PS2X_SPU2_VOICES");
++            on = !(e && e[0] == '0');
++            if (const char *g = std::getenv("PS2X_SPU2_VOICE_GAIN"))
++                gain = static_cast<float>(std::atof(g));
++            const char *l = std::getenv("PS2X_SPU2_VOICELOG");
++            log = l && l[0] == '1';
++        }
++
++        // Called from 16-bit (and split 32-bit) SPU2 register writes, after the value is stored.
++        template <typename Rd>
++        void reg16(uint32_t phys, uint16_t value, Rd rd)
++        {
++            if (!on)
++                return;
++            const uint32_t off = phys - 0x1F900000u;
++            int core;
++            uint32_t r;
++            if (off < 0x400u) { core = 0; r = off; }
++            else if (off < 0x760u) { core = 1; r = off - 0x400u; }
++            else return;
++            const uint32_t cb = 0x1F900000u + core * 0x400u;
++            switch (r)
++            {
++            case 0x1A8: case 0x1AA:
++                tsa[core] = ((uint32_t)(rd(cb + 0x1A8u) & 0x000Fu) << 16 | rd(cb + 0x1AAu)) & (kRamHalfwords - 1u);
++                return;
++            case 0x1AC:
++                ++portWrites;
++                ram[tsa[core]] = value;
++                tsa[core] = (tsa[core] + 1u) & (kRamHalfwords - 1u);
++                return;
++            case 0x1A0: case 0x1A2:
++                for (int i = 0; i < 16; ++i)
++                    if (value & (1u << i))
++                    {
++                        const int n = (r == 0x1A2 ? 16 : 0) + i;
++                        if (n < 24) keyOn(core, n, rd);
++                    }
++                return;
++            case 0x1A4: case 0x1A6:
++                for (int i = 0; i < 16; ++i)
++                    if (value & (1u << i))
++                    {
++                        const int n = (r == 0x1A6 ? 16 : 0) + i;
++                        if (n < 24 && v[core][n].phase != 0)
++                        {
++                            if (log && koffLog < 60u && v[core][n].env > 0x1000)
++                            {
++                                ++koffLog;
++                                std::fprintf(stderr, "[spu2:voice] KOFF c%d v%d after %u frames env=%d addr=%05x\n", core, n, v[core][n].played, v[core][n].env, v[core][n].addr);
++                            }
++                            v[core][n].phase = 4; v[core][n].envCounter = 0;
++                        }
++                    }
++                return;
++            default:
++                break;
++            }
++            // LSAX written while a voice plays (core+0x1C0 + n*0xC + 4/6)
++            if (r >= 0x1C0u && r < 0x1C0u + 24u * 0xCu)
++            {
++                const uint32_t n = (r - 0x1C0u) / 0xCu, w = (r - 0x1C0u) % 0xCu;
++                if (w == 4u || w == 6u)
++                {
++                    const uint32_t b = cb + 0x1C0u + n * 0xCu;
++                    v[core][n].lsa = (((uint32_t)(rd(b + 4u) & 0xFu) << 16) | rd(b + 6u)) & (kRamHalfwords - 1u);
++                    v[core][n].lsaSet = true;
++                }
++            }
++        }
++
++        template <typename Rd>
++        void keyOn(int core, int n, Rd rd)
++        {
++            const uint32_t cb = 0x1F900000u + core * 0x400u;
++            const uint32_t b = cb + 0x1C0u + n * 0xCu;
++            Voice &x = v[core][n];
++            x = Voice{};
++            x.addr = ((((uint32_t)(rd(b) & 0xFu) << 16) | rd(b + 2u)) & (kRamHalfwords - 1u)) & ~7u;
++            endx[core] &= ~(1u << n);
++            x.core = (uint8_t)core; x.idx = (uint8_t)n;
++            // LSA comes from the LSAX register (SNDDRV points it at the 0x5000 silent loop and
++            // treats NAX < 0x5040 as "voice finished"); a loop-start flag in the data overrides it.
++            x.lsa = (((uint32_t)(rd(b + 4u) & 0xFu) << 16) | rd(b + 6u)) & (kRamHalfwords - 1u);
++            x.active = true;
++            x.phase = 1;
++            ++keyOns;
++            const uint32_t vb = cb + n * 0x10u;
++            if (log && logN < 150u && (rd(vb) | rd(vb + 2u)) != 0u)
++            {
++                ++logN;
++                std::fprintf(stderr, "[spu2:voice] KON c%d v%d ssa=%05x volL=%04x volR=%04x pitch=%04x adsr1=%04x adsr2=%04x hdr=%04x\n",
++                             core, n, x.addr, rd(vb), rd(vb + 2u), rd(vb + 4u), rd(vb + 6u), rd(vb + 8u), ram[x.addr]);
++            }
++        }
++
++        void dmaUpload(int core, const uint8_t *src, uint32_t bytes)
++        {
++            if (!on)
++                return;
++            ++uploads; uploadBytes += bytes;
++            uint32_t a = tsa[core];
++            for (uint32_t i = 0; i + 1 < bytes; i += 2)
++            {
++                ram[a] = (uint16_t)(src[i] | (src[i + 1] << 8));
++                a = (a + 1u) & (kRamHalfwords - 1u);
++            }
++            tsa[core] = a;
++        }
++
++        void decodeBlock(Voice &x)
++        {
++            static const int32_t f0[5] = {0, 60, 115, 98, 122}, f1[5] = {0, 0, -52, -55, -60};
++            const uint16_t h = ram[x.addr];
++            const int shift = h & 0xF, filt = std::min((h >> 4) & 0xF, 4);
++            x.flags = (uint8_t)(h >> 8);
++            if ((x.flags & 4u) && !x.lsaSet)
++                x.lsa = x.addr;
++            for (int i = 0; i < 28; ++i)
++            {
++                const uint16_t w = ram[(x.addr + 1u + i / 4u) & (kRamHalfwords - 1u)];
++                int32_t s = (int16_t)(((w >> ((i & 3) * 4)) & 0xF) << 12);
++                s >>= (shift > 12 ? 9 : shift);
++                s += (x.s1 * f0[filt] + x.s2 * f1[filt] + 32) >> 6;
++                s = std::clamp(s, -32768, 32767);
++                x.s2 = x.s1; x.s1 = s;
++                x.buf[i] = (int16_t)s;
++            }
++            x.bufPos = 0;
++        }
++
++        int16_t nextSample(Voice &x)
++        {
++            if (x.bufPos >= 28)
++            {
++                decodeBlock(x);
++            }
++            const int16_t s = x.buf[x.bufPos++];
++            if (x.bufPos >= 28)
++            {
++                // block finished: handle end/loop flags
++                if (x.flags & 1u)
++                {
++                    endx[x.core] |= 1u << x.idx;
++                    if (x.flags & 2u)
++                        x.addr = x.lsa;
++                    else
++                    {
++                        if (log && endLog < 30u) { ++endLog; std::fprintf(stderr, "[spu2:voice] END at addr=%05x after %u frames\n", x.addr, x.played); }
++                        x.addr = x.lsa;
++                        x.phase = 0; x.env = 0; x.active = false;
++                    }
++                }
++                else
++                    x.addr = (x.addr + 8u) & (kRamHalfwords - 1u);
++            }
++            return s;
++        }
++
++        static void envTick(Voice &x, int rate, int step, bool expo, bool decrease)
++        {
++            rate = std::clamp(rate, 0, 127);
++            const int shift = rate >> 2;
++            int32_t stepv = step * (1 << std::max(0, 11 - shift));
++            uint32_t inc = 0x8000u >> std::max(0, shift - 11);
++            if (expo && !decrease && x.env > 0x6000)
++            {
++                // exponential increase: 4x slower above 0x6000
++                inc >>= 2;
++            }
++            if (expo && decrease)
++                stepv = (stepv * x.env) >> 15;
++            if (rate == 127) { inc = 0; }
++            x.envCounter += inc;
++            if (x.envCounter >= 0x8000u)
++            {
++                x.envCounter = 0;
++                x.env = std::clamp(x.env + stepv, 0, 0x7FFF);
++            }
++        }
++
++        void envelope(Voice &x, uint16_t a1, uint16_t a2)
++        {
++            switch (x.phase)
++            {
++            case 1:
++            {
++                const int rate = (a1 >> 8) & 0x7F;
++                envTick(x, rate, 7 - (rate & 3), (a1 & 0x8000u) != 0, false);
++                if (x.env >= 0x7FFF) { x.env = 0x7FFF; x.phase = 2; x.envCounter = 0; }
++                break;
++            }
++            case 2:
++            {
++                const int32_t sl = std::min<int32_t>(((a1 & 0xF) + 1) * 0x800, 0x7FFF);
++                envTick(x, ((a1 >> 4) & 0xF) << 2, -8, true, true);
++                if (x.env <= sl) { x.phase = 3; x.envCounter = 0; }
++                break;
++            }
++            case 3:
++            {
++                const int rate = (a2 >> 6) & 0x7F;
++                const bool dec = (a2 & 0x4000u) != 0;
++                envTick(x, rate, dec ? -8 + (rate & 3) : 7 - (rate & 3), (a2 & 0x8000u) != 0, dec);
++                break;
++            }
++            case 4:
++            {
++                envTick(x, (a2 & 0x1F) << 2, -8, (a2 & 0x20u) != 0, true);
++                if (x.env <= 0) { x.env = 0; x.phase = 0; x.active = false; }
++                break;
++            }
++            default:
++                break;
++            }
++        }
++
++        static float volOf(uint16_t r)
++        {
++            if (r & 0x8000u)
++                return 1.0f; // sweep mode: approximated as full scale
++            return (float)(int16_t)(r << 1) / 32768.0f;
++        }
++
++        // Reflect voice state into the registers the sound driver polls: ENVX (voice+0xA),
++        // VOLXL/R (+0xC/+0xE), NAX (core+0x1C8/0x1CA + n*0xC) and ENDX (core+0x340/0x342).
++        // Without this SNDDRV saw ENVX=0 and keyed every SFX voice off after ~50 ms.
++        template <typename Wr>
++        void feedback(Wr wr)
++        {
++            for (int c = 0; c < 2; ++c)
++            {
++                const uint32_t cb = 0x1F900000u + c * 0x400u;
++                for (int n = 0; n < 24; ++n)
++                {
++                    const Voice &x = v[c][n];
++                    const uint32_t vb = cb + n * 0x10u;
++                    const uint16_t e = x.active ? (uint16_t)x.env : 0u;
++                    wr(vb + 0xAu, e);
++                    wr(vb + 0xCu, e);
++                    wr(vb + 0xEu, e);
++                    const uint32_t nb = cb + 0x1C0u + n * 0xCu;
++                    wr(nb + 8u, (uint16_t)((x.addr >> 16) & 0xFu));
++                    wr(nb + 0xAu, (uint16_t)(x.addr & 0xFFFFu));
++                }
++                wr(cb + 0x340u, (uint16_t)(endx[c] & 0xFFFFu));
++                wr(cb + 0x342u, (uint16_t)(endx[c] >> 16));
++            }
++        }
++
++        template <typename Rd>
++        void render(int16_t *lr, uint32_t frames, Rd rd)
++        {
++            if (!on)
++                return;
++            if (++renders % 470u == 0u)
++            {
++                int act = 0;
++                for (int c = 0; c < 2; ++c)
++                    for (int n = 0; n < 24; ++n)
++                        act += v[c][n].active ? 1 : 0;
++                std::fprintf(stderr, "[spu2:voice] keyOns=%llu active=%d dmaUploads=%llu (%llu B) portWrites=%llu peak=%.0f\n",
++                             (unsigned long long)keyOns, act, (unsigned long long)uploads, (unsigned long long)uploadBytes,
++                             (unsigned long long)portWrites, peak);
++                peak = 0.0f;
++                if (log)
++                {
++                    std::fprintf(stderr, "[spu2:voice] mix regs:");
++                    for (uint32_t r = 0x760u; r < 0x7B0u; r += 2u)
++                        std::fprintf(stderr, " %03x=%04x", r, rd(0x1F900000u + r));
++                    std::fprintf(stderr, " c0mmix=%04x c1mmix=%04x\n", rd(0x1F900198u), rd(0x1F900598u));
++                }
++                // PS2X_SPU2_RAMDUMP=<path> (diagnostic): overwrite a 2 MB SPU2 RAM dump every ~5 s.
++                if (const char *dp = std::getenv("PS2X_SPU2_RAMDUMP"))
++                    if (FILE *f = std::fopen(dp, "wb")) { std::fwrite(ram.data(), 2, ram.size(), f); std::fclose(f); }
++            }
++            bool any = false;
++            for (int c = 0; c < 2 && !any; ++c)
++                for (int n = 0; n < 24; ++n)
++                    if (v[c][n].active) { any = true; break; }
++            if (!any)
++                return;
++            static std::vector<float> acc;
++            acc.assign(frames * 2, 0.0f);
++            for (int c = 0; c < 2; ++c)
++            {
++                const uint32_t cb = 0x1F900000u + c * 0x400u;
++                const uint32_t vmixL = rd(cb + 0x188u) | ((uint32_t)rd(cb + 0x18Au) << 16);
++                const uint32_t vmixEL = rd(cb + 0x18Cu) | ((uint32_t)rd(cb + 0x18Eu) << 16);
++                const uint32_t vmixR = rd(cb + 0x190u) | ((uint32_t)rd(cb + 0x192u) << 16);
++                const uint32_t vmixER = rd(cb + 0x194u) | ((uint32_t)rd(cb + 0x196u) << 16);
++                for (int n = 0; n < 24; ++n)
++                {
++                    Voice &x = v[c][n];
++                    if (!x.active)
++                        continue;
++                    const uint32_t vb = cb + n * 0x10u;
++                    const float vl = volOf(rd(vb)), vr = volOf(rd(vb + 2u));
++                    const uint32_t pitch = std::min<uint32_t>(rd(vb + 4u), 0x3FFFu);
++                    const uint16_t a1 = rd(vb + 6u), a2 = rd(vb + 8u);
++                    const uint32_t bit = 1u << n;
++                    // dry = 1.0, wet-only (no reverb emulated) = 0.5, neither = muted
++                    const float gl = (vmixL & bit) ? 1.0f : ((vmixEL & bit) ? 0.5f : 0.0f);
++                    const float gr = (vmixR & bit) ? 1.0f : ((vmixER & bit) ? 0.5f : 0.0f);
++                    for (uint32_t i = 0; i < frames && x.active; ++i)
++                    {
++                        while (x.counter >= 0x1000u)
++                        {
++                            x.counter -= 0x1000u;
++                            x.prev = x.cur;
++                            x.cur = nextSample(x);
++                            if (!x.active) break;
++                        }
++                        const float t = (float)x.counter / 4096.0f;
++                        const float s = ((float)x.prev + ((float)x.cur - (float)x.prev) * t) * ((float)x.env / 32768.0f);
++                        acc[i * 2] += s * vl * gl;
++                        acc[i * 2 + 1] += s * vr * gr;
++                        envelope(x, a1, a2);
++                        if (x.phase == 0) x.active = false;
++                        x.counter += pitch;
++                        ++x.played;
++                    }
++                }
++            }
++            // PS2X_SPU2_VOICERAW=<path> (diagnostic): raw s16 stereo 48 kHz dump of the voice mix only
++            // (only blocks where a voice is active; silence gaps are not written).
++            static FILE *s_raw = []() -> FILE * { const char *e = std::getenv("PS2X_SPU2_VOICERAW"); return e ? std::fopen(e, "wb") : nullptr; }();
++            if (s_raw)
++            {
++                static std::vector<int16_t> tmp;
++                tmp.resize(frames * 2);
++                for (uint32_t i = 0; i < frames * 2; ++i)
++                    tmp[i] = (int16_t)std::clamp(acc[i] * gain, -32768.0f, 32767.0f);
++                std::fwrite(tmp.data(), 2, tmp.size(), s_raw);
++            }
++            for (uint32_t i = 0; i < frames * 2; ++i)
++            {
++                peak = std::max(peak, std::fabs(acc[i] * gain));
++                const float s = (float)lr[i] + acc[i] * gain;
++                lr[i] = (int16_t)std::clamp(s, -32768.0f, 32767.0f);
++            }
++        }
++    };
++    Spu2Voices &spu2Voices() { static Spu2Voices s; return s; }
++}
++
++// EE-side sound-bank upload into the emulated SPU2 RAM (byte address), used by game overrides
++// whose EE->IOP SIF command path is not emulated (Black Kat: 0x2F45D0).
++extern "C" void ps2x_spu2_upload(uint32_t spuByteAddr, const uint8_t *src, uint32_t bytes)
++{
++    Spu2Voices &sv = spu2Voices();
++    ++sv.uploads; sv.uploadBytes += bytes;
++    uint32_t a = (spuByteAddr >> 1) & (Spu2Voices::kRamHalfwords - 1u);
++    for (uint32_t i = 0; i + 1 < bytes; i += 2)
++    {
++        sv.ram[a] = (uint16_t)(src[i] | (src[i + 1] << 8));
++        a = (a + 1u) & (Spu2Voices::kRamHalfwords - 1u);
++    }
++}
+ extern "C" void ps2x_spu2_pull(int16_t *out, uint32_t frames) { spu2Out().pull(out, frames); }
+ extern "C" bool ps2x_spu2_out_enabled() { return spu2Out().outOn.load() && !spu2Out().sim; }
+ 
+@@ -327,6 +733,8 @@
+         }
+         write8(address, static_cast<uint8_t>(value));
+         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
++        if (phys >= Spu2Base && phys < Spu2End && (phys & 1u) == 0u)
++            spu2Voices().reg16(phys, value, [this](uint32_t a) { return static_cast<uint16_t>(readHardware32(a & ~3u) >> ((a & 2u) * 8u)); });
+     }
+ 
+     void IopMemory::write32(uint32_t address, uint32_t value)
+@@ -346,6 +754,12 @@
+         if ((phys & 3u) == 0u)
+         {
+             writeHardware32(phys, value);
++            if (phys >= Spu2Base && phys < Spu2End)
++            {
++                auto rd = [this](uint32_t a) { return static_cast<uint16_t>(readHardware32(a & ~3u) >> ((a & 2u) * 8u)); };
++                spu2Voices().reg16(phys, static_cast<uint16_t>(value), rd);
++                spu2Voices().reg16(phys + 2u, static_cast<uint16_t>(value >> 16u), rd);
++            }
+             return;
+         }
+         write8(address, static_cast<uint8_t>(value));
+@@ -545,10 +959,37 @@
+                             std::memcpy(&r, src + half * 0x400u + 0x200u + i * 2u, 2);
+                             lr[(half * 256 + i) * 2] = l; lr[(half * 256 + i) * 2 + 1] = r;
+                         }
++                    spu2Voices().render(lr, 512, [this](uint32_t a) { return static_cast<uint16_t>(readHardware32(a & ~3u) >> ((a & 2u) * 8u)); });
++                    if (spu2Voices().on)
++                        spu2Voices().feedback([this](uint32_t a, uint16_t val) {
++                            const uint32_t al = a & ~3u, sh = (a & 2u) * 8u;
++                            m_hardware[al] = (readHardware32(al) & ~(0xFFFFu << sh)) | (static_cast<uint32_t>(val) << sh);
++                        });
+                     spu2Out().push(lr, 512);
+                 }
+             }
+         }
++        {
++            const auto ad = m_hardware.find((secondCore ? 0x1F900400u : 0x1F900000u) + 0x1B0u);
++            const bool adma = ad != m_hardware.end() && (ad->second & 0xFFFFu) != 0u;
++            static const bool s_vlog0 = []() { const char *e = std::getenv("PS2X_SPU2_VOICELOG"); return e && e[0] == '1'; }();
++            static uint32_t s_dmaLog = 0;
++            if (s_vlog0 && (!adma || transferWords != 512u) && s_dmaLog++ < 60u)
++                std::fprintf(stderr, "[spu2:voice] DMA start core%d adma=%d chcr=%08x bcr=%08x madr=%08x words=%llu\n", secondCore ? 1 : 0, adma ? 1 : 0, value,
++                             blockControl, readHardware32(address - 8u), (unsigned long long)transferWords);
++            if (!adma && (value & 1u) != 0u)
++            {
++                const uint32_t madr = readHardware32(address - 8u) & 0x1FFFFFu;
++                const uint64_t bytes = transferWords * 4u;
++                if (madr + bytes <= m_ram.size())
++                    spu2Voices().dmaUpload(secondCore ? 1 : 0, m_ram.data() + madr, static_cast<uint32_t>(bytes));
++                static uint32_t s_upLog = 0;
++                static const bool s_vlog = []() { const char *e = std::getenv("PS2X_SPU2_VOICELOG"); return e && e[0] == '1'; }();
++                if (s_vlog && s_upLog++ < 40u)
++                    std::fprintf(stderr, "[spu2:voice] DMA upload core%d madr=%06x bytes=%llu tsa=%05x\n", secondCore ? 1 : 0, madr,
++                                 (unsigned long long)bytes, (spu2Voices().tsa[secondCore ? 1 : 0] - (uint32_t)(bytes / 2u)) & 0xFFFFFu);
++            }
++        }
+         m_dmaStart = DmaStart{secondCore ? kDmaSpu1Irq : kDmaSpu0Irq, dmaDelay};
+     }
+ 
+--- a/third_party/PS2Recomp/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/third_party/PS2Recomp/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -811,6 +811,28 @@
+             if (checkInterrupt(cpu))
+                 return true;
+ 
++            {
++                // PS2X_IOP_PCTRAP=a,b,... (diagnostic): log the first 24 hits of each physical PC
++                // with a0-a3/ra.
++                static const std::vector<uint32_t> s_traps = []() {
++                    std::vector<uint32_t> t;
++                    if (const char *e = std::getenv("PS2X_IOP_PCTRAP"))
++                        for (const char *q = e; *q;)
++                        {
++                            char *end = nullptr;
++                            const unsigned long v = std::strtoul(q, &end, 16);
++                            if (end == q) break;
++                            t.push_back(static_cast<uint32_t>(v) & 0x1FFFFFFFu);
++                            q = (*end == ',') ? end + 1 : end;
++                        }
++                    return t;
++                }();
++                static std::vector<uint32_t> s_trapHits(s_traps.size(), 0u);
++                for (size_t ti = 0; ti < s_traps.size(); ++ti)
++                    if ((cpu.pc & 0x1FFFFFFFu) == s_traps[ti] && s_trapHits[ti]++ < 24u)
++                        std::fprintf(stderr, "[iop:trap] pc=%08x a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x hit=%u\n", cpu.pc,
++                                     cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], cpu.gpr[31], s_trapHits[ti]);
++            }
+             if (sndMixPc != 0u && (cpu.pc & 0x1FFFFFFFu) == sndMixPc && trySndMix(cpu))
+             {
+                 ++totalInstructions;

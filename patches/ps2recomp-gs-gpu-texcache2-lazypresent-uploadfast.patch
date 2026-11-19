@@ -1,0 +1,740 @@
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_backend.inl
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_backend.inl
+@@ -186,9 +186,10 @@
+     uint8_t tbw = 0, psm = 0, cpsm = 0, csm = 0, csa = 0, ta0 = 0, ta1 = 0, aem = 0;
+     uint16_t w = 0, h = 0;
+     uint64_t clutHash = 0;
++    uint64_t content = 0; // PS2X_GS_TEXCACHE2: hash of the source VRAM pages (0 when off)
+     bool operator==(const TexKey &o) const
+     {
+-        return tbp0 == o.tbp0 && tbw == o.tbw && psm == o.psm && cpsm == o.cpsm && csm == o.csm && csa == o.csa &&
++        return content == o.content && tbp0 == o.tbp0 && tbw == o.tbw && psm == o.psm && cpsm == o.cpsm && csm == o.csm && csa == o.csa &&
+                ta0 == o.ta0 && ta1 == o.ta1 && aem == o.aem && w == o.w && h == o.h && clutHash == o.clutHash;
+     }
+ };
+@@ -199,7 +200,7 @@
+         uint64_t h = k.clutHash * 0x9E3779B97F4A7C15ull;
+         auto mix = [&](uint64_t v) { h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); };
+         mix(k.tbp0); mix((uint64_t(k.tbw) << 8) | k.psm); mix((uint64_t(k.cpsm) << 16) | (uint64_t(k.csm) << 8) | k.csa);
+-        mix((uint64_t(k.ta0) << 16) | (uint64_t(k.ta1) << 8) | k.aem); mix((uint64_t(k.w) << 16) | k.h);
++        mix((uint64_t(k.ta0) << 16) | (uint64_t(k.ta1) << 8) | k.aem); mix((uint64_t(k.w) << 16) | k.h); mix(k.content);
+         return static_cast<size_t>(h);
+     }
+ };
+@@ -208,7 +209,44 @@
+     GLuint tex = 0;
+     uint64_t genSum = ~0ull;
+     GLint wrapS = -1, wrapT = -1, filter = -1;
++    std::vector<uint32_t> dbg; // PS2X_GS_TEXCACHE2_CHECK=1 only: decoded texels for compare
++    uint64_t lastUse = 0;      // Present() count when last bound (TEXCACHE2 eviction)
++    uint32_t bytes = 0;
+ };
++struct TexFront
++{
++    uint64_t genSum = ~0ull; // page generations when 'content' was hashed
++    uint64_t content = 0;
++};
++
++// Default-on env toggle: unset or anything but '0' = on.
++inline bool envOn(const char *name)
++{
++    const char *e = std::getenv(name);
++    return !(e && e[0] == '0');
++}
++
++inline uint64_t tcMum(uint64_t a, uint64_t b)
++{
++    const __uint128_t r = static_cast<__uint128_t>(a) * b;
++    return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
++}
++
++// 64-bit content hash of one 8 KiB GS page (4 independent lanes, wyhash-style mixing).
++inline uint64_t tcHashPage(const uint8_t *d)
++{
++    uint64_t l0 = 0xa0761d6478bd642full, l1 = 0xe7037ed1a0b428dbull, l2 = 0x8ebc6af09c88c6e3ull, l3 = 0x589965cc75374cc3ull;
++    for (uint32_t i = 0; i < 8192u; i += 64u)
++    {
++        uint64_t w[8];
++        std::memcpy(w, d + i, 64);
++        l0 = tcMum(l0 ^ w[0], w[1] ^ 0x1d8e4e27c47d124full) + w[0];
++        l1 = tcMum(l1 ^ w[2], w[3] ^ 0x9E3779B97F4A7C15ull) + w[2];
++        l2 = tcMum(l2 ^ w[4], w[5] ^ 0xbf58476d1ce4e5b9ull) + w[4];
++        l3 = tcMum(l3 ^ w[6], w[7] ^ 0x94d049bb133111ebull) + w[6];
++    }
++    return tcMum(tcMum(l0, 0x9E3779B97F4A7C15ull) ^ l1, tcMum(l2, 0xbf58476d1ce4e5b9ull) ^ l3);
++}
+ 
+ struct DrawKey
+ {
+@@ -420,7 +458,7 @@
+                 m_cpu.BeginTransfer(command);
+                 m_xferDst = dst;
+                 m_xferActive = true;
+-                vramWritten(dst);
++                m_bumpTag = 1; vramWritten(dst);
+                 break;
+             case 1: // local -> host
+                 resolveOverlapping(src, nullptr);
+@@ -430,7 +468,7 @@
+                 resolveOverlapping(src, nullptr);
+                 resolveOverlapping(dst, nullptr);
+                 m_cpu.BeginTransfer(command);
+-                vramWritten(dst);
++                m_bumpTag = 3; vramWritten(dst);
+                 ++m_stats.localCopies;
+                 break;
+             default:
+@@ -448,7 +486,7 @@
+                 resolveOverlapping(m_xferDst, nullptr);
+             m_cpu.UploadImage(buf->data(), static_cast<uint32_t>(buf->size()));
+             if (m_xferActive)
+-                vramWritten(m_xferDst);
++                m_bumpTag = 2; vramWritten(m_xferDst);
+         });
+     }
+ 
+@@ -470,8 +508,112 @@
+     {
+         PresentationFrame out;
+         runSync([this, &request, &out]() {
+-            resolveAll();
+-            out = m_cpu.Present(request);
++            ++m_presents;
++            if (!m_presentLazy)
++            {
++                resolveAll();
++                out = m_cpu.Present(request);
++                maybePrintStats();
++                return;
++            }
++            // PS2X_GS_PRESENT_LAZY: only make the memory Present can read current (display
++            // buffers, preferred source, context frames when a display is at fbp 0), and reuse
++            // the last converted frame when neither those pages nor the request changed.
++            PageRange rs[6];
++            int ctxN = 0;
++            int n = presentReadSet(request, rs, &ctxN);
++            // The context frames are only read when a single enabled display at fbp 0 comes out
++            // all black; resolve them up front only when both CRTs are on (merge path).
++            const bool bothCrt = (request.pmode & 3u) == 3u;
++            bool ctxDeferred = ctxN > 0 && !bothCrt && m_presentCtxLazy;
++            if (!ctxDeferred)
++                n += ctxN;
++            const bool fieldMode = (request.smode2 & 1u) != 0u && (request.smode2 & 2u) == 0u;
++            const int slot = fieldMode ? static_cast<int>(request.vsyncTick & 1u) : 0;
++            uint64_t gs = 0x51ed270b27a3c1f5ull;
++            m_rctx = 1;
++            for (int i = 0; i < n; ++i)
++                resolveOverlapping(rs[i], nullptr);
++            m_rctx = 0;
++            for (int i = 0; i < n; ++i)
++                gs = tcMum(gs ^ pageGenSum(rs[i]), 0x9E3779B97F4A7C15ull + static_cast<uint64_t>(i) * 0x1000193ull + rs[i].first);
++            if (m_statsOn && m_pcValid[slot] && gs != m_pcGen[slot] && m_presentDiag < 60 && m_presents > 2000)
++            {
++                ++m_presentDiag;
++                std::string tagsSeen;
++                for (int i = 0; i < n; ++i)
++                    for (uint32_t pg = rs[i].first; pg < rs[i].last; ++pg)
++                    {
++                        const uint32_t ix = pg & (kPages - 1u);
++                        if (m_pageGen[ix] != m_lastPageGenSnap[ix])
++                        {
++                            char b[48];
++                            std::snprintf(b, sizeof b, " p%u:t%u", ix, m_pageBumpTag[ix]);
++                            if (tagsSeen.size() < 400) tagsSeen += b;
++                        }
++                    }
++                std::fprintf(stderr, "[gs:gpu:presentdiag] present#%llu changed:%s\n", (unsigned long long)m_presents, tagsSeen.c_str());
++            }
++            if (m_statsOn && m_pcValid[slot] && gs == m_pcGen[slot] && !samePresentRequest(request, m_pcReq[slot], ctxDeferred) && m_presentDiag < 120)
++            {
++                ++m_presentDiag;
++                const auto &a = request; const auto &b = m_pcReq[slot];
++                std::fprintf(stderr, "[gs:gpu:presentdiag] reqdiff pmode=%d smode2=%llx/%llx disp=%d%d%d%d bg=%d tick=%llu/%llu pref=%d/%d dest=%u/%u prefFbp=%u/%u ctxDeferred=%d\n",
++                             a.pmode != b.pmode, (unsigned long long)a.smode2, (unsigned long long)b.smode2, a.dispfb1 != b.dispfb1,
++                             a.display1 != b.display1, a.dispfb2 != b.dispfb2, a.display2 != b.display2, a.bgcolor != b.bgcolor,
++                             (unsigned long long)a.vsyncTick, (unsigned long long)b.vsyncTick, a.hasPreferredSource, b.hasPreferredSource,
++                             a.preferredDestFbp, b.preferredDestFbp, a.preferredSource.fbp, b.preferredSource.fbp, ctxDeferred ? 1 : 0);
++            }
++            if (m_statsOn)
++                m_lastPageGenSnap = m_pageGen;
++            if (m_pcValid[slot] && gs == m_pcGen[slot] && samePresentRequest(request, m_pcReq[slot], ctxDeferred))
++            {
++                out = m_pcFrame[slot];
++                ++m_stats.presentReuse;
++            }
++            else
++            {
++                out = m_cpu.PresentInPlace(request);
++                bool cacheable = true;
++                if (ctxDeferred && (out.pixels.empty() || out.sourceFbp != out.displayFbp || presentAllBlack(out)))
++                {
++                    // Fallback may have looked at the (unresolved) context frames: redo it with
++                    // them current, and don't reuse this frame later.
++                    m_rctx = 1;
++                    for (int i = 0; i < ctxN; ++i)
++                        resolveOverlapping(rs[n + i], nullptr);
++                    m_rctx = 0;
++                    out = m_cpu.PresentInPlace(request);
++                    cacheable = false;
++                    ++m_stats.presentCtxRedo;
++                }
++                m_pcFrame[slot] = out;
++                m_pcReq[slot] = request;
++                m_pcGen[slot] = gs;
++                m_pcValid[slot] = cacheable;
++                ++m_stats.presentConvert;
++            }
++            if (m_presentCheck)
++            {
++                // Debug: full resolve + the original snapshot Present, compared with what we return.
++                resolveAll();
++                const PresentationFrame ref = m_cpu.Present(request);
++                ++m_stats.presentChecks;
++                if (ref.width != out.width || ref.height != out.height || ref.pixels != out.pixels ||
++                    ref.displayFbp != out.displayFbp || ref.sourceFbp != out.sourceFbp || ref.usedPreferred != out.usedPreferred)
++                {
++                    ++m_stats.presentMismatches;
++                    size_t diff = 0;
++                    for (size_t i = 0; i < ref.pixels.size() && i < out.pixels.size(); ++i)
++                        diff += ref.pixels[i] != out.pixels[i];
++                    if (++m_presentMismatchTotal <= 30)
++                        std::fprintf(stderr, "[gs:gpu:presentcheck] MISMATCH reuse=%d %ux%u vs %ux%u bytes-differ=%zu dispfb1=%llx dispfb2=%llx\n",
++                                     (m_stats.presentReuse && gs == m_pcGen[slot]) ? 1 : 0, out.width, out.height, ref.width, ref.height, diff,
++                                     (unsigned long long)request.dispfb1, (unsigned long long)request.dispfb2);
++                    out = ref;
++                    m_pcValid[slot] = false;
++                }
++            }
+             maybePrintStats();
+         });
+         return out;
+@@ -485,7 +627,7 @@
+                                          0u, static_cast<uint32_t>(context.scissor.y1) + 1u);
+             resolveOverlapping(r, nullptr);
+             result = m_cpu.ClearFramebuffer(context, rgba);
+-            vramWritten(r);
++            m_bumpTag = 4; vramWritten(r);
+         });
+         return result;
+     }
+@@ -514,7 +656,7 @@
+             const PageRange r = pageSpan(base, bw, psm, x + 1u, y + 1u);
+             resolveOverlapping(r, nullptr);
+             m_cpu.WriteVram(psm, base, bw, x, y, value);
+-            vramWritten(r);
++            m_bumpTag = 5; vramWritten(r);
+         });
+     }
+ 
+@@ -544,7 +686,8 @@
+     struct Stats
+     {
+         uint64_t prims = 0, batches = 0, resolves = 0, resolvedPixels = 0, uploads = 0, texDecodes = 0, texHits = 0,
+-                 localCopies = 0, dstCopies = 0;
++                 localCopies = 0, dstCopies = 0, texHashes = 0, pageHashes = 0, texChecks = 0, texMismatches = 0, texEvicts = 0, presentReuse = 0, presentConvert = 0, presentChecks = 0, presentMismatches = 0, presentCtxRedo = 0;
++        uint64_t resolveBy[4] = {0, 0, 0, 0};
+     };
+ 
+     // ---- queue -------------------------------------------------------------
+@@ -858,6 +1001,9 @@
+         m_haveKey = false;
+         m_attachedColor = m_attachedDepth = 0;
+         m_pageGen.fill(0);
++        m_pageHashGen.fill(0);
++        m_texFront.clear();
++        m_texBytes = 0;
+         ++m_globalGen;
+     }
+ 
+@@ -865,7 +1011,11 @@
+     void bumpPages(const PageRange &r)
+     {
+         for (uint32_t p = r.first; p < r.last; ++p)
++        {
+             ++m_pageGen[p & (kPages - 1u)];
++            m_pageBumpTag[p & (kPages - 1u)] = m_bumpTag;
++        }
++        m_bumpTag = 0;
+     }
+ 
+     uint64_t pageGenSum(const PageRange &r) const
+@@ -970,8 +1120,15 @@
+                 }
+             }
+         }
+-        bumpPages(pageSpan(bp, bw, t.psm, 0, static_cast<uint32_t>(rc.y1) + 1u));
++        m_bumpTag = 16 + (t.fbp & 0xFFF) * 32; bumpPages(pageSpan(bp, bw, t.psm, 0, static_cast<uint32_t>(rc.y1) + 1u));
+         ++m_stats.resolves;
++        ++m_stats.resolveBy[m_rctx & 3];
++        if (m_statsOn && m_resolveLog < 40 && m_presents > 2000)
++        {
++            ++m_resolveLog;
++            std::fprintf(stderr, "[gs:gpu:resolve] ctx=%d fbp=%u fbw=%u psm=%u rect=%d,%d-%d,%d present#%llu\n", m_rctx, t.fbp, t.fbw, t.psm,
++                         rc.x0, rc.y0, rc.x1, rc.y1, (unsigned long long)m_presents);
++        }
+         m_stats.resolvedPixels += static_cast<uint64_t>(rw) * rh;
+     }
+ 
+@@ -1078,7 +1235,9 @@
+                 Target &o = kv.second;
+                 if (&o == &t || !o.range().overlaps(mine))
+                     continue;
++                m_rctx = 3;
+                 resolve(o);
++                m_rctx = 0;
+                 o.stale = true;
+             }
+             t.gpuDirty = true;
+@@ -1111,7 +1270,9 @@
+         const uint32_t w = std::min<uint32_t>(std::max<uint32_t>(st.textureWidth, 1u), kDim);
+         const uint32_t h = std::min<uint32_t>(std::max<uint32_t>(st.textureHeight, 1u), kDim);
+         const PageRange r = pageSpan(tx.tbp0, tx.tbw, tx.psm, w, h);
++        m_rctx = 2;
+         resolveOverlapping(r, nullptr); // render-to-texture: make VRAM current first
++        m_rctx = 0;
+ 
+         TexKey k;
+         k.tbp0 = tx.tbp0;
+@@ -1135,36 +1296,203 @@
+             k.ta1 = st.texa.ta1;
+             k.aem = st.texa.aem ? 1 : 0;
+         }
+-        if (m_texCache.size() > 4096)
++        if (m_tc2 && (m_texCache.size() > 4096 || m_texBytes > (256ull << 20)))
++            evictTextures();
++        if (m_texCache.size() > 4096 || m_texBytes > (768ull << 20))
+         {
+             for (auto &kv : m_texCache)
+                 gl.glDeleteTextures(1, &kv.second.tex);
+             m_texCache.clear();
++            m_texFront.clear();
++            m_texBytes = 0;
+         }
+-        TexEntry &e = m_texCache[k];
+         const uint64_t gen = pageGenSum(r);
++        if (m_tc2)
++        {
++            // Content-addressed: page generations only say "maybe changed"; the hash of the
++            // source pages decides. Re-uploads of identical data and A/B textures sharing one
++            // VRAM slot then hit instead of re-decoding.
++            TexFront &f = m_texFront[k];
++            if (f.genSum != gen)
++            {
++                f.content = contentHash(r);
++                f.genSum = gen;
++                ++m_stats.texHashes;
++            }
++            k.content = f.content;
++        }
++        TexEntry &e = m_texCache[k];
+         if (!e.tex)
+         {
+             gl.glGenTextures(1, &e.tex);
+             gl.glBindTexture(GL_TEXTURE_2D, e.tex);
+             gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, nullptr);
++            e.bytes = w * h * 4u;
++            m_texBytes += e.bytes;
+         }
+-        if (e.genSum != gen)
++        e.lastUse = m_presents;
++        const bool decode = m_tc2 ? (e.genSum == ~0ull) : (e.genSum != gen);
++        if (decode)
+         {
+             m_texels.resize(static_cast<size_t>(w) * h);
+             m_cpu.DecodeTextureRgba(st, w, h, m_texels.data());
+             gl.glBindTexture(GL_TEXTURE_2D, e.tex);
+             gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA,
+                                GL_UNSIGNED_BYTE, m_texels.data());
+-            e.genSum = gen;
++            e.genSum = m_tc2 ? 0ull : gen;
++            if (m_tc2Check)
++                e.dbg = m_texels;
+             ++m_stats.texDecodes;
+         }
+         else
++        {
+             ++m_stats.texHits;
++            if (m_tc2Check)
++            {
++                // Debug: decode anyway and compare with what the cached texture was built from.
++                m_texels.resize(static_cast<size_t>(w) * h);
++                m_cpu.DecodeTextureRgba(st, w, h, m_texels.data());
++                ++m_stats.texChecks;
++                if (e.dbg.size() != m_texels.size() || std::memcmp(e.dbg.data(), m_texels.data(), m_texels.size() * 4u) != 0)
++                {
++                    ++m_stats.texMismatches;
++                    ++m_texMismatchTotal;
++                    size_t diff = 0;
++                    for (size_t i = 0; i < m_texels.size() && i < e.dbg.size(); ++i)
++                        diff += e.dbg[i] != m_texels[i];
++                    if (m_texMismatchTotal <= 50)
++                        std::fprintf(stderr, "[gs:gpu:texcheck] MISMATCH tbp=0x%x tbw=%u psm=0x%x %ux%u cpsm=0x%x csa=%u clut=%016llx content=%016llx texels-differ=%zu\n",
++                                     k.tbp0, k.tbw, k.psm, w, h, k.cpsm, k.csa, (unsigned long long)k.clutHash,
++                                     (unsigned long long)k.content, diff);
++                    // keep rendering correct in check mode
++                    gl.glBindTexture(GL_TEXTURE_2D, e.tex);
++                    gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA,
++                                       GL_UNSIGNED_BYTE, m_texels.data());
++                    e.dbg = m_texels;
++                }
++            }
++        }
+         return &e;
+     }
+ 
++    static uint32_t presentDisplayHeight(uint64_t display64)
++    {
++        // mirrors decodeDisplaySize() in gs_cpu_backend.cpp
++        const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
++        const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
++        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
++        uint32_t w = (dw + 1u) / (magh + 1u), h = dh + 1u;
++        if (w < 64u || h < 64u)
++            h = 448u;
++        return std::min<uint32_t>(h, 512u);
++    }
++
++    // Display/preferred ranges into rs[0..n); context-frame ranges (only read by the
++    // "fbp 0 display is all black" fallback) into rs[n..n+*ctxN).
++    int presentReadSet(const GSPresentationRequest &q, PageRange *rs, int *ctxN = nullptr) const
++    {
++        int n = 0;
++        const uint32_t h1 = presentDisplayHeight(q.display1), h2 = presentDisplayHeight(q.display2);
++        const uint32_t hm = std::max(h1, h2);
++        auto disp = [&](uint64_t fb, uint32_t h) {
++            const uint32_t fbp = static_cast<uint32_t>(fb & 0x1FFu), fbw = static_cast<uint32_t>((fb >> 9) & 0x3Fu);
++            const uint32_t psm = static_cast<uint32_t>((fb >> 15) & 0x1Fu);
++            const uint32_t ox = static_cast<uint32_t>((fb >> 32) & 0x7FFu), oy = static_cast<uint32_t>((fb >> 43) & 0x7FFu);
++            rs[n++] = pageSpan(fbp << 5u, fbw ? fbw : 10u, psm, ox + 640u, oy + h);
++        };
++        // only enabled CRTs are read (PMODE.EN1/EN2, same as decodePmode())
++        if (q.pmode & 1u)
++            disp(q.dispfb1, h1);
++        if (q.pmode & 2u)
++            disp(q.dispfb2, h2);
++        if (q.hasPreferredSource) // base in blocks (frameBaseIsPages=false)
++            rs[n++] = pageSpan(q.preferredSource.fbp, q.preferredSource.fbw ? q.preferredSource.fbw : 10u, q.preferredSource.psm, 640u, hm);
++        int c = 0;
++        if (((q.pmode & 1u) && (q.dispfb1 & 0x1FFu) == 0u) || ((q.pmode & 2u) && (q.dispfb2 & 0x1FFu) == 0u))
++            for (const GSFrameReg &cf : q.contextFrames)
++                rs[n + c++] = pageSpan(cf.fbp << 5u, cf.fbw ? cf.fbw : 10u, cf.psm, 640u, hm);
++        if (ctxN)
++            *ctxN = c;
++        else
++            n += c;
++        return n;
++    }
++
++    static bool presentAllBlack(const PresentationFrame &f)
++    {
++        // same test as countNonBlackPixels() (RGB != 0), over the whole host frame
++        const uint8_t *p = f.pixels.data();
++        const size_t n = f.pixels.size() / 4u;
++        for (size_t i = 0; i < n; ++i)
++            if (p[i * 4u] | p[i * 4u + 1u] | p[i * 4u + 2u])
++                return false;
++        return true;
++    }
++
++    static bool sameFrameReg(const GSFrameReg &a, const GSFrameReg &b)
++    {
++        return a.fbp == b.fbp && a.fbw == b.fbw && a.psm == b.psm && a.fbmsk == b.fbmsk;
++    }
++
++    // ctxIgnored: the cached frame did not take the black-display fallback, so the context
++    // frames did not influence it (and won't, while the display pages are unchanged).
++    static bool samePresentRequest(const GSPresentationRequest &a, const GSPresentationRequest &b, bool ctxIgnored)
++    {
++        const bool fieldMode = (a.smode2 & 1u) != 0u && (a.smode2 & 2u) == 0u; // as decodeSMode2/fieldMode
++        const bool prefUsed = a.hasPreferredSource || b.hasPreferredSource;
++        return a.pmode == b.pmode && a.smode2 == b.smode2 && a.dispfb1 == b.dispfb1 && a.display1 == b.display1 &&
++               a.dispfb2 == b.dispfb2 && a.display2 == b.display2 && a.bgcolor == b.bgcolor &&
++               (!fieldMode || ((a.vsyncTick ^ b.vsyncTick) & 1u) == 0u) &&
++               (ctxIgnored || (sameFrameReg(a.contextFrames[0], b.contextFrames[0]) && sameFrameReg(a.contextFrames[1], b.contextFrames[1]))) &&
++               a.hasPreferredSource == b.hasPreferredSource &&
++               (!prefUsed || (sameFrameReg(a.preferredSource, b.preferredSource) && a.preferredDestFbp == b.preferredDestFbp));
++    }
++
++    // TEXCACHE2: drop entries not bound in the last ~2 s of presents (oldest-first fallback).
++    void evictTextures()
++    {
++        uint64_t age = 120;
++        while (m_texCache.size() > 2048 || m_texBytes > (192ull << 20))
++        {
++            for (auto it = m_texCache.begin(); it != m_texCache.end();)
++            {
++                if (m_presents - it->second.lastUse >= age)
++                {
++                    gl.glDeleteTextures(1, &it->second.tex);
++                    m_texBytes -= it->second.bytes;
++                    it = m_texCache.erase(it);
++                    ++m_stats.texEvicts;
++                }
++                else
++                    ++it;
++            }
++            if (age == 0)
++                break;
++            age /= 2;
++        }
++    }
++
++    uint64_t pageHash(uint32_t p)
++    {
++        const uint32_t i = p & (kPages - 1u);
++        if (m_pageHashGen[i] != m_pageGen[i] + 1u)
++        {
++            m_pageHash[i] = (m_vram && (i + 1u) * 8192u <= m_vramSize) ? tcHashPage(m_vram + i * 8192u) : 0u;
++            m_pageHashGen[i] = m_pageGen[i] + 1u;
++            ++m_stats.pageHashes;
++        }
++        return m_pageHash[i];
++    }
++
++    uint64_t contentHash(const PageRange &r)
++    {
++        uint64_t h = 0x243f6a8885a308d3ull ^ (static_cast<uint64_t>(r.last - r.first) << 32);
++        for (uint32_t p = r.first; p < r.last; ++p)
++            h = tcMum(h ^ pageHash(p), 0x9E3779B97F4A7C15ull + p);
++        return h | 1u; // never 0 (0 = "off" in TexKey)
++    }
++
+     // ---- drawing --------------------------------------------------------------
+     static uint8_t primClass(GSPrimType t)
+     {
+@@ -1517,12 +1845,30 @@
+         m_busyNs = 0;
+         std::fprintf(stderr,
+                      "[gs:gpu:stats] prims=%llu batches=%llu resolves=%llu (%llu px) uploads=%llu texDecodes=%llu texHits=%llu "
+-                     "l2l=%llu dstCopies=%llu targets=%zu textures=%zu\n",
++                     "l2l=%llu dstCopies=%llu targets=%zu textures=%zu | tc2=%d texHashes=%llu pageHashes=%llu texMB=%llu checks=%llu mismatches=%llu (total %llu) evicts=%llu | lazyPresent=%d convert=%llu reuse=%llu pchecks=%llu pmismatches=%llu (total %llu) ctxRedo=%llu\n",
+                      (unsigned long long)m_stats.prims, (unsigned long long)m_stats.batches,
+                      (unsigned long long)m_stats.resolves, (unsigned long long)m_stats.resolvedPixels,
+                      (unsigned long long)m_stats.uploads, (unsigned long long)m_stats.texDecodes,
+                      (unsigned long long)m_stats.texHits, (unsigned long long)m_stats.localCopies,
+-                     (unsigned long long)m_stats.dstCopies, m_targets.size(), m_texCache.size());
++                     (unsigned long long)m_stats.dstCopies, m_targets.size(), m_texCache.size(),
++                     m_tc2 ? 1 : 0, (unsigned long long)m_stats.texHashes, (unsigned long long)m_stats.pageHashes,
++                     (unsigned long long)(m_texBytes >> 20), (unsigned long long)m_stats.texChecks,
++                     (unsigned long long)m_stats.texMismatches, (unsigned long long)m_texMismatchTotal,
++                     (unsigned long long)m_stats.texEvicts, m_presentLazy ? 1 : 0,
++                     (unsigned long long)m_stats.presentConvert, (unsigned long long)m_stats.presentReuse,
++                     (unsigned long long)m_stats.presentChecks, (unsigned long long)m_stats.presentMismatches,
++                     (unsigned long long)m_presentMismatchTotal, (unsigned long long)m_stats.presentCtxRedo);
++        std::fprintf(stderr, "[gs:gpu:resolves] other=%llu present=%llu texture=%llu alias=%llu\n",
++                     (unsigned long long)m_stats.resolveBy[0], (unsigned long long)m_stats.resolveBy[1],
++                     (unsigned long long)m_stats.resolveBy[2], (unsigned long long)m_stats.resolveBy[3]);
++        if (m_presentLazy)
++            std::fprintf(stderr, "[gs:gpu:present] pmode=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx ctx0=%u/%u/%u ctx1=%u/%u/%u pref=%d %u/%u/%u dest=%u\n",
++                         (unsigned long long)m_pcReq[0].pmode, (unsigned long long)m_pcReq[0].dispfb1, (unsigned long long)m_pcReq[0].display1,
++                         (unsigned long long)m_pcReq[0].dispfb2, (unsigned long long)m_pcReq[0].display2,
++                         m_pcReq[0].contextFrames[0].fbp, m_pcReq[0].contextFrames[0].fbw, m_pcReq[0].contextFrames[0].psm,
++                         m_pcReq[0].contextFrames[1].fbp, m_pcReq[0].contextFrames[1].fbw, m_pcReq[0].contextFrames[1].psm,
++                         m_pcReq[0].hasPreferredSource ? 1 : 0, m_pcReq[0].preferredSource.fbp, m_pcReq[0].preferredSource.fbw,
++                         m_pcReq[0].preferredSource.psm, m_pcReq[0].preferredDestFbp);
+         m_stats = Stats{};
+     }
+ 
+@@ -1573,6 +1919,28 @@
+     std::unordered_map<TexKey, TexEntry, TexKeyHash> m_texCache;
+     std::array<uint64_t, kPages> m_pageGen{};
+     uint64_t m_globalGen = 0;
++    // PS2X_GS_TEXCACHE2 (default on, =0 restores the generation-only cache)
++    bool m_tc2 = envOn("PS2X_GS_TEXCACHE2");
++    bool m_tc2Check = envFlag("PS2X_GS_TEXCACHE2_CHECK");
++    std::array<uint64_t, kPages> m_pageHash{}, m_pageHashGen{};
++    std::unordered_map<TexKey, TexFront, TexKeyHash> m_texFront;
++    uint64_t m_texBytes = 0, m_texMismatchTotal = 0, m_presents = 0;
++    // PS2X_GS_PRESENT_LAZY (default on)
++    bool m_presentLazy = envOn("PS2X_GS_PRESENT_LAZY");
++    int m_rctx = 0;
++    uint32_t m_bumpTag = 0;
++    int m_presentDiag = 0;
++    std::array<uint32_t, kPages> m_pageBumpTag{};
++    std::array<uint64_t, kPages> m_lastPageGenSnap{};
++    int m_resolveLog = 0;
++    bool m_presentCtxLazy = envOn("PS2X_GS_PRESENT_CTXLAZY");
++    bool m_presentCheck = envFlag("PS2X_GS_PRESENT_CHECK");
++    uint64_t m_presentMismatchTotal = 0;
++    // one cached converted frame per field parity (interlaced field mode alternates them)
++    bool m_pcValid[2] = {false, false};
++    uint64_t m_pcGen[2] = {0, 0};
++    GSPresentationRequest m_pcReq[2]{};
++    PresentationFrame m_pcFrame[2]{};
+ 
+     // pending batch
+     bool m_haveKey = false;
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1653,6 +1653,42 @@
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    // PS2X_GS_UPLOAD_FAST (default on, =0 = old per-pixel div/mod path).
++    static const bool s_uploadFast = []() { const char *e = std::getenv("PS2X_GS_UPLOAD_FAST"); return !(e && e[0] == '0'); }();
++    // PS2X_GS_UPLOAD_CHECK=1: run the fast and the old path on the same input and compare
++    // the resulting VRAM bytes and transfer state (debug; copies 4 MiB twice per call).
++    static const bool s_uploadCheck = []() { const char *e = std::getenv("PS2X_GS_UPLOAD_CHECK"); return e && e[0] == '1'; }();
++    if (!s_uploadCheck || !m_vram)
++    {
++        UploadImageImpl(data, sizeBytes, s_uploadFast);
++        return;
++    }
++    static uint64_t s_calls = 0, s_bad = 0;
++    std::vector<uint8_t> before(m_vram, m_vram + m_vramSize);
++    const GSTransferSnapshot st0 = m_transferState;
++    UploadImageImpl(data, sizeBytes, true);
++    std::vector<uint8_t> fastVram(m_vram, m_vram + m_vramSize);
++    const GSTransferSnapshot stFast = m_transferState;
++    std::memcpy(m_vram, before.data(), m_vramSize);
++    m_transferState = st0;
++    UploadImageImpl(data, sizeBytes, false);
++    ++s_calls;
++    const bool stateSame = stFast.direction == m_transferState.direction && stFast.copiedPixels == m_transferState.copiedPixels &&
++                           stFast.totalPixels == m_transferState.totalPixels &&
++                           (m_transferState.direction == 3u || (stFast.x == m_transferState.x && stFast.y == m_transferState.y));
++    if (!stateSame || std::memcmp(fastVram.data(), m_vram, m_vramSize) != 0)
++    {
++        ++s_bad;
++        if (s_bad <= 20)
++            std::fprintf(stderr, "[gs:uploadcheck] MISMATCH call %llu psm=0x%x size=%u state=%d\n", (unsigned long long)s_calls,
++                         m_transfer.bitbltbuf.dpsm, sizeBytes, stateSame ? 1 : 0);
++    }
++    if ((s_calls & 4095u) == 0u)
++        std::fprintf(stderr, "[gs:uploadcheck] %llu calls, %llu mismatches\n", (unsigned long long)s_calls, (unsigned long long)s_bad);
++}
++
++void GSCpuBackend::UploadImageImpl(const uint8_t *data, uint32_t sizeBytes, bool fast)
++{
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+@@ -1665,6 +1701,94 @@
+     const uint32_t dsax = m_transfer.trxpos.dsax;
+     uint32_t offset = 0u;
+ 
++    // fast: same writes in the same order, but the destination x/y are stepped instead of
++    // re-derived (div/mod) per pixel.
++    if (fast)
++    {
++        const WriteVramFunc wr = m_writeVramFuncs[dpsm & 0x3Fu];
++        const uint32_t total = m_transferState.totalPixels;
++        const uint32_t dsay = m_transfer.trxpos.dsay;
++        uint32_t cp = m_transferState.copiedPixels;
++        uint32_t col = cp % rrw, row = cp / rrw;
++        auto step = [&]() { ++cp; if (++col == rrw) { col = 0u; ++row; } };
++        switch (dpsm)
++        {
++        case GS_PSM_CT32:
++        case GS_PSM_Z32:
++            while (cp < total && sizeBytes - offset >= 4u)
++            {
++                uint32_t value;
++                std::memcpy(&value, data + offset, 4u);
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, value);
++                offset += 4u;
++                step();
++            }
++            break;
++        case GS_PSM_CT24:
++        case GS_PSM_Z24:
++            while (cp < total && sizeBytes - offset >= 3u)
++            {
++                const uint32_t value = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
++                                       (static_cast<uint32_t>(data[offset + 2u]) << 16u);
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, value);
++                offset += 3u;
++                step();
++            }
++            break;
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++        case GS_PSM_Z16:
++        case GS_PSM_Z16S:
++            while (cp < total && sizeBytes - offset >= 2u)
++            {
++                uint16_t value;
++                std::memcpy(&value, data + offset, 2u);
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, value);
++                offset += 2u;
++                step();
++            }
++            break;
++        case GS_PSM_T8:
++        case GS_PSM_T8H:
++            while (cp < total && offset < sizeBytes)
++            {
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, data[offset++]);
++                step();
++            }
++            break;
++        case GS_PSM_T4:
++        case GS_PSM_T4HL:
++        case GS_PSM_T4HH:
++            while (cp < total && offset < sizeBytes)
++            {
++                const uint8_t packed = data[offset++];
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, packed & 0x0Fu);
++                step();
++                if (cp < total)
++                {
++                    wr(m_vram, dbp, dbw, dsax + col, dsay + row, (packed >> 4u) & 0x0Fu);
++                    step();
++                }
++            }
++            break;
++        default:
++            return;
++        }
++        if (cp >= total)
++        {
++            m_transferState.copiedPixels = total;
++            m_transferState.direction = 3u;
++            m_transferState.totalPixels = 0u;
++        }
++        else if (cp != m_transferState.copiedPixels)
++        {
++            m_transferState.copiedPixels = cp;
++            m_transferState.x = dsax + col;
++            m_transferState.y = dsay + row;
++        }
++        return;
++    }
++
+     auto advancePixel = [&](uint32_t count)
+     {
+         const uint32_t totalPixels = m_transferState.totalPixels;
+@@ -2030,6 +2154,12 @@
+     return snapshotBackend.PresentFromLocalMemory(request);
+ }
+ 
++PresentationFrame GSCpuBackend::PresentInPlace(const GSPresentationRequest &request)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    return PresentFromLocalMemory(request);
++}
++
+ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
+ {
+     PresentationFrame result{};
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -38,6 +38,9 @@
+     void DecodeTextureRgba(const GSDrawState &state, uint32_t width, uint32_t height, uint32_t *out);
+     // Hash of the currently loaded CLUT buffer.
+     uint64_t ClutHash() const;
++    // GPU backend (PS2X_GS_PRESENT_LAZY): Present straight from the live VRAM (caller is the only
++    // VRAM user at that moment) instead of snapshotting all 4 MiB first.
++    PresentationFrame PresentInPlace(const GSPresentationRequest &request);
+ 
+ private:
+     void ResetUnlocked();
+@@ -54,6 +57,7 @@
+     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+ 
++    void UploadImageImpl(const uint8_t *data, uint32_t sizeBytes, bool fast);
+     void PerformLocalToLocalTransfer();
+     void PerformLocalToHostTransfer();
+     PresentationFrame PresentFromLocalMemory(const GSPresentationRequest &request);

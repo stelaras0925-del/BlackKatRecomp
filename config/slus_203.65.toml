@@ -1,0 +1,71 @@
+# PS2Recomp configuration for Pirates: The Legend of Black Kat
+# NTSC-U SLUS-20365 v1.00, ELF basename SLUS_203.65.
+#
+# Run this from the repository root so the relative paths resolve:
+#   ./build/linux-release/bin/ps2_recomp config/slus_203.65.toml
+# or:
+#   cmake --build --preset linux-release --target recompile
+#
+# Field names match ConfigManager::loadConfig in the pinned PS2Recomp
+# (general.input, ghidra_output, output, single_file_output, low_memory_mode,
+# output_worker_threads, patch_syscalls, patch_cop0, patch_cache, stubs, skip,
+# entry_points, and the legacy alias untracked_stubs). [patches].instructions
+# is the instruction-patch list. A missing ghidra_output file is a warning,
+# not a hard error.
+#
+# Preferred source of stubs and boundaries: Ghidra 12 + the Emotion Engine
+# processor, then
+#   third_party/PS2Recomp/ps2xRecomp/tools/ghidra/ExportPS2Functions.java
+# The script asks for a TOML path and a CSV path. It writes `stubs`,
+# `untracked_stubs`, and `skip`, and it points `output` at a sibling `output/`
+# directory. After an export, either:
+#   * re-run from that exported TOML after setting `output` to "build/generated"
+#     and `single_file_output` to true, or
+#   * copy its stubs / untracked_stubs / skip arrays into this file and set
+#     `ghidra_output` to the CSV you saved (config/ghidra/SLUS_203.65.csv).
+# Keep `input` pointed at the ELF you extracted. Do not commit the CSV or the
+# generated C++.
+
+[general]
+input = "game/SLUS_203.65"
+ghidra_output = "config/ghidra/SLUS_203.65.csv"
+output = "build/generated"
+
+# One translation unit is easier to pull into the blackkat target. The Ghidra
+# script writes false; CMake globs build/generated/*.cpp either way.
+single_file_output = true
+low_memory_mode = false
+output_worker_threads = 0
+
+# Instruction-driven syscalls. Leave false unless a specific SYSCALL needs a patch.
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true
+
+# Runtime handlers. Stripped retail builds bind by function start:
+#   "sceCdRead@0x00123456"
+# Generic triage handlers, also by start address: ret0, ret1, reta0.
+stubs = [
+  # "sceCdRead@0x00000000",
+  # "SifLoadModule@0x00000000",
+  # "ret0@0x00000000",
+]
+
+# Guest entry points with no runtime handler (current key).
+entry_points = [
+  # "boot@0x002A7B70",
+]
+
+# Legacy name written by ExportPS2Functions.java. Parsed as extra entry points.
+untracked_stubs = [
+]
+
+# Functions that are not recompiled. Left empty on purpose; the analyzer no
+# longer fills this in, and skipping boot code hides the first real faults.
+skip = [
+]
+
+[patches]
+instructions = [
+  # { address = "0x00000000", value = "0x00000000" },
+]

@@ -1,0 +1,637 @@
+# PS2Recomp patch: VU1 exact-zero FMAC fast path + inline hot lower ops, IOP per-instruction/per-slice fast paths.
+# Applies on top of ps2recomp-vu1-loop-iop.patch.
+# Revert switches: PS2X_VU1_FASTZERO=0, PS2X_VU1_FASTLOWER=0, PS2X_IOP_FASTPATH=0 (+ PS2X_IOP_FASTSCHED=0 for the dead-thread flag).
+# Experimental, off by default: PS2X_IOP_QUANTUM=N. Diagnostics: PS2X_VU1_OPSTATS=1, PS2X_IOP_PCSTATS=1.
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..cacf614 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -24,6 +24,54 @@
+ #include <span>
+ #include <sstream>
+ #include <utility>
++#include <cstdlib>
++#include <vector>
++#include <cstdio>
++
++namespace
++{
++    // PS2X_IOP_FASTPATH=0 disables the IOP per-instruction fast checks (import pre-check,
++    // DMA-start flag check, DMA-interrupt due-cycle guard).
++    bool iopFastPath()
++    {
++        static const bool on = []() {
++            const char *e = std::getenv("PS2X_IOP_FASTPATH");
++            return !(e && e[0] == '0');
++        }();
++        return on;
++    }
++    // PS2X_IOP_PCSTATS=1 (diagnostic): hottest IOP PCs and slice lengths.
++    bool iopPcStats()
++    {
++        static const bool on = []() {
++            const char *e = std::getenv("PS2X_IOP_PCSTATS");
++            return e && e[0] == '1';
++        }();
++        return on;
++    }
++    std::vector<uint32_t> g_iopPcHist;
++    uint64_t g_iopSlices = 0, g_iopSliceInstr = 0, g_iopIdleSkips = 0, g_iopStatInstr = 0;
++    void iopPcStatNote(uint32_t pc)
++    {
++        if (g_iopPcHist.empty())
++            g_iopPcHist.assign(1u << 19, 0u);
++        ++g_iopPcHist[(pc & 0x1FFFFFu) >> 2];
++        if ((++g_iopStatInstr & ((1ull << 25) - 1u)) != 0u)
++            return;
++        std::vector<std::pair<uint32_t, uint32_t>> v;
++        for (uint32_t i = 0; i < g_iopPcHist.size(); ++i)
++            if (g_iopPcHist[i])
++                v.push_back({g_iopPcHist[i], i << 2});
++        std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first > b.first; });
++        std::fprintf(stderr, "[iop:pc] instr=%llu slices=%llu avgSlice=%.1f idle=%llu top:",
++                     (unsigned long long)g_iopStatInstr, (unsigned long long)g_iopSlices,
++                     g_iopSlices ? double(g_iopSliceInstr) / double(g_iopSlices) : 0.0,
++                     (unsigned long long)g_iopIdleSkips);
++        for (size_t i = 0; i < v.size() && i < 24u; ++i)
++            std::fprintf(stderr, " %05x=%.2f%%", v[i].second, 100.0 * v[i].first / double(g_iopStatInstr));
++        std::fprintf(stderr, "\n");
++    }
++}
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -125,12 +173,14 @@ namespace ps2x::iop::detail
+             timrman.reset();
+             ioman.reset();
+             pendingDmaInterrupts.clear();
++            dmaMinDue = UINT64_MAX;
+             pendingGuestCallbacks.clear();
+             nextModuleId = 1;
+             moduleCursor = kModuleLoadBase;
+             totalCycles = 0;
+             totalInstructions = 0;
+             eeCycleCarry = 0;
++            iopCyclePending = 0;
+             activeCpu = nullptr;
+             lastError.clear();
+             servicingDmaInterrupts = false;
+@@ -176,8 +226,13 @@ namespace ps2x::iop::detail
+ 
+         void schedulePendingDma()
+         {
++            if (iopFastPath() && !memory.hasDmaStart())
++                return;
+             if (const auto dma = memory.takeDmaStart())
++            {
+                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
++                dmaMinDue = std::min(dmaMinDue, totalCycles + dma->delayCycles);
++            }
+         }
+ 
+         bool readRam(uint32_t address, void *destination, size_t size) const
+@@ -378,7 +433,10 @@ namespace ps2x::iop::detail
+             if (checkInterrupt(cpu))
+                 return true;
+ 
+-            if (const auto import = imports.decode(cpu.pc))
++            // decode() returns nothing unless the word at pc is `jr ra`; check that inline first.
++            if (const auto import = (iopFastPath() && memory.fetch32(cpu.pc) != 0x03E00008u)
++                                        ? decltype(imports.decode(cpu.pc)){}
++                                        : imports.decode(cpu.pc))
+             {
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+                 ++totalInstructions;
+@@ -390,8 +448,11 @@ namespace ps2x::iop::detail
+                 return !cpu.stopped;
+             }
+ 
++            if (iopPcStats())
++                iopPcStatNote(cpu.pc);
+             const bool running = cpuCore.executeInstruction(cpu);
+-            schedulePendingDma();
++            if (!iopFastPath() || memory.hasDmaStart())
++                schedulePendingDma();
+             ++totalInstructions;
+             ++totalCycles;
+             return running;
+@@ -406,7 +467,8 @@ namespace ps2x::iop::detail
+             {
+                 if (!step(cpu))
+                     break;
+-                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
++                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty() &&
++                    (!iopFastPath() || totalCycles >= dmaMinDue))
+                     servicePendingDmaInterrupts();
+                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                     servicePendingGuestCallbacks();
+@@ -485,20 +547,26 @@ namespace ps2x::iop::detail
+         {
+             if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
+                 return;
++            // dmaMinDue is <= every pending completion cycle (it can only be stale-low).
++            if (iopFastPath() && totalCycles < dmaMinDue)
++                return;
+ 
+             servicingDmaInterrupts = true;
+ 
+             std::vector<int> completed;
++            uint64_t newMin = UINT64_MAX;
+             for (auto it = pendingDmaInterrupts.begin(); it != pendingDmaInterrupts.end();)
+             {
+                 if (it->second > totalCycles)
+                 {
++                    newMin = std::min(newMin, it->second);
+                     ++it;
+                     continue;
+                 }
+                 completed.push_back(it->first);
+                 it = pendingDmaInterrupts.erase(it);
+             }
++            dmaMinDue = newMin;
+             try
+             {
+                 for (const int irq : completed)
+@@ -572,11 +640,18 @@ namespace ps2x::iop::detail
+                         if (!pendingGuestCallbacks.empty())
+                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                         nextWake = timrman.nextEventCycle(nextWake);
++                        if (iopPcStats())
++                            ++g_iopIdleSkips;
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+                     }
+                     const uint64_t before = totalCycles;
++                    if (iopPcStats())
++                        ++g_iopSlices;
++                    const uint64_t beforeInstr = totalInstructions;
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
++                    if (iopPcStats())
++                        g_iopSliceInstr += totalInstructions - beforeInstr;
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+                     if (totalCycles == before)
+                         ++totalCycles;
+@@ -702,9 +777,11 @@ namespace ps2x::iop::detail
+         uint64_t totalCycles = 0;
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
++        uint64_t iopCyclePending = 0; // PS2X_IOP_QUANTUM batching (off by default)
+         CpuState *activeCpu = nullptr;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
++        uint64_t dmaMinDue = UINT64_MAX;
+         bool servicingGuestCallbacks = false;
+         uint32_t callDepth = 0u;
+         GuestCallback secrMcCommandHandler;
+@@ -744,6 +821,24 @@ namespace ps2x::iop::detail
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+         const uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;
++        // PS2X_IOP_QUANTUM=N (N>1, experimental, default off): run the IOP only once N IOP cycles
++        // are owed instead of on every EE dispatch (the EE accounts 8 cycles = 1 IOP cycle per
++        // dispatch). Changes the EE/IOP interleaving granularity, not the IOP's own order.
++        static const uint64_t s_quantum = []() -> uint64_t {
++            const char *e = std::getenv("PS2X_IOP_QUANTUM");
++            const long v = e ? std::strtol(e, nullptr, 10) : 1;
++            return v > 1 ? static_cast<uint64_t>(v) : 1u;
++        }();
++        if (s_quantum > 1u)
++        {
++            m_impl->iopCyclePending += iopCycles;
++            if (m_impl->iopCyclePending < s_quantum)
++                return;
++            const uint64_t run = m_impl->iopCyclePending;
++            m_impl->iopCyclePending = 0;
++            m_impl->runCycles(run);
++            return;
++        }
+         if (iopCycles)
+             m_impl->runCycles(iopCycles);
+     }
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..0df41fe 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <optional>
+ #include <span>
+ #include <string>
+@@ -68,6 +69,19 @@ namespace ps2x::iop::detail
+         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
+ 
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
++        [[nodiscard]] bool hasDmaStart() const noexcept { return m_dmaStart.has_value(); }
++        // Same result as read32 for every address; aligned RAM reads are inlined.
++        [[nodiscard]] uint32_t fetch32(uint32_t address) const
++        {
++            const uint32_t phys = address & 0x1FFFFFFFu;
++            if ((phys & 3u) == 0u && phys + 3u < RamSize)
++            {
++                uint32_t value;
++                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
++                return value;
++            }
++            return read32(address);
++        }
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+ 
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.cpp b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+index e09642e..33f3b41 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.cpp
++++ b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+@@ -55,7 +55,7 @@ namespace ps2x::iop::detail
+     bool IopCpuCore::executeInstruction(IopCpuState &cpu)
+     {
+         const uint32_t pc = cpu.pc;
+-        const uint32_t instruction = m_memory.read32(pc);
++        const uint32_t instruction = m_memory.fetch32(pc);
+         const bool wasDelaySlot = cpu.branchPending;
+         const uint32_t priorBranchTarget = cpu.branchTarget;
+ 
+@@ -370,7 +370,7 @@ namespace ps2x::iop::detail
+                 raiseException(cpu, 4u, pc, wasDelaySlot, address);
+                 break;
+             }
+-            load(rt, m_memory.read32(address));
++            load(rt, m_memory.fetch32(address));
+             break;
+         }
+         case 0x26:
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 0491cc9..694ea05 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -105,6 +105,7 @@ namespace ps2x::iop::detail
+         // scans walk a flat array instead of the red-black tree. Same order, same decisions.
+         std::vector<IopThread *> m_threadList;
+         bool m_threadListDirty = true;
++        bool m_deadPending = true;
+         const std::vector<IopThread *> &threadList();
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 3a35c21..b9c17be 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -117,6 +117,8 @@ namespace ps2x::iop::detail
+             if (m_currentThread != nullptr)
+             {
+                 m_currentThread->state = ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant;
++                if (ordinal == 9)
++                    m_deadPending = true;
+                 cpu.stopped = true;
+                 cpu.yielded = true;
+             }
+@@ -772,18 +774,9 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::cleanupDeadThreads()
+     {
+-        if (iopFastSched())
+-        {
+-            bool anyDead = false;
+-            for (const IopThread *thread : threadList())
+-                if (thread->state == IopThreadState::Dead)
+-                {
+-                    anyDead = true;
+-                    break;
+-                }
+-            if (!anyDead)
+-                return;
+-        }
++        // Dead is only set by ExitDeleteThread and terminateThreadsInRange, which raise m_deadPending.
++        if (iopFastSched() && !m_deadPending)
++            return;
+         for (auto thread = m_threads.begin(); thread != m_threads.end();)
+         {
+             if (thread->second.state != IopThreadState::Dead)
+@@ -796,6 +789,7 @@ namespace ps2x::iop::detail
+             thread = m_threads.erase(thread);
+             m_threadListDirty = true;
+         }
++        m_deadPending = false;
+     }
+ 
+     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
+@@ -804,7 +798,10 @@ namespace ps2x::iop::detail
+         {
+             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
+             if (pc >= base && pc < base + size)
++            {
+                 thread.state = IopThreadState::Dead;
++                m_deadPending = true;
++            }
+         }
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index c56e6ba..763641f 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -86,6 +86,48 @@ namespace
+         static Vu1Prof *p = new Vu1Prof();
+         return *p;
+     }
++    // PS2X_VU1_OPSTATS=1 (diagnostic): counts generic-upper / fast-upper / lower ops by opcode.
++    std::atomic<uint64_t> g_opStat[3][512];
++    std::atomic<uint64_t> g_opStatN{0};
++    inline uint32_t vu1OpKey(int kind, uint32_t instr)
++    {
++        if (kind < 2)
++        {
++            const uint32_t op = instr & 0x3Fu;
++            return op >= 0x3Cu ? 0x100u | (instr & 3u) | ((instr >> 4) & 0x7Cu) : op;
++        }
++        const uint32_t hi = (instr >> 25) & 0x7Fu;
++        if (hi != 0x40u)
++            return hi;
++        const uint32_t op = instr & 0x3Fu;
++        return op >= 0x3Cu ? 0x100u | (instr & 3u) | ((instr >> 4) & 0x7Cu) : 0x80u | op;
++    }
++    inline void vu1OpStatNote(int kind, uint32_t instr)
++    {
++        g_opStat[kind][vu1OpKey(kind, instr)].fetch_add(1, std::memory_order_relaxed);
++        if (kind == 2 && (g_opStatN.fetch_add(1, std::memory_order_relaxed) & ((1u << 25) - 1u)) == 0u)
++        {
++            static const char *names[3] = {"upper-generic", "upper-fast", "lower"};
++            for (int k = 0; k < 3; ++k)
++            {
++                std::vector<std::pair<uint64_t, uint32_t>> v;
++                uint64_t tot = 0;
++                for (uint32_t i = 0; i < 512u; ++i)
++                {
++                    const uint64_t c = g_opStat[k][i].load(std::memory_order_relaxed);
++                    tot += c;
++                    if (c)
++                        v.push_back({c, i});
++                }
++                std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first > b.first; });
++                std::fprintf(stderr, "[vu1:ops] %s total=%llu:", names[k], (unsigned long long)tot);
++                for (size_t i = 0; i < v.size() && i < 16u; ++i)
++                    std::fprintf(stderr, " %03x=%.1f%%", v[i].second, tot ? 100.0 * v[i].first / tot : 0.0);
++                std::fprintf(stderr, "\n");
++            }
++        }
++    }
++
+     inline void vu1ProfNotePair(uint32_t pc, uint32_t lower, uint32_t upper)
+     {
+         Vu1Prof &p = vu1Prof();
+@@ -230,6 +272,18 @@ namespace
+     }
+     // PS2X_VU1_LOOP=0: no precomputed per-pair stall lists, no MAX/MINI/FTOI/ITOF/ABS/CLIP/NOP
+     // upper fast handlers (vu1-loop-iop patch); the rest of the block cache stays.
++    // PS2X_VU1_FASTZERO=0: FMAC lanes with an exactly-zero product/sum go through the generic path again.
++    bool vu1FastZeroOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_FASTZERO"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // PS2X_VU1_FASTLOWER=0: no inline handlers for the common lower ops (always execLower).
++    bool vu1FastLowerOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_FASTLOWER"); return !(e && e[0] == '0'); }();
++        return on;
++    }
+     bool vu1LoopOn()
+     {
+         static const bool on = []() { const char *e = std::getenv("PS2X_VU1_LOOP"); return !(e && e[0] == '0'); }();
+@@ -2455,6 +2509,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     // runs the generic code. No state is touched before that decision.
+     const bool fastUpperOn = tl_runXlat != nullptr && !vu1ExactFlagsOnly() && !vu1FlagCheck();
+     const bool loopOn = tl_runXlat != nullptr && vu1LoopOn();
++    const bool zeroOn = tl_runXlat != nullptr && vu1FastZeroOn();
++    const bool fastLowerOn = tl_runXlat != nullptr && vu1FastLowerOn();
+     const auto fastUpper = [&](uint32_t instr) -> bool {
+         const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
+         const bool toAcc = op >= 0x3Cu;
+@@ -2622,6 +2678,37 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             if ((dest & laneForComponent(c)) == 0u)
+                 continue;
+             const float sv = vuNormOperand(m_state.vf[fs][c]);
++            if (zeroOn)
++            {
++                // Exactly-zero results (the long-double path gives the same signed zero, flags Z|S):
++                // MUL with a zero operand, ADD of opposites, SUB of equals.
++                if ((kind == 2 && (sv == 0.0f || t[c] == 0.0f)) || (kind == 0 && sv == -t[c]) ||
++                    (kind == 1 && sv == t[c]))
++                {
++                    const float r0 = kind == 0 ? sv + t[c] : kind == 1 ? sv - t[c] : sv * t[c];
++                    uint32_t b0;
++                    std::memcpy(&b0, &r0, 4);
++                    laneFlags[c] = static_cast<uint8_t>(0x1u | ((b0 & 0x80000000u) ? 0x2u : 0x0u));
++                    res[c] = r0;
++                    continue;
++                }
++                // MADD/MSUB with a zero product: the product is an exact signed zero (sticky Z|S),
++                // and acc +- 0 is acc (normalised, so in range) or a signed zero.
++                if ((kind == 3 || kind == 4) && (sv == 0.0f || t[c] == 0.0f))
++                {
++                    const float a = vuNormOperand(m_state.acc[c]);
++                    const float prod = sv * t[c];
++                    const float r0 = kind == 3 ? a + prod : a - prod;
++                    uint32_t pb, rb;
++                    std::memcpy(&pb, &prod, 4);
++                    std::memcpy(&rb, &r0, 4);
++                    sticky |= 0x1u | ((pb & 0x80000000u) ? 0x2u : 0x0u);
++                    laneFlags[c] = static_cast<uint8_t>(((rb & 0x7FFFFFFFu) == 0u ? 0x1u : 0x0u) |
++                                                        ((rb & 0x80000000u) ? 0x2u : 0x0u));
++                    res[c] = r0;
++                    continue;
++                }
++            }
+             float r;
+             if (kind == 0)
+                 r = sv + t[c];
+@@ -2669,9 +2756,163 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 dst[c] = res[c];
+         return true;
+     };
++    static const bool s_opStats = []() { const char *e = std::getenv("PS2X_VU1_OPSTATS"); return e && e[0] == '1'; }();
+     const auto doUpper = [&](uint32_t instr) {
+         if (!fastUpperOn || !fastUpper(instr))
++        {
++            if (s_opStats)
++                vu1OpStatNote(0, instr);
+             execUpper(instr);
++        }
++        else if (s_opStats)
++            vu1OpStatNote(1, instr);
++    };
++    // Inline copies of the hottest execLower cases (same code as ps2_vu1_lower.cpp); anything
++    // else returns false and runs execLower.
++    const auto fastLower = [&](uint32_t instr) -> bool {
++        if (instr == 0x00000000u || instr == 0x8000033Cu)
++            return true;
++        switch ((instr >> 25) & 0x7Fu)
++        {
++        case 0x00: // LQ
++        {
++            const uint8_t it = FT(instr);
++            const uint8_t is = VIS(instr);
++            const uint8_t dest = (instr >> 21) & 0xF;
++            const int16_t imm = IMM11(instr);
++            uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[is] + imm)) * 16u;
++            addr &= (dataSize - 1);
++            if (addr + 16 <= dataSize)
++            {
++                float tmp[4];
++                std::memcpy(tmp, vuData + addr, 16);
++                applyDest(m_state.vf[it], tmp, dest);
++            }
++            return true;
++        }
++        case 0x01: // SQ
++        {
++            const uint8_t is = FS(instr);
++            const uint8_t it = VIT(instr);
++            const uint8_t dest = (instr >> 21) & 0xF;
++            const int16_t imm = IMM11(instr);
++            uint32_t addr = ((uint32_t)(int32_t)(m_state.vi[it] + imm)) * 16u;
++            addr &= (dataSize - 1);
++            if (addr + 16 <= dataSize)
++            {
++                uint32_t words[4]{};
++                std::memcpy(words, m_state.vf[is], sizeof(words));
++                queueStore(addr, words, dest);
++            }
++            return true;
++        }
++        case 0x08: // IADDIU
++        case 0x09: // ISUBIU
++        {
++            const uint8_t it = VIT(instr);
++            const uint8_t is = VIS(instr);
++            const int16_t imm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800);
++            if (it != 0)
++                m_state.vi[it] = ((instr >> 25) & 0x7Fu) == 0x08u ? (int16_t)(m_state.vi[is] + imm)
++                                                                   : (int16_t)(m_state.vi[is] - imm);
++            return true;
++        }
++        case 0x28: // IBEQ
++        case 0x29: // IBNE
++        {
++            const uint8_t it = VIT(instr);
++            const uint8_t is = VIS(instr);
++            const int16_t imm = IMM11(instr);
++            const bool eq = (int16_t)readBranchVi(is) == (int16_t)readBranchVi(it);
++            if (eq == (((instr >> 25) & 0x7Fu) == 0x28u))
++            {
++                const uint32_t target = (m_state.pc + 8 + imm * 8) & microAddressMask();
++                m_state.branchPending = true;
++                m_state.branchTarget = target;
++                m_state.branchDelay = 1;
++            }
++            return true;
++        }
++        case 0x40:
++        {
++            const uint8_t funct = instr & 0x3Fu;
++            const uint8_t viT = VIT(instr);
++            const uint8_t viS = VIS(instr);
++            const uint8_t viD = VID(instr);
++            switch (funct)
++            {
++            case 0x30: // IADD
++                if (viD != 0)
++                    m_state.vi[viD] = (int16_t)(m_state.vi[viS] + m_state.vi[viT]);
++                return true;
++            case 0x32: // IADDI
++            {
++                const int16_t imm5 = (int16_t)((int32_t)((instr >> 6) & 0x1F) << 27 >> 27);
++                if (viT != 0)
++                    m_state.vi[viT] = (int16_t)(m_state.vi[viS] + imm5);
++                return true;
++            }
++            case 0x34: // IAND
++                if (viD != 0)
++                    m_state.vi[viD] = m_state.vi[viS] & m_state.vi[viT];
++                return true;
++            case 0x35: // IOR
++                if (viD != 0)
++                    m_state.vi[viD] = m_state.vi[viS] | m_state.vi[viT];
++                return true;
++            case 0x3C:
++            case 0x3D:
++            case 0x3E:
++            case 0x3F:
++            {
++                const uint8_t funct2 = (uint8_t)((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
++                const uint8_t vfT = FT(instr);
++                const uint8_t vfS = FS(instr);
++                const uint8_t dest = (instr >> 21) & 0xF;
++                if (funct2 == 0x30u) // MOVE
++                {
++                    float tmp[4];
++                    std::memcpy(tmp, m_state.vf[vfS], 16);
++                    applyDest(m_state.vf[vfT], tmp, dest);
++                    return true;
++                }
++                if (funct2 == 0x34u) // LQI
++                {
++                    uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
++                    addr &= (dataSize - 1);
++                    if (addr + 16 <= dataSize)
++                    {
++                        float tmp[4];
++                        std::memcpy(tmp, vuData + addr, 16);
++                        applyDest(m_state.vf[vfT], tmp, dest);
++                    }
++                    if (viS != 0)
++                        m_state.vi[viS] = (int16_t)(m_state.vi[viS] + 1);
++                    return true;
++                }
++                if (funct2 == 0x35u) // SQI
++                {
++                    uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
++                    addr &= (dataSize - 1);
++                    if (addr + 16 <= dataSize)
++                    {
++                        uint32_t words[4]{};
++                        std::memcpy(words, m_state.vf[vfS], sizeof(words));
++                        queueStore(addr, words, dest);
++                    }
++                    if (viT != 0)
++                        m_state.vi[viT] = (int16_t)(m_state.vi[viT] + 1);
++                    return true;
++                }
++                return false;
++            }
++            default:
++                return false;
++            }
++        }
++        default:
++            return false;
++        }
+     };
+     // The decoded-pair cache cannot change during a run (VU1 code is only written by VIF MPG
+     // between runs), so whether it is current is checked once.
+@@ -2835,7 +3076,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+                         oldVf,
+                         sizeof(oldVf));
+-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++            if (s_opStats)
++                vu1OpStatNote(2, decoded.lower);
++            if (!fastLowerOn || !fastLower(decoded.lower))
++                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+             std::memcpy(m_state.vf[decoded.upperVfShadowReg],
+                         upperVf,
+                         sizeof(upperVf));
+@@ -2843,7 +3087,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         else
+         {
+             doUpper(decoded.upper);
+-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++            if (s_opStats)
++                vu1OpStatNote(2, decoded.lower);
++            if (!fastLowerOn || !fastLower(decoded.lower))
++                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+         }
+ 
+         m_viBranchBackupValid = false;

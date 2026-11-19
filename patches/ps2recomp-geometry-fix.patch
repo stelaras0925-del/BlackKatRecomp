@@ -1,0 +1,430 @@
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++#include <cstdio>
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -1354,7 +1356,14 @@
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // Was a hard 4096-tag cap: big VIF1 display lists (terrain/sea, ~1.7 MB,
++                    // thousands of REF tags) were silently cut, dropping the rest of the
++                    // frame and leaving a dangling UNPACK. PS2X_DMA_MAXTAGS=N overrides.
++                    static const int kMaxChainTags = []() {
++                        const char *e = std::getenv("PS2X_DMA_MAXTAGS");
++                        const int v = e ? std::atoi(e) : 0;
++                        return v > 0 ? v : (1 << 20);
++                    }();
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1531,6 +1540,13 @@
+                             break;
+                     }
+ 
++                    if (tagsProcessed >= kMaxChainTags)
++                    {
++                        static uint32_t s_capLogged = 0;
++                        if (s_capLogged++ < 10)
++                            std::fprintf(stderr, "[dma] chain on %08x hit tag cap %d (%zu bytes gathered), rest dropped\n",
++                                         channelBase, kMaxChainTags, chainBuf.size());
++                    }
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,6 +1,10 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <cstring>
++#include <cstdlib>
++#include <cstdio>
++#include <atomic>
++#include <array>
+ 
+ enum VIFCmd : uint8_t
+ {
+@@ -30,6 +34,50 @@
+ {
+     constexpr uint8_t kGifFmtImage = 2u;
+ 
++    // PS2X_VIF_UNPACK_LEGACY=1: old unpack semantics (V2/V3 upper lanes kept,
++    // V4-5 unscaled, MODE 3 ignored). Default: PCSX2/hardware semantics.
++    bool vifUnpackLegacy()
++    {
++        static const bool v = []() {
++            const char *e = std::getenv("PS2X_VIF_UNPACK_LEGACY");
++            return e && e[0] == '1';
++        }();
++        return v;
++    }
++
++    // PS2X_VIF_STATS=1: histogram of VIF1 UNPACK formats (cmd&0x1F, mode, usn)
++    // and dropped (truncated) unpacks, printed every 200k unpacks.
++    bool vifStatsEnabled()
++    {
++        static const bool v = []() {
++            const char *e = std::getenv("PS2X_VIF_STATS");
++            return e && e[0] == '1';
++        }();
++        return v;
++    }
++    std::array<std::atomic<uint64_t>, 32 * 4 * 2> s_vifUnpackHist{};
++    std::atomic<uint64_t> s_vifUnpackTotal{0};
++    std::atomic<uint64_t> s_vifUnpackDropped{0};
++    void vifStatsNote(uint32_t fmt, uint32_t mode, bool usn, bool dropped)
++    {
++        s_vifUnpackHist[(fmt & 31u) * 8u + (mode & 3u) * 2u + (usn ? 1u : 0u)].fetch_add(1, std::memory_order_relaxed);
++        if (dropped)
++            s_vifUnpackDropped.fetch_add(1, std::memory_order_relaxed);
++        const uint64_t n = s_vifUnpackTotal.fetch_add(1, std::memory_order_relaxed) + 1;
++        if ((n % 200000u) != 0u)
++            return;
++        std::fprintf(stderr, "[vif:stats] unpacks=%llu dropped=%llu\n",
++                     (unsigned long long)n, (unsigned long long)s_vifUnpackDropped.load());
++        for (uint32_t i = 0; i < s_vifUnpackHist.size(); ++i)
++        {
++            const uint64_t c = s_vifUnpackHist[i].load(std::memory_order_relaxed);
++            if (c)
++                std::fprintf(stderr, "[vif:stats]   fmt=%02x(vn=%u vl=%u msk=%u) mode=%u usn=%u count=%llu\n",
++                             i / 8u, (i / 8u >> 2) & 3u, (i / 8u) & 3u, (i / 8u >> 4) & 1u, (i / 2u) & 3u, i & 1u,
++                             (unsigned long long)c);
++        }
++    }
++
+     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
+     {
+         if (!data || sizeBytes < 16u)
+@@ -571,6 +619,17 @@
+                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
+ 
+             const bool zeroExtend = (imm & 0x4000u) != 0u;
++            const bool legacyUnpack = vifUnpackLegacy();
++
++            if (vifStatsEnabled())
++            {
++                const bool dropped = !(totalBytes > 0 && pos + totalBytes <= sizeBytes);
++                vifStatsNote(opcode & 0x1Fu, vif1_regs.mode & 3u, zeroExtend, dropped);
++                static uint32_t s_dropLogged = 0;
++                if (dropped && s_dropLogged++ < 40)
++                    std::fprintf(stderr, "[vif:drop] cmd=%08x num=%u cl=%u wl=%u bytes=%u pos=%u size=%u addr=%x tops=%x\n",
++                                 cmd, writeVectorCount, cl, wl, totalBytes, pos, sizeBytes, vuAddr, vif1_regs.tops);
++            }
+ 
+             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+             {
+@@ -697,19 +756,66 @@
+                     }
+                     else if (vl == 3u && vn == 3u)
+                     {
+-                        // V4-5: packed color-like format in a single 16-bit value.
++                        // V4-5: RGBA5551 -> 8 bits per lane (5-bit value << 3,
++                        // alpha bit -> 0x80), as the hardware/PCSX2 do.
+                         uint16_t packed = 0;
+                         std::memcpy(&packed, srcVec, sizeof(packed));
+-                        decompressed[0] = packed & 0x1Fu;
+-                        decompressed[1] = (packed >> 5) & 0x1Fu;
+-                        decompressed[2] = (packed >> 10) & 0x1Fu;
+-                        decompressed[3] = (packed >> 15) & 0x01u;
++                        if (legacyUnpack)
++                        {
++                            decompressed[0] = packed & 0x1Fu;
++                            decompressed[1] = (packed >> 5) & 0x1Fu;
++                            decompressed[2] = (packed >> 10) & 0x1Fu;
++                            decompressed[3] = (packed >> 15) & 0x01u;
++                        }
++                        else
++                        {
++                            decompressed[0] = (packed & 0x001Fu) << 3;
++                            decompressed[1] = (packed & 0x03E0u) >> 2;
++                            decompressed[2] = (packed & 0x7C00u) >> 7;
++                            decompressed[3] = (packed & 0x8000u) >> 8;
++                        }
+                     }
+                     else
+                     {
+                         handledFormat = false;
+                     }
+ 
++                    // V2 writes x,y,x,y; V3 writes the next stream element into W
++                    // (V3 uses the V4 unpacker on hardware). Both then go through
++                    // MODE/MASK like any data lane.
++                    if (handledFormat && decoded && !legacyUnpack && (components == 2 || components == 3))
++                    {
++                        if (components == 2)
++                        {
++                            decompressed[2] = decompressed[0];
++                            decompressed[3] = decompressed[1];
++                        }
++                        else
++                        {
++                            const uint32_t elemBytes = static_cast<uint32_t>(bitsPerComponent / 8);
++                            const uint8_t *wSrc = srcVec + 3u * elemBytes;
++                            if (wSrc + elemBytes <= data + sizeBytes)
++                            {
++                                if (vl == 0u)
++                                {
++                                    uint32_t scalar = 0;
++                                    std::memcpy(&scalar, wSrc, sizeof(scalar));
++                                    decompressed[3] = scalar;
++                                }
++                                else if (vl == 1u)
++                                {
++                                    uint16_t raw = 0;
++                                    std::memcpy(&raw, wSrc, sizeof(raw));
++                                    decompressed[3] = extend16(raw);
++                                }
++                                else if (vl == 2u)
++                                {
++                                    decompressed[3] = extend8(wSrc[0]);
++                                }
++                            }
++                        }
++                    }
++
+                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.
+                     if (!handledFormat && decoded && !maskEnable && (vif1_regs.mode == 0u || vif1_regs.mode == 3u))
+                     {
+@@ -748,6 +854,10 @@
+                                     if (mode == 2u)
+                                         vif1_regs.row[field] = writeVal;
+                                 }
++                                else if (canAdd && mode == 3u && !legacyUnpack)
++                                {
++                                    vif1_regs.row[field] = writeVal; // MODE 3: set ROW = data
++                                }
+                             }
+                         }
+                         else if (maskSpec == 1u)
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1733,8 +1733,18 @@
+ 
+         // Fast mode: results are written straight into the register file, so
+         // only the Q/P (FDIV/EFU) resources and WAITQ/WAITP can stall.
++        // Fast mode still models data-hazard stalls (cheap ready-cycle scan, no
++        // deferred writes) so cycle timing - and therefore when CLIP/MAC/status
++        // flags become visible to FCAND/FMAND/... - matches the hardware. Without
++        // this the sea microprogram read stale clip flags and failed to cull
++        // triangles behind the camera (fan/streak artefacts).
++        // PS2X_VU1_FAST_NOSTALL=1 restores the old stall-free fast mode.
++        static const bool s_fastNoStall = []() {
++            const char *e = std::getenv("PS2X_VU1_FAST_NOSTALL");
++            return e && e[0] == '1';
++        }();
+         auto pairReady = [&]() -> uint64_t {
+-            if (!fastMode)
++            if (!fastMode || !s_fastNoStall)
+                 return calculatePairReadyCycle(decoded);
+             uint64_t r = m_cycle;
+             if ((decoded.lowerUsage.pipeline == PipelineFdiv || decoded.lowerUsage.waitQ) && m_fdiv.valid)
+@@ -1870,6 +1880,10 @@
+ 
+         markPairWrites(decoded);
+         }
++        else if (!s_fastNoStall)
++        {
++            markPairWrites(decoded);
++        }
+         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
+             recordViWriteForBranch(writtenVi, oldVi);
+ 
+@@ -1930,6 +1944,29 @@
+             break;
+     }
+ 
++    {
++        // PS2X_VU1_STATS=1: report programs cut off by the cycle budget
++        // (they are NOT resumed later -> lost geometry) and stop reasons.
++        static const bool s_vu1Stats = []() {
++            const char *e = std::getenv("PS2X_VU1_STATS");
++            return e && e[0] == '1';
++        }();
++        if (s_vu1Stats && m_unit == Unit::VU1)
++        {
++            static uint64_t s_runs = 0, s_budget = 0, s_stop = 0, s_pcEnd = 0;
++            ++s_runs;
++            if (!programEnded)
++            {
++                if (m_stopRequested) ++s_stop;
++                else if (m_cycle >= budgetEnd) { ++s_budget; if (s_budget < 20) std::fprintf(stderr, "[vu1:stats] budget exhausted pc=0x%x\n", m_state.pc); }
++                else ++s_pcEnd;
++            }
++            if ((s_runs % 100000u) == 0u)
++                std::fprintf(stderr, "[vu1:stats] runs=%llu budget=%llu stop=%llu pcEnd=%llu\n",
++                             (unsigned long long)s_runs, (unsigned long long)s_budget,
++                             (unsigned long long)s_stop, (unsigned long long)s_pcEnd);
++        }
++    }
+     if (programEnded)
+     {
+         flushPipelines();
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1990,10 +1990,69 @@
+     recordRegisterDebugEventUnlocked(regAddr, value);
+ }
+ 
++
++namespace
++{
++    // PS2X_GS_DRAWLOG=<sec>[,<dur>]: from <sec> for <dur> (default 0.4) seconds,
++    // log draw runs (consecutive prims sharing frame/zbuf/tex/test/alpha/prim)
++    // in submission order: count, screen bbox, z range, max |coord| outside
++    // the scissor, first vertex rgba.
++    struct GsDrawLog
++    {
++        bool enabled = false;
++        double t0 = 0.0, dur = 0.4;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++        bool open = false;
++        uint64_t key[6] = {};
++        uint32_t count = 0;
++        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
++        double z0 = 1e18, z1 = -1e18;
++        float maxArea = 0.f;
++        uint32_t rgba = 0;
++        int ofx = 0, ofy = 0;
++        uint32_t lines = 0;
++        uint64_t seq = 0;
++        uint32_t adc = 0;
++        std::string desc;
++        GsDrawLog()
++        {
++            const char *e = std::getenv("PS2X_GS_DRAWLOG");
++            if (!e) return;
++            enabled = true;
++            std::sscanf(e, "%lf,%lf", &t0, &dur);
++        }
++        bool active()
++        {
++            if (!enabled || lines > 6000) return false;
++            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++            static const bool s_dumping = std::getenv("PS2X_GS_DUMPRUNS") != nullptr;
++            if (s_dumping ? (el >= t0 && seq >= 110) : (el >= t0 + dur)) { if (open) flush(); enabled = false; return false; }
++            return el >= t0;
++        }
++        void flush()
++        {
++            if (!open) return;
++            std::fprintf(stderr, "[gs:draw] #%llu n=%u adc=%u %s bbox=(%.0f,%.0f)-(%.0f,%.0f) z=%.0f..%.0f maxArea=%.0f rgba0=%08x\n",
++                         (unsigned long long)seq, count, adc, desc.c_str(), x0, y0, x1, y1, z0, z1, maxArea, rgba);
++            ++lines;
++            open = false;
++        }
++    };
++    GsDrawLog g_gsDrawLog;
++}
++
+ void GS::vertexKick(bool drawing)
+ {
+     ++m_vtxCount;
+     ++m_vtxIndex;
++    if (g_gsDrawLog.enabled && !drawing && g_gsDrawLog.active())
++    {
++        static uint32_t s_adcLogged = 0;
++        const GSVertex &v = m_vtxQueue[(m_vtxCount - 1) % kMaxVerts];
++        ++g_gsDrawLog.adc;
++        if (s_adcLogged++ < 0)
++            std::fprintf(stderr, "[gs:adc] prim=%u vtx#%d x=%.1f y=%.1f z=%.0f\n", (unsigned)m_prim.type, m_vtxCount, v.x, v.y, v.z);
++    }
+ 
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);
+@@ -2041,6 +2100,91 @@
+     if (drawing && m_backend)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
++        if (g_gsDrawLog.enabled && g_gsDrawLog.active())
++        {
++            auto &L = g_gsDrawLog;
++            const GSContext &c = batch.state.context;
++            const auto &pr = batch.state.prim;
++            uint64_t k[6] = {
++                (uint64_t)c.frame.fbp | ((uint64_t)c.frame.psm << 16) | ((uint64_t)c.frame.fbmsk << 24),
++                (uint64_t)c.zbuf.zbp | ((uint64_t)c.zbuf.psm << 16) | ((uint64_t)c.zbuf.zmask << 24),
++                (uint64_t)c.tex0.tbp0 | ((uint64_t)c.tex0.psm << 16) | ((uint64_t)c.tex0.cbp << 24) | ((uint64_t)c.tex0.tw << 40) | ((uint64_t)c.tex0.th << 44) | ((uint64_t)c.tex0.tcc << 48) | ((uint64_t)c.tex0.tfx << 49),
++                c.test, c.alpha,
++                (uint64_t)pr.type | ((uint64_t)pr.iip << 3) | ((uint64_t)pr.tme << 4) | ((uint64_t)pr.fge << 5) | ((uint64_t)pr.abe << 6) | ((uint64_t)pr.aa1 << 7) | ((uint64_t)pr.fst << 8) | ((uint64_t)pr.ctxt << 9)};
++            if (!L.open || std::memcmp(k, L.key, sizeof(k)) != 0)
++            {
++                L.flush();
++                std::memcpy(L.key, k, sizeof(k));
++                L.open = true; L.count = 0; L.adc = 0; ++L.seq;
++                L.x0 = L.y0 = 1e9f; L.x1 = L.y1 = -1e9f; L.z0 = 1e18; L.z1 = -1e18; L.maxArea = 0.f;
++                L.ofx = c.xyoffset.ofx >> 4; L.ofy = c.xyoffset.ofy >> 4;
++                const auto &v = batch.vertices[0];
++                L.rgba = ((uint32_t)v.r << 24) | ((uint32_t)v.g << 16) | ((uint32_t)v.b << 8) | v.a;
++                char buf[400];
++                std::snprintf(buf, sizeof(buf), "prim=%u tme=%u abe=%u fst=%u ctxt=%u fb=%x/psm%x/msk%x zb=%x/psm%x/zm%u tex=%x/psm%x/%ux%u/tcc%u/tfx%u/cbp%x test=%llx alpha=%llx sc=(%u,%u)-(%u,%u)",
++                              (unsigned)pr.type, pr.tme, pr.abe, pr.fst, pr.ctxt, c.frame.fbp, c.frame.psm, c.frame.fbmsk, c.zbuf.zbp, c.zbuf.psm, (unsigned)c.zbuf.zmask,
++                              c.tex0.tbp0, c.tex0.psm, 1u << c.tex0.tw, 1u << c.tex0.th, c.tex0.tcc, c.tex0.tfx, c.tex0.cbp,
++                              (unsigned long long)c.test, (unsigned long long)c.alpha, c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1);
++                L.desc = buf;
++                // PS2X_GS_DUMPRUNS="a,b,..": dump fb + zbuf (640x448) before run a, b...
++                static const std::string s_dumpRuns = []() { const char *e = std::getenv("PS2X_GS_DUMPRUNS"); return std::string(e ? e : ""); }();
++                if (!s_dumpRuns.empty() && m_backend)
++                {
++                    const std::string tok = "," + std::to_string(L.seq) + ",";
++                    if (("," + s_dumpRuns + ",").find(tok) != std::string::npos)
++                    {
++                        const uint32_t W = 640, H = 448;
++                        std::vector<uint8_t> rgb(W * H * 3), zz(W * H);
++                        const uint32_t fbBase = c.frame.fbp * 32u, zBase = c.zbuf.zbp * 32u;
++                        const uint32_t bw = c.frame.fbw ? c.frame.fbw : 10u;
++                        const uint32_t zpsm = 0x30u | (c.zbuf.psm & 0xFu);
++                        uint32_t zmax = 1;
++                        std::vector<uint32_t> zraw(W * H);
++                        for (uint32_t y = 0; y < H; ++y)
++                            for (uint32_t x = 0; x < W; ++x)
++                            {
++                                const uint32_t px = m_backend->ReadVram(c.frame.psm, fbBase, bw, x, y);
++                                rgb[(y * W + x) * 3 + 0] = px & 0xFF;
++                                rgb[(y * W + x) * 3 + 1] = (px >> 8) & 0xFF;
++                                rgb[(y * W + x) * 3 + 2] = (px >> 16) & 0xFF;
++                                const uint32_t z = m_backend->ReadVram(zpsm, zBase, bw, x, y);
++                                zraw[y * W + x] = z;
++                                zmax = std::max(zmax, z);
++                            }
++                        for (uint32_t i = 0; i < W * H; ++i)
++                            zz[i] = static_cast<uint8_t>(std::min<uint64_t>(255u, (uint64_t)zraw[i] * 255u / zmax));
++                        char name[256];
++                        std::snprintf(name, sizeof(name), "build/shots/dr_%llu_fb.ppm", (unsigned long long)L.seq);
++                        if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", W, H); std::fwrite(rgb.data(), 1, rgb.size(), f); std::fclose(f); }
++                        std::snprintf(name, sizeof(name), "build/shots/dr_%llu_z.pgm", (unsigned long long)L.seq);
++                        if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P5\n%u %u\n255\n", W, H); std::fwrite(zz.data(), 1, zz.size(), f); std::fclose(f); }
++                        std::fprintf(stderr, "[gs:dump] run#%llu fb=%x z=%x/psm%x zmax=%u\n", (unsigned long long)L.seq, c.frame.fbp, c.zbuf.zbp, zpsm, zmax);
++                    }
++                }
++            }
++            ++L.count;
++            for (int i = 0; i < batch.vertexCount; ++i)
++            {
++                const auto &v = batch.vertices[i];
++                const float sx = v.x - L.ofx, sy = v.y - L.ofy;
++                L.x0 = std::min(L.x0, sx); L.x1 = std::max(L.x1, sx);
++                L.y0 = std::min(L.y0, sy); L.y1 = std::max(L.y1, sy);
++                L.z0 = std::min(L.z0, v.z); L.z1 = std::max(L.z1, v.z);
++            }
++            if (batch.vertexCount == 3)
++            {
++                const auto &a = batch.vertices[0], &b = batch.vertices[1], &d = batch.vertices[2];
++                const float area = std::fabs((b.x - a.x) * (d.y - a.y) - (d.x - a.x) * (b.y - a.y)) * 0.5f;
++                L.maxArea = std::max(L.maxArea, area);
++                static uint32_t s_hugeLogged = 0;
++                if ((a.z > 65535.0 || b.z > 65535.0 || d.z > 65535.0) && s_hugeLogged < 60)
++                {
++                    ++s_hugeLogged;
++                    std::fprintf(stderr, "[gs:huge] run#%llu area=%.0f v0=(%.1f,%.1f,%.0f) v1=(%.1f,%.1f,%.0f) v2=(%.1f,%.1f,%.0f) raw0=(%.1f,%.1f) q=%g,%g,%g\n",
++                                 (unsigned long long)L.seq, area, a.x - L.ofx, a.y - L.ofy, a.z, b.x - L.ofx, b.y - L.ofy, b.z, d.x - L.ofx, d.y - L.ofy, d.z, a.x, a.y, a.q, b.q, d.q);
++                }
++            }
++        }
+         updatePreferredDisplaySourceForDraw(batch);
+         m_backend->Submit(batch);
+         recordDrawDebugEventUnlocked(needed);

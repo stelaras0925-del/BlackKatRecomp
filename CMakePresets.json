@@ -1,0 +1,65 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "linux-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "PS2X_BUILD_STUDIO": "OFF",
+        "PS2X_BUILD_TEST": "OFF",
+        "BKR_ENABLE_LTO": "OFF"
+      },
+      "vendor": {
+        "blackkat": {
+          "description": "Clang + Ninja. -msse4.1 is added by the top-level CMakeLists on x86_64."
+        }
+      }
+    },
+    {
+      "name": "linux-release",
+      "displayName": "Linux Release (Clang + Ninja)",
+      "description": "Optimized host build of the PS2Recomp tools, ps2xRuntime, and the blackkat launcher.",
+      "inherits": "linux-base",
+      "binaryDir": "${sourceDir}/build/linux-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "linux-debug",
+      "displayName": "Linux Debug (Clang + Ninja)",
+      "description": "Debug host build of the PS2Recomp tools, ps2xRuntime, and the blackkat launcher.",
+      "inherits": "linux-base",
+      "binaryDir": "${sourceDir}/build/linux-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release",
+      "jobs": 0
+    },
+    {
+      "name": "linux-debug",
+      "configurePreset": "linux-debug",
+      "jobs": 0
+    }
+  ]
+}

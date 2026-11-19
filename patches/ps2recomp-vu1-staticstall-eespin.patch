@@ -1,0 +1,161 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -272,6 +272,12 @@
+     }
+     // PS2X_VU1_LOOP=0: no precomputed per-pair stall lists, no MAX/MINI/FTOI/ITOF/ABS/CLIP/NOP
+     // upper fast handlers (vu1-loop-iop patch); the rest of the block cache stays.
++    // PS2X_VU1_STATICSTALL=0: always scan every operand's ready cycle (no static no-stall proof).
++    bool vu1StaticStallOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_STATICSTALL"); return !(e && e[0] == '0'); }();
++        return on;
++    }
+     // PS2X_VU1_FASTZERO=0: FMAC lanes with an exactly-zero product/sum go through the generic path again.
+     bool vu1FastZeroOn()
+     {
+@@ -303,6 +309,11 @@
+     {
+         std::vector<Vu1PairStall> stall; // per pair index
+         std::vector<uint8_t> flagDead; // per pair index
++        // PS2X_VU1_STATICSTALL: 1 = this pair's register operands cannot be pending when the
++        // previous `window` pairs ran straight through before it (see below).
++        std::vector<uint8_t> noRegStall; // per pair index
++        uint32_t window = 0;             // max write latency - 1 (pairs of look-back needed)
++        uint32_t noStallPairs = 0;
+         uint32_t writers = 0;
+         uint32_t dead = 0;
+     };
+@@ -2587,6 +2598,56 @@
+                     if (st.nRead >= 24u || st.nWrite >= 16u)
+                         st.nRead = 0xFFu; // overflow guard: use the generic functions for this pair
+                 }
++                // Static no-stall proof. A slot written by pair j with latency L is ready at
++                // issue(j)+L; every pair takes >= 1 cycle, so pair k issues at >= issue(j)+(k-j).
++                // If none of the `window` pairs right before k (window = max L - 1) writes a slot k
++                // reads with L > distance, and those pairs really ran straight before k (checked at
++                // run time: consecutive pcs since the run started / the last jump), no read of k
++                // can be pending and the per-slot ready scan is skipped. Older writes are already
++                // ready. The Q/P/EFU/XGKICK resource checks are kept.
++                {
++                    uint32_t maxLat = 1;
++                    for (uint32_t k = 0; k < n; ++k)
++                        if (x->stall[k].nRead != 0xFFu)
++                            for (uint32_t w = 0; w < x->stall[k].nWrite; ++w)
++                                maxLat = std::max<uint32_t>(maxLat, x->stall[k].writeLat[w]);
++                    x->window = maxLat - 1u;
++                    x->noRegStall.assign(n, 0u);
++                    for (uint32_t k = 0; k < n; ++k)
++                    {
++                        const Vu1PairStall &rk = x->stall[k];
++                        if (rk.nRead == 0xFFu || k < x->window)
++                            continue;
++                        bool safe = true;
++                        for (uint32_t d = 1; d <= x->window && safe; ++d)
++                        {
++                            const Vu1PairStall &wj = x->stall[k - d];
++                            if (wj.nRead == 0xFFu)
++                            {
++                                safe = false;
++                                break;
++                            }
++                            for (uint32_t w = 0; w < wj.nWrite && safe; ++w)
++                            {
++                                if (wj.writeLat[w] <= d)
++                                    continue;
++                                for (uint32_t r = 0; r < rk.nRead; ++r)
++                                    if (rk.read[r] == wj.write[w])
++                                    {
++                                        safe = false;
++                                        break;
++                                    }
++                            }
++                        }
++                        if (safe)
++                        {
++                            x->noRegStall[k] = 1u;
++                            ++x->noStallPairs;
++                        }
++                    }
++                }
++                if (vu1BcStats())
++                    std::fprintf(stderr, "[vu1:bc] static no-stall: %u of %u pairs (window %u)\n", x->noStallPairs, n, x->window);
+                 (*tl_xlCache)[key] = std::move(made);
+                 g_bcTranslations.fetch_add(1, std::memory_order_relaxed);
+                 if (vu1BcStats())
+@@ -3014,6 +3075,8 @@
+     };
+     // The decoded-pair cache cannot change during a run (VU1 code is only written by VIF MPG
+     // between runs), so whether it is current is checked once.
++    const bool staticStallOn = tl_runXlat != nullptr && vu1StaticStallOn() && !tl_runXlat->noRegStall.empty();
++    uint32_t ssLastPc = 0xFFFFFFF0u, ssSeq = 0u;
+     const bool decodedCurrent = tl_runXlat != nullptr && m_decodedCodeCacheValid && m_cachedVuCode == vuCode &&
+                                 m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
+                                 m_cachedCodeGeneration == memory->getVU1CodeGeneration();
+@@ -3047,6 +3110,14 @@
+             if (pairStall->nRead == 0xFFu)
+                 pairStall = nullptr;
+         }
++        // Pairs run back to back right before this one in this run (for the static no-stall proof).
++        if (m_state.pc == ssLastPc + 8u)
++            ++ssSeq;
++        else
++            ssSeq = 0u;
++        ssLastPc = m_state.pc;
++        const bool skipRegScan = staticStallOn && pairStall && ssSeq >= tl_runXlat->window &&
++                                 tl_runXlat->noRegStall[m_state.pc / 8u] != 0u;
+         if (s_vu1Prof)
+             vu1ProfNotePair(m_state.pc, decoded.lower, decoded.upper);
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+@@ -3072,7 +3143,7 @@
+             {
+                 // Same result as calculatePairReadyCycle(decoded), from the precomputed slot list.
+                 uint64_t r = m_cycle;
+-                for (uint32_t k = 0; k < pairStall->nRead; ++k)
++                for (uint32_t k = 0, nr = skipRegScan ? 0u : pairStall->nRead; k < nr; ++k)
+                 {
+                     const uint32_t slot = pairStall->read[k];
+                     const uint64_t v = slot < 128u ? m_vfReady[slot >> 2][slot & 3u]
+--- a/ps2xRuntime/src/lib/ps2_vu1_async.inl
++++ b/ps2xRuntime/src/lib/ps2_vu1_async.inl
+@@ -74,6 +74,7 @@
+             std::atomic<uint64_t> bigJobs{0};
+             std::atomic<uint64_t> jobBytes{0};
+             std::atomic<uint64_t> busyPolls{0};
++            std::atomic<uint64_t> eeSpinNs{0}; // EE time from the first busy CHCR poll until it reads not-busy
+             std::atomic<uint64_t> inlineGif{0};
+             std::mutex reasonMutex;
+             std::unordered_map<std::string, uint64_t> waitReasons;
+@@ -443,11 +444,11 @@
+                 s.waitReasons.clear();
+             }
+             std::fprintf(stderr,
+-                         "[vu1thread:stats] jobs=%llu (big %llu, %.1f MB) worker busy %.0f%% | EE drains=%llu waited=%llu (%.0f ms) busyPolls=%llu inlineGif=%llu |%s\n",
++                         "[vu1thread:stats] jobs=%llu (big %llu, %.1f MB) worker busy %.0f%% | EE drains=%llu waited=%llu (%.0f ms) busyPolls=%llu spin %.0f ms inlineGif=%llu |%s\n",
+                          (unsigned long long)s.jobs.exchange(0), (unsigned long long)s.bigJobs.exchange(0),
+                          s.jobBytes.exchange(0) / 1048576.0, 100.0 * (s.workerBusyNs.exchange(0) / 1e9) / span,
+                          (unsigned long long)s.drains.exchange(0), (unsigned long long)s.drainsWaited.exchange(0),
+-                         s.drainWaitNs.exchange(0) / 1e6, (unsigned long long)s.busyPolls.exchange(0), (unsigned long long)s.inlineGif.exchange(0), reasons.c_str());
++                         s.drainWaitNs.exchange(0) / 1e6, (unsigned long long)s.busyPolls.exchange(0), s.eeSpinNs.exchange(0) / 1e6, (unsigned long long)s.inlineGif.exchange(0), reasons.c_str());
+             if (gsStageOn())
+                 std::fprintf(stderr, "[vu1thread:stats] GS stage busy %.0f%%, worker waited %.0f ms for it, %llu ops in %llu batches\n",
+                              100.0 * (gsStage().busyNs.exchange(0) / 1e9) / span, gsStage().waitNs.exchange(0) / 1e6,
+@@ -793,9 +794,19 @@
+ 
+     bool chcrReadWhileBusy(PS2Memory &mem, uint32_t address, uint32_t &value)
+     {
++        static thread_local uint64_t tl_spinStart = 0;
+         const uint32_t channelBase = address & 0xFFFFFF00u;
+         if (!channelBusy(channelBase))
++        {
++            if (tl_spinStart)
++            {
++                st().eeSpinNs.fetch_add(nowNs() - tl_spinStart, std::memory_order_relaxed);
++                tl_spinStart = 0;
++            }
+             return false;
++        }
++        if (!tl_spinStart)
++            tl_spinStart = nowNs();
+         if (drainOnPoll())
+         {
+             drain(mem, "chcr-poll");

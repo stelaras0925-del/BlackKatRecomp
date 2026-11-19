@@ -1,0 +1,272 @@
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -166,6 +166,8 @@
+             memory.reset();
+             kernel.reset();
+             modules.clear();
++            sndMixPc = 0u;
++            sndCheck.pending = false;
+             imports.reset();
+             rpc.reset();
+             cdvd.reset();
+@@ -413,6 +415,236 @@
+             return ImportDisposition::Missing;
+         }
+ 
++        // ---- SNDDRV.IRX SNDIOP_ee36_iop36 native port (PS2X_IOP_SNDMIX) -------------------
++        // Profiles (PS2X_IOP_PCSTATS) showed ~100% of IOP instructions inside this one
++        // function: the sound driver's 36 kHz -> 48 kHz 3:4 resampler/mixer (2 x 2 blocks of
++        // 192 source samples -> 256 output samples, s16 saturate, accumulator table zeroed).
++        // It is a pure function of IOP RAM, so it is run natively with identical memory
++        // effects. Detected by module name + a 192-word fingerprint of the non-relocated
++        // code (addresses are decoded from the relocated lui/addiu pairs).
++        // PS2X_IOP_SNDMIX=0 disables, =check runs the interpreter and compares every write.
++        static constexpr uint32_t kSndMixOffset = 0x5c54u;
++        uint32_t sndMixPc = 0u; // physical entry, 0 = not found
++        uint32_t sndTblA = 0u, sndTblB = 0u, sndState = 0u, sndStateEnd = 0u, sndPtrHi = 0u;
++        int32_t sndPtrLo = 0;
++        uint64_t sndMixCalls = 0u;
++        struct SndCheck
++        {
++            bool pending = false;
++            CpuState *cpu = nullptr;
++            uint32_t ra = 0u, sp = 0u;
++            std::map<uint32_t, uint8_t> writes;
++            uint64_t checked = 0u, bad = 0u;
++        } sndCheck;
++
++        static int sndMixMode()
++        {
++            static const int mode = []() {
++                const char *e = std::getenv("PS2X_IOP_SNDMIX");
++                if (e && e[0] == '0') return 0;
++                if (e && (e[0] == 'c' || e[0] == 'C')) return 2;
++                return 1;
++            }();
++            return mode;
++        }
++        static uint64_t sndMixCycles()
++        {
++            static const uint64_t c = []() -> uint64_t {
++                const char *e = std::getenv("PS2X_IOP_SNDMIX_CYCLES");
++                const long v = e ? std::strtol(e, nullptr, 10) : 15200; // interpreted instruction count of one call (measured)
++                return v > 0 ? static_cast<uint64_t>(v) : 1u;
++            }();
++            return c;
++        }
++
++        void detectSndMix(const Module &m)
++        {
++            if (sndMixMode() == 0)
++                return;
++            std::string upper = m.name;
++            for (char &c : upper)
++                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++            if (upper.find("SNDDRV") == std::string::npos)
++                return;
++            static const uint32_t kFp[][2] = {{0x000,0x27bdffd8u},{0x004,0xafb00010u},{0x008,0x00808021u},{0x00c,0x00a06821u},{0x010,0x0000c021u},{0x014,0x240e8000u},{0x018,0x240b7fffu},{0x01c,0x0300c821u},{0x020,0xafb40020u},{0x024,0xafb3001cu},{0x028,0xafb20018u},{0x02c,0xafb10014u},{0x038,0x8a910003u},{0x03c,0x9a910000u},{0x040,0x8a920007u},{0x044,0x9a920004u},{0x048,0xabb10003u},{0x04c,0xbbb10000u},{0x050,0xabb20007u},{0x054,0xbbb20004u},{0x060,0x8a910003u},{0x064,0x9a910000u},{0x068,0x8a920007u},{0x06c,0x9a920004u},{0x070,0xabb1000bu},{0x074,0xbbb10008u},{0x078,0xabb2000fu},{0x07c,0xbbb2000cu},{0x088,0x00007821u},{0x08c,0x25aa0006u},{0x090,0x00181880u},{0x094,0x01e31821u},{0x098,0x03a31021u},{0x09c,0x03a31821u},{0x0a0,0x84420008u},{0x0a4,0x95840000u},{0x0a8,0x00021080u},{0x0b0,0x00a22821u},{0x0b8,0x84620000u},{0x0bc,0xa5a40000u},{0x0c0,0x00b92821u},{0x0c4,0x00021040u},{0x0c8,0x02024021u},{0x0cc,0x8ca20000u},{0x0d0,0x85030000u},{0x0d4,0x000211c3u},{0x0d8,0x00623821u},{0x0dc,0x00071040u},{0x0e0,0x85830000u},{0x0e4,0x00471021u},{0x0e8,0x00621821u},{0x0ec,0x00031883u},{0x0f0,0x28628000u},{0x0f4,0x10400003u},{0x0f8,0x0163102au},{0x100,0xa54efffcu},{0x104,0x10400003u},{0x108,0x00000000u},{0x110,0xa54bfffcu},{0x114,0xa543fffcu},{0x118,0x8ca20004u},{0x11c,0xaca00000u},{0x120,0x85030002u},{0x124,0x000211c3u},{0x128,0x00622021u},{0x12c,0x00e41021u},{0x130,0x00021843u},{0x134,0x28628000u},{0x138,0x10400003u},{0x13c,0x0163102au},{0x144,0xa54efffeu},{0x148,0x10400003u},{0x14c,0x00000000u},{0x154,0xa54bfffeu},{0x158,0xa543fffeu},{0x15c,0x00041040u},{0x160,0x00441021u},{0x164,0xaca00004u},{0x168,0x85040004u},{0x16c,0x8ca30008u},{0x170,0x00441021u},{0x174,0x000319c3u},{0x178,0x00431021u},{0x17c,0x00021883u},{0x180,0x28628000u},{0x184,0x10400003u},{0x188,0x0163102au},{0x190,0xa54e0000u},{0x194,0x10400003u},{0x198,0x00000000u},{0x1a0,0xa54b0000u},{0x1a4,0xa5430000u},{0x1a8,0x8ca202fcu},{0x1ac,0x8503017eu},{0x1b0,0x000211c3u},{0x1b4,0x00621821u},{0x1b8,0x28628000u},{0x1bc,0x10400003u},{0x1c0,0x0163102au},{0x1c8,0xa58e0000u},{0x1cc,0x10400003u},{0x1d0,0x00000000u},{0x1d8,0xa58b0000u},{0x1dc,0xa5830000u},{0x1e0,0x25a60008u},{0x1e4,0x25090004u},{0x1e8,0x24a80008u},{0x1ec,0x8d020000u},{0x1f0,0x85230000u},{0x1f4,0x000211c3u},{0x1f8,0x00622021u},{0x1fc,0x28828000u},{0x200,0x10400003u},{0x204,0x0164102au},{0x20c,0xa4ce0000u},{0x210,0x10400003u},{0x214,0x00000000u},{0x21c,0xa4cb0000u},{0x220,0xa4c40000u},{0x224,0x8d020004u},{0x228,0xad000000u},{0x22c,0x85230002u},{0x230,0x000211c3u},{0x234,0x00623821u},{0x238,0x00071040u},{0x23c,0x00471021u},{0x240,0x00821021u},{0x244,0x00021883u},{0x248,0x28628000u},{0x24c,0x10400003u},{0x250,0x0163102au},{0x258,0xa4ce0002u},{0x25c,0x10400003u},{0x260,0x00000000u},{0x268,0xa4cb0002u},{0x26c,0xa4c30002u},{0x270,0x8d020008u},{0x274,0xad000004u},{0x278,0x85230004u},{0x27c,0x000211c3u},{0x280,0x00622021u},{0x284,0x00e41021u},{0x288,0x00021843u},{0x28c,0x28628000u},{0x290,0x10400003u},{0x294,0x0163102au},{0x29c,0xa4ce0004u},{0x2a0,0x10400003u},{0x2a4,0x00000000u},{0x2ac,0xa4cb0004u},{0x2b0,0xa4c30004u},{0x2b4,0x00041040u},{0x2b8,0x00441021u},{0x2bc,0xad000008u},{0x2c0,0x85240006u},{0x2c4,0x8d03000cu},{0x2c8,0x00441021u},{0x2cc,0x000319c3u},{0x2d0,0x00431021u},{0x2d4,0x00021883u},{0x2d8,0x28628000u},{0x2dc,0x10400003u},{0x2e0,0x0163102au},{0x2e8,0xa4ce0006u},{0x2ec,0x10400003u},{0x2f0,0x00000000u},{0x2f8,0xa4cb0006u},{0x2fc,0xa4c30006u},{0x300,0x25290006u},{0x304,0x24c60008u},{0x308,0x25a30200u},{0x30c,0x00c3102au},{0x310,0x1440ffb6u},{0x314,0x2508000cu},{0x318,0xaca002fcu},{0x31c,0x254a0200u},{0x320,0x00606821u},{0x324,0x258c0002u},{0x330,0x0182102au},{0x334,0x1440ff56u},{0x338,0x25ef0002u},{0x33c,0x27180001u},{0x340,0x2b020002u},{0x344,0x1440ff4eu},{0x348,0x27390300u},{0x34c,0x8fb40020u},{0x350,0x8fb3001cu},{0x354,0x8fb20018u},{0x358,0x8fb10014u},{0x35c,0x8fb00010u},{0x360,0x03e00008u},{0x364,0x27bd0028u}};
++            const uint32_t fn = m.base + kSndMixOffset;
++            for (const auto &e : kFp)
++            {
++                if (memory.fetch32(fn + e[0]) != e[1])
++                {
++                    log(LogLevel::Warning, "[IOP] SNDDRV.IRX found but SNDIOP_ee36_iop36 fingerprint differs; native mixer off");
++                    return;
++                }
++            }
++            auto hi = [&](uint32_t off) { return (memory.fetch32(fn + off) & 0xFFFFu) << 16; };
++            auto lo = [&](uint32_t off) { return static_cast<int32_t>(static_cast<int16_t>(memory.fetch32(fn + off) & 0xFFFFu)); };
++            sndTblA = hi(0x030) + static_cast<uint32_t>(lo(0x034));
++            sndTblB = hi(0x058) + static_cast<uint32_t>(lo(0x05c));
++            sndState = hi(0x080) + static_cast<uint32_t>(lo(0x084));
++            sndPtrHi = hi(0x0ac);
++            sndPtrLo = lo(0x0b4);
++            sndStateEnd = hi(0x328) + static_cast<uint32_t>(lo(0x32c));
++            if (sndStateEnd <= sndState || sndStateEnd - sndState > 64u)
++            {
++                log(LogLevel::Warning, "[IOP] SNDIOP_ee36_iop36: unexpected state range; native mixer off");
++                return;
++            }
++            sndMixPc = IopMemory::physicalAddress(fn);
++            char buf[200];
++            std::snprintf(buf, sizeof(buf), "[IOP] SNDIOP_ee36_iop36 native port %s at 0x%x (tblA=%x tblB=%x state=%x..%x ptr=%x%+d)",
++                          sndMixMode() == 2 ? "CHECK mode" : "on", fn, sndTblA, sndTblB, sndState, sndStateEnd, sndPtrHi, sndPtrLo);
++            log(LogLevel::Info, buf);
++        }
++
++        struct SndMemDirect
++        {
++            IopMemory &m;
++            uint16_t r16(uint32_t a) { return m.read16(a); }
++            uint32_t r32(uint32_t a) { return m.read32(a); }
++            void w16(uint32_t a, uint16_t v) { m.write16(a, v); }
++            void w32(uint32_t a, uint32_t v) { m.write32(a, v); }
++        };
++        struct SndMemOverlay
++        {
++            IopMemory &m;
++            std::map<uint32_t, uint8_t> &w;
++            uint8_t r8(uint32_t a)
++            {
++                const uint32_t p = IopMemory::physicalAddress(a);
++                auto it = w.find(p);
++                return it != w.end() ? it->second : m.read8(a);
++            }
++            uint16_t r16(uint32_t a) { return static_cast<uint16_t>(r8(a) | (r8(a + 1u) << 8)); }
++            uint32_t r32(uint32_t a) { return r16(a) | (static_cast<uint32_t>(r16(a + 2u)) << 16); }
++            void w8(uint32_t a, uint8_t v) { w[IopMemory::physicalAddress(a)] = v; }
++            void w16(uint32_t a, uint16_t v) { w8(a, static_cast<uint8_t>(v)); w8(a + 1u, static_cast<uint8_t>(v >> 8)); }
++            void w32(uint32_t a, uint32_t v) { w16(a, static_cast<uint16_t>(v)); w16(a + 2u, static_cast<uint16_t>(v >> 16)); }
++        };
++
++        template <class M>
++        void sndMixRun(M &mem, uint32_t a0, uint32_t a1)
++        {
++            auto lh = [&](uint32_t a) -> int32_t { return static_cast<int16_t>(mem.r16(a)); };
++            auto lw = [&](uint32_t a) -> int32_t { return static_cast<int32_t>(mem.r32(a)); };
++            auto sat = [](int32_t v) -> uint16_t {
++                if (v < -32768) v = -32768;
++                else if (v > 32767) v = 32767;
++                return static_cast<uint16_t>(v);
++            };
++            auto add = [](int32_t x, int32_t y) -> int32_t { return static_cast<int32_t>(static_cast<uint32_t>(x) + static_cast<uint32_t>(y)); };
++            auto x3 = [&](int32_t x) -> int32_t { return add(add(x, x), x); };
++            const uint32_t nj = (sndStateEnd - sndState + 1u) / 2u;
++            uint32_t dst = a1;
++            for (uint32_t k = 0; k < 2u; ++k)
++            {
++                for (uint32_t j = 0; j < nj; ++j, dst += 0x200u)
++                {
++                    const uint32_t s = sndState + j * 2u;
++                    const int32_t A = lh(sndTblA + k * 4u + j * 2u);
++                    const int32_t B = lh(sndTblB + k * 4u + j * 2u);
++                    const uint16_t stU = mem.r16(s);
++                    const uint32_t P = static_cast<uint32_t>(lw(sndPtrHi + static_cast<uint32_t>(B * 4) + static_cast<uint32_t>(sndPtrLo))) + k * 0x300u;
++                    const uint32_t src = a0 + static_cast<uint32_t>(A * 2);
++                    mem.w16(dst, stU);
++                    const int32_t x0 = add(lh(src), lw(P) >> 7);
++                    mem.w16(dst + 2u, sat(add(lh(s), x3(x0)) >> 2));
++                    const int32_t p1 = lw(P + 4u);
++                    mem.w32(P, 0u);
++                    const int32_t x1 = add(lh(src + 2u), p1 >> 7);
++                    mem.w16(dst + 4u, sat(add(x0, x1) >> 1));
++                    int32_t t = x3(x1);
++                    mem.w32(P + 4u, 0u);
++                    t = add(t, lh(src + 4u));
++                    t = add(t, lw(P + 8u) >> 7);
++                    mem.w16(dst + 6u, sat(t >> 2));
++                    const int32_t xl = add(lh(src + 0x17eu), lw(P + 0x2fcu) >> 7);
++                    mem.w16(s, sat(xl));
++                    uint32_t d = dst + 8u, q = src + 4u, p = P + 8u;
++                    while (static_cast<int32_t>(d) < static_cast<int32_t>(dst + 0x200u))
++                    {
++                        const int32_t xa = add(lh(q), lw(p) >> 7);
++                        mem.w16(d, sat(xa));
++                        const int32_t pb = lw(p + 4u);
++                        mem.w32(p, 0u);
++                        const int32_t xb = add(lh(q + 2u), pb >> 7);
++                        mem.w16(d + 2u, sat(add(xa, x3(xb)) >> 2));
++                        const int32_t pc = lw(p + 8u);
++                        mem.w32(p + 4u, 0u);
++                        const int32_t xc = add(lh(q + 4u), pc >> 7);
++                        mem.w16(d + 4u, sat(add(xb, xc) >> 1));
++                        int32_t u = x3(xc);
++                        mem.w32(p + 8u, 0u);
++                        u = add(u, lh(q + 6u));
++                        u = add(u, lw(p + 12u) >> 7);
++                        mem.w16(d + 6u, sat(u >> 2));
++                        q += 6u;
++                        d += 8u;
++                        p += 12u;
++                    }
++                    mem.w32(P + 0x2fcu, 0u);
++                }
++            }
++        }
++
++        // Returns true when the call was executed natively (cpu now at ra).
++        bool trySndMix(CpuState &cpu)
++        {
++            if (cpu.branchPending)
++                return false;
++            if (cpu.pendingLoad)
++            {
++                if (cpu.pendingLoadReg != 0u)
++                    cpu.gpr[cpu.pendingLoadReg] = cpu.pendingLoadValue;
++                cpu.pendingLoad = false;
++            }
++            ++sndMixCalls;
++            if (sndMixMode() == 2)
++            {
++                if (sndCheck.pending)
++                    return false;
++                sndCheck.writes.clear();
++                SndMemOverlay ov{memory, sndCheck.writes};
++                sndMixRun(ov, cpu.gpr[4], cpu.gpr[5]);
++                sndCheck.pending = true;
++                sndCheck.cpu = &cpu;
++                sndCheck.ra = cpu.gpr[31];
++                sndCheck.sp = cpu.gpr[29];
++                return false; // interpreter runs it; compared on return
++            }
++            SndMemDirect dm{memory};
++            sndMixRun(dm, cpu.gpr[4], cpu.gpr[5]);
++            const uint64_t c = sndMixCycles();
++            totalInstructions += c;
++            totalCycles += c;
++            cpu.pc = cpu.gpr[31];
++            cpu.branchPending = false;
++            return true;
++        }
++
++        void sndCheckCompare()
++        {
++            sndCheck.pending = false;
++            uint64_t diffs = 0u;
++            uint32_t first = 0u;
++            for (const auto &[a, v] : sndCheck.writes)
++            {
++                if (memory.read8(a) != v)
++                {
++                    if (diffs == 0u)
++                        first = a;
++                    ++diffs;
++                }
++            }
++            ++sndCheck.checked;
++            if (diffs)
++                ++sndCheck.bad;
++            if (diffs || sndCheck.checked <= 3u || (sndCheck.checked % 500u) == 0u)
++                std::fprintf(stderr, "[iop:sndmix] check #%llu: %zu bytes written, %llu differ%s (first at 0x%x); bad calls so far %llu\n",
++                             static_cast<unsigned long long>(sndCheck.checked), sndCheck.writes.size(),
++                             static_cast<unsigned long long>(diffs), diffs ? " MISMATCH" : "", first,
++                             static_cast<unsigned long long>(sndCheck.bad));
++        }
++
+         bool step(CpuState &cpu)
+         {
+             if (cpu.stopped)
+@@ -433,6 +665,15 @@
+             if (checkInterrupt(cpu))
+                 return true;
+ 
++            if (sndMixPc != 0u && (cpu.pc & 0x1FFFFFFFu) == sndMixPc && trySndMix(cpu))
++            {
++                ++totalInstructions;
++                ++totalCycles;
++                return !cpu.stopped;
++            }
++            if (sndCheck.pending && sndCheck.cpu == &cpu && cpu.pc == sndCheck.ra && cpu.gpr[29] == sndCheck.sp)
++                sndCheckCompare();
++
+             // decode() returns nothing unless the word at pc is `jr ra`; check that inline first.
+             if (const auto import = (iopFastPath() && memory.fetch32(cpu.pc) != 0x03E00008u)
+                                         ? decltype(imports.decode(cpu.pc)){}
+@@ -706,6 +947,7 @@
+             result.moduleId = module.id;
+             result.startResult = static_cast<int32_t>(startResult);
+             modules[module.id] = std::move(module);
++            detectSndMix(modules[result.moduleId]);
+ 
+             std::ostringstream out;
+             out << "[IOP] loaded IRX id=" << result.moduleId

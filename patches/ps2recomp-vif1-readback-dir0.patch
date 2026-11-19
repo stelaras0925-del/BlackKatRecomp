@@ -1,0 +1,114 @@
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -14,6 +14,12 @@
+ #include <vector>
+ 
+ void ps2xVif1NoteTransfer(uint32_t src, uint32_t qwc, uint32_t chainBytes);
++void ps2xVif1ResetCarry();
++
++// GS local->host readback hook (set by PS2Runtime): VIF1 DMA with CHCR.DIR=0 reads the
++// GS FIFO into memory (TRXDIR=1 download). Kept as a plain pointer so no header changes.
++uint32_t (*g_ps2xGsLocalToHost)(void *ctx, uint8_t *dst, uint32_t maxBytes) = nullptr;
++void *g_ps2xGsLocalToHostCtx = nullptr;
+ 
+ namespace
+ {
+@@ -1291,6 +1297,7 @@
+             {
+                 const bool wasPath3Masked = m_path3Masked;
+                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
++                ps2xVif1ResetCarry();
+                 m_vif1PendingPath2ImageQwc = 0u;
+                 m_vif1PendingPath2DirectHl = false;
+                 m_path3Masked = false;
+@@ -1373,6 +1380,56 @@
+                 return true;
+             }
+ 
++            // VIF1 CHCR.DIR=0 (bit 0) is the "from VIF1 to memory" direction: a GS
++            // local->host download (TRXDIR=1) read back through the VIF1 FIFO. The old
++            // code treated it as a normal to-VIF transfer, so the destination buffer
++            // (old texels) was parsed as VIFcodes -> stream desync, garbage UNPACK/MPG,
++            // XGKICK overflows, and the readback never happened (Skull Islands teleport
++            // banding / mosaic). PS2X_VIF1_READBACK=0 restores the old behaviour.
++            if (channelBase == 0x10009000u && ((value >> 2) & 0x3u) == 0u && qwc > 0u && (value & 0x1u) == 0u)
++            {
++                static const bool s_readback = []() {
++                    const char *e = std::getenv("PS2X_VIF1_READBACK");
++                    return !(e && e[0] == '0');
++                }();
++                if (s_readback)
++                {
++                    // Make sure the preceding VIF1 work (BITBLTBUF/TRXPOS/TRXREG/TRXDIR via DIRECT) has reached the GS.
++                    processPendingTransfers();
++                    ps2x_vu1async::drain(*this, "vif1-readback");
++                    const uint32_t bytes = qwc * 16u;
++                    uint32_t got = 0u;
++                    uint8_t *dst = nullptr;
++                    uint32_t limit = 0u;
++                    try
++                    {
++                        const bool scratch = isScratchpad(madr);
++                        const uint32_t phys = translateAddress(madr);
++                        uint8_t *base = scratch ? m_scratchpad : m_rdram;
++                        const uint32_t size = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++                        if (phys < size)
++                        {
++                            dst = base + phys;
++                            limit = std::min<uint32_t>(bytes, size - phys);
++                        }
++                    }
++                    catch (...)
++                    {
++                        dst = nullptr;
++                    }
++                    if (dst && limit && g_ps2xGsLocalToHost)
++                        got = g_ps2xGsLocalToHost(g_ps2xGsLocalToHostCtx, dst, limit);
++                    static std::atomic<uint32_t> s_rbLogged{0};
++                    if (s_rbLogged.fetch_add(1, std::memory_order_relaxed) < 20u)
++                        std::fprintf(stderr, "[vif1:readback] GS->mem madr=%08x qwc=%u chcr=%08x got=%u/%u bytes%s\n",
++                                     madr, qwc, value, got, bytes, g_ps2xGsLocalToHost ? "" : " (no GS hook)");
++                    m_ioRegisters[channelBase + 0x10] = madr + bytes;
++                    m_ioRegisters[channelBase + 0x20] = 0u;
++                    completeDmacChannel(channelBase, 1u);
++                    return true;
++                }
++            }
++
+             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
+             {
+                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -672,6 +672,14 @@
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);
++    {
++        extern uint32_t (*g_ps2xGsLocalToHost)(void *, uint8_t *, uint32_t);
++        extern void *g_ps2xGsLocalToHostCtx;
++        g_ps2xGsLocalToHostCtx = &m_gs;
++        g_ps2xGsLocalToHost = [](void *c, uint8_t *d, uint32_t n) -> uint32_t {
++            return static_cast<GS *>(c)->consumeLocalToHostBytes(d, n);
++        };
++    }
+     ps2x_vu1async::setNotify([this]()
+                              {
+                                  if (m_eeScheduler)
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -449,6 +449,14 @@
+     }
+ }
+ 
++// VIF1_FBRST.RST discards a partially received VIFcode (no carry into the next DMA).
++void ps2xVif1ResetCarry()
++{
++    if (!g_vif1Carry.empty())
++        std::fprintf(stderr, "[vif1:carry] dropped %zu carried bytes on VIF1 reset\n", g_vif1Carry.size());
++    g_vif1Carry.clear();
++}
++
+ void ps2xVif1NoteTransfer(uint32_t src, uint32_t qwc, uint32_t chainBytes)
+ {
+     ++g_vif1XferSerial;

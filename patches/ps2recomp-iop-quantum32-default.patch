@@ -1,0 +1,29 @@
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -777,7 +777,7 @@
+         uint64_t totalCycles = 0;
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
+-        uint64_t iopCyclePending = 0; // PS2X_IOP_QUANTUM batching (off by default)
++        uint64_t iopCyclePending = 0; // PS2X_IOP_QUANTUM batching (default 32)
+         CpuState *activeCpu = nullptr;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+@@ -821,12 +821,13 @@
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+         const uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;
+-        // PS2X_IOP_QUANTUM=N (N>1, experimental, default off): run the IOP only once N IOP cycles
+-        // are owed instead of on every EE dispatch (the EE accounts 8 cycles = 1 IOP cycle per
+-        // dispatch). Changes the EE/IOP interleaving granularity, not the IOP's own order.
++        // PS2X_IOP_QUANTUM=N: run the IOP only once N IOP cycles are owed instead of on every
++        // EE dispatch (the EE accounts 8 cycles = 1 IOP cycle per dispatch). Changes the EE/IOP
++        // interleaving granularity, not the IOP's own order. Default 32 (played through the
++        // teleport/Skull Islands without glitches, 2026-11-18); PS2X_IOP_QUANTUM=1 = old behaviour.
+         static const uint64_t s_quantum = []() -> uint64_t {
+             const char *e = std::getenv("PS2X_IOP_QUANTUM");
+-            const long v = e ? std::strtol(e, nullptr, 10) : 1;
++            const long v = e ? std::strtol(e, nullptr, 10) : 32;
+             return v > 1 ? static_cast<uint64_t>(v) : 1u;
+         }();
+         if (s_quantum > 1u)

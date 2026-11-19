@@ -1,0 +1,249 @@
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -112,6 +112,237 @@
+     reset();
+ }
+ 
++// ---------------------------------------------------------------------------
++// Threaded raster backend (default; PS2X_GS_SYNC=1 disables it).
++// All VRAM-mutating backend calls (Submit, LoadClut, BeginTransfer,
++// UploadImage, TextureFlush, WriteVram) are queued in order and executed on
++// one worker thread. Every call that reads GS memory or needs completed work
++// (Flush, Sync, Present, ClearFramebuffer, ConsumeLocalToHostBytes, ReadVram,
++// SnapshotVram, Reset, Initialize) first waits until everything queued before
++// it has been executed. GetTransferSnapshot (debug only) does not wait.
++// ---------------------------------------------------------------------------
++#include <chrono>
++#include <condition_variable>
++#include <string>
++#include <deque>
++#include <mutex>
++#include <thread>
++namespace
++{
++    class GSThreadedBackend final : public GSRasterBackend
++    {
++    public:
++        explicit GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
++            : m_inner(std::move(inner))
++        {
++            m_worker = std::thread([this]() { workerLoop(); });
++        }
++        ~GSThreadedBackend() override
++        {
++            drain(0);
++            {
++                std::lock_guard<std::mutex> lk(m_mutex);
++                m_quit = true;
++            }
++            m_cv.notify_all();
++            if (m_worker.joinable())
++                m_worker.join();
++        }
++
++        void Initialize(uint8_t *vram, uint32_t vramSize) override { drain(0); m_inner->Initialize(vram, vramSize); }
++        void Reset() override { drain(0); m_inner->Reset(); }
++
++        void Submit(const GSPrimitiveBatch &batch) override
++        {
++            Cmd c;
++            c.type = Cmd::SubmitT;
++            c.batch = batch;
++            push(std::move(c));
++        }
++        void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
++        {
++            Cmd c;
++            c.type = Cmd::ClutT;
++            c.tex0 = tex0;
++            c.clut = texclut;
++            push(std::move(c));
++        }
++        void BeginTransfer(const GSTransferCommand &command) override
++        {
++            Cmd c;
++            c.type = Cmd::TransferT;
++            c.transfer = command;
++            push(std::move(c));
++        }
++        void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
++        {
++            if (!data || sizeBytes == 0u)
++                return;
++            Cmd c;
++            c.type = Cmd::UploadT;
++            c.data.assign(data, data + sizeBytes);
++            push(std::move(c));
++        }
++        // Flush and Sync(Finish) must drain: letting the EE run past FINISH
++        // (tried 2026-11-11) produced corrupted gameplay frames and stalled
++        // the host present for tens of seconds.
++        void Flush() override { drain(1); m_inner->Flush(); }
++        void Sync(GSSyncReason reason) override { drain(2); m_inner->Sync(reason); }
++        void TextureFlush() override
++        {
++            Cmd c;
++            c.type = Cmd::TexFlushT;
++            push(std::move(c));
++        }
++        PresentationFrame Present(const GSPresentationRequest &request) override { drain(3); return m_inner->Present(request); }
++        bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override { drain(4); return m_inner->ClearFramebuffer(context, rgba); }
++        uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override { drain(5); return m_inner->ConsumeLocalToHostBytes(dst, maxBytes); }
++        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
++        {
++            drain(6);
++            return m_inner->ReadVram(psm, base, bw, x, y);
++        }
++        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
++        {
++            Cmd c;
++            c.type = Cmd::WriteT;
++            c.w[0] = psm; c.w[1] = base; c.w[2] = bw; c.w[3] = x; c.w[4] = y; c.w[5] = value;
++            push(std::move(c));
++        }
++        void SnapshotVram(std::vector<uint8_t> &out) const override { drain(7); m_inner->SnapshotVram(out); }
++        GSTransferSnapshot GetTransferSnapshot() const override { return m_inner->GetTransferSnapshot(); }
++
++    private:
++        struct Cmd
++        {
++            enum Type : uint8_t { SubmitT, ClutT, TransferT, UploadT, TexFlushT, WriteT } type = SubmitT;
++            GSPrimitiveBatch batch{};
++            GSTex0Reg tex0{};
++            GSTexClutReg clut{};
++            GSTransferCommand transfer{};
++            std::vector<uint8_t> data;
++            uint32_t w[6] = {};
++        };
++
++        void push(Cmd &&c)
++        {
++            bool wake;
++            {
++                std::lock_guard<std::mutex> lk(m_mutex);
++                m_queue.push_back(std::move(c));
++                ++m_submitted;
++                wake = m_workerIdle;
++            }
++            if (wake)
++                m_cv.notify_one();
++        }
++
++        // PS2X_GS_THREAD_STATS=1: every ~5 s log drains per reason, how many
++        // had to wait, and the total wait time.
++        void drain(int why) const
++        {
++            if (std::this_thread::get_id() == m_worker.get_id())
++                return;
++            static const bool s_stats = []() { const char *e = std::getenv("PS2X_GS_THREAD_STATS"); return e && e[0] == '1'; }();
++            std::unique_lock<std::mutex> lk(m_mutex);
++            const uint64_t target = m_submitted;
++            if (s_stats)
++                ++m_drainCalls[why & 7];
++            if (m_completed >= target)
++                return;
++            m_cv.notify_one();
++            const auto t0 = std::chrono::steady_clock::now();
++            m_doneCv.wait(lk, [&]() { return m_completed >= target; });
++            if (s_stats)
++            {
++                const auto t1 = std::chrono::steady_clock::now();
++                ++m_drainWaits[why & 7];
++                m_drainWaitNs[why & 7] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
++                if (t1 - m_lastStats > std::chrono::seconds(5))
++                {
++                    m_lastStats = t1;
++                    static const char *names[8] = {"init/reset", "flush", "sync", "present", "clear", "l2h", "readvram", "snapshot"};
++                    std::string line = "[gs:thread]";
++                    for (int i = 0; i < 8; ++i)
++                        if (m_drainCalls[i])
++                            line += std::string(" ") + names[i] + "=" + std::to_string(m_drainCalls[i]) + "/" +
++                                    std::to_string(m_drainWaits[i]) + "w/" + std::to_string(m_drainWaitNs[i] / 1000000ull) + "ms";
++                    line += " cmds=" + std::to_string(m_submitted);
++                    std::fprintf(stderr, "%s\n", line.c_str());
++                }
++            }
++        }
++        mutable uint64_t m_drainCalls[8] = {};
++        mutable uint64_t m_drainWaits[8] = {};
++        mutable uint64_t m_drainWaitNs[8] = {};
++        mutable std::chrono::steady_clock::time_point m_lastStats{};
++
++        void execute(Cmd &c)
++        {
++            switch (c.type)
++            {
++            case Cmd::SubmitT: m_inner->Submit(c.batch); break;
++            case Cmd::ClutT: m_inner->LoadClut(c.tex0, c.clut); break;
++            case Cmd::TransferT: m_inner->BeginTransfer(c.transfer); break;
++            case Cmd::UploadT: m_inner->UploadImage(c.data.data(), static_cast<uint32_t>(c.data.size())); break;
++            case Cmd::TexFlushT: m_inner->TextureFlush(); break;
++            case Cmd::WriteT: m_inner->WriteVram(c.w[0], c.w[1], c.w[2], c.w[3], c.w[4], c.w[5]); break;
++            }
++        }
++
++        void workerLoop()
++        {
++            std::deque<Cmd> local;
++            std::unique_lock<std::mutex> lk(m_mutex);
++            for (;;)
++            {
++                m_workerIdle = true;
++                m_cv.wait(lk, [&]() { return m_quit || !m_queue.empty(); });
++                m_workerIdle = false;
++                if (m_queue.empty() && m_quit)
++                    return;
++                local.swap(m_queue);
++                lk.unlock();
++                uint64_t n = 0;
++                for (Cmd &c : local)
++                {
++                    execute(c);
++                    ++n;
++                }
++                local.clear();
++                lk.lock();
++                m_completed += n;
++                m_doneCv.notify_all();
++            }
++        }
++
++        std::unique_ptr<GSRasterBackend> m_inner;
++        mutable std::mutex m_mutex;
++        mutable std::condition_variable m_cv;
++        mutable std::condition_variable m_doneCv;
++        std::deque<Cmd> m_queue;
++        uint64_t m_submitted = 0;
++        uint64_t m_completed = 0;
++        bool m_workerIdle = false;
++        bool m_quit = false;
++        std::thread m_worker;
++    };
++
++    bool gsSyncMode()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_GS_SYNC"); return e && e[0] == '1'; }();
++        return on;
++    }
++
++    std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend(std::unique_ptr<GSRasterBackend> inner)
++    {
++        if (gsSyncMode())
++            return inner;
++        std::fprintf(stderr, "[gs] rasterizer on worker thread (PS2X_GS_SYNC=1 to disable)\n");
++        return std::make_unique<GSThreadedBackend>(std::move(inner));
++    }
++}
++
+ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+ {
+     m_localMemoryStorage = vram;
+@@ -119,6 +350,8 @@
+     m_privRegs = privRegs;
+     if (!m_backend)
+         m_backend = std::make_unique<GSCpuBackend>();
++    if (!dynamic_cast<GSThreadedBackend *>(m_backend.get()))
++        m_backend = makeDefaultRasterBackend(std::move(m_backend));
+     m_backend->Initialize(vram, vramSize);
+     reset();
+ }

@@ -1,0 +1,808 @@
+# PS2Recomp runtime: cheaper VU1 microprogram interpretation (exact fast-mode semantics; default on; PS2X_VU1_JIT=0 = old paths).
+# Apply on top of ps2recomp-vu1-thread.patch, from third_party/PS2Recomp: git apply ../../patches/ps2recomp-vu1-jit.patch
+# Diag envs: PS2X_VU1_PROFILE=1 (hot programs/pcs), PS2X_VU1_FLAGCHECK=1 (fast flags vs exact), PS2X_VU1_EXACTFLAGS=1.
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 8d1acfc..c3d6a49 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -12,6 +12,10 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <limits>
++#include <array>
++#include <chrono>
++#include <unordered_map>
++#include <vector>
+ #include <ps2_log.h>
+ 
+ namespace
+@@ -39,8 +43,10 @@ namespace
+     // with this it returns at once while nothing can be due yet. Entries are
+     // only ever added via "x.readyCycle = m_cycle + n" (hint lowered there)
+     // or removed; a stale (too low) hint only costs one extra scan.
+-    const void *g_vu1HintOwner = nullptr;
+-    uint64_t g_vu1CommitHint = 0;
++    // thread_local: VU0 (EE thread) and VU1 (VU1 worker thread) run concurrently since the
++    // VU1 thread patch; a shared hint could let one unit skip the other's due commits.
++    thread_local const void *g_vu1HintOwner = nullptr;
++    thread_local uint64_t g_vu1CommitHint = 0;
+     inline void vu1NoteReady(const void *self, uint64_t cycle)
+     {
+         if (g_vu1HintOwner != self)
+@@ -54,6 +60,144 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // PS2X_VU1_PROFILE=1: hot VU1 microprogram / pair report every 5 s ([vu1:prof]).
++    bool vu1ProfOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_PROFILE"); return e && e[0] == '1'; }();
++        return on;
++    }
++    struct Vu1Prof
++    {
++        uint64_t pcHits[2048] = {};
++        uint32_t pcLower[2048] = {};
++        uint32_t pcUpper[2048] = {};
++        std::unordered_map<uint32_t, std::array<uint64_t, 3>> progs; // start pc -> runs, pairs, cycles
++        uint64_t runPairs = 0;
++        uint64_t totalPairs = 0;
++        uint64_t totalCycles = 0;
++        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++    };
++    Vu1Prof &vu1Prof()
++    {
++        static Vu1Prof *p = new Vu1Prof();
++        return *p;
++    }
++    inline void vu1ProfNotePair(uint32_t pc, uint32_t lower, uint32_t upper)
++    {
++        Vu1Prof &p = vu1Prof();
++        const uint32_t i = (pc >> 3) & 2047u;
++        ++p.pcHits[i];
++        p.pcLower[i] = lower;
++        p.pcUpper[i] = upper;
++        ++p.runPairs;
++    }
++    void vu1ProfBeginRun() { vu1Prof().runPairs = 0; }
++    void vu1ProfEndRun(uint32_t startPc, uint64_t cycles)
++    {
++        Vu1Prof &p = vu1Prof();
++        auto &e = p.progs[startPc];
++        ++e[0];
++        e[1] += p.runPairs;
++        e[2] += cycles;
++        p.totalPairs += p.runPairs;
++        p.totalCycles += cycles;
++        const auto now = std::chrono::steady_clock::now();
++        const double span = std::chrono::duration<double>(now - p.last).count();
++        if (span < 5.0)
++            return;
++        p.last = now;
++        std::vector<std::pair<uint64_t, uint32_t>> v;
++        for (auto &kv : p.progs)
++            v.emplace_back(kv.second[1], kv.first);
++        std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first > b.first; });
++        std::fprintf(stderr, "[vu1:prof] %.2f Mpairs/s %.2f Mcycles/s (stall %.0f%%), %zu programs\n",
++                     p.totalPairs / span / 1e6, p.totalCycles / span / 1e6,
++                     p.totalCycles ? 100.0 * (1.0 - double(p.totalPairs) / double(p.totalCycles)) : 0.0, v.size());
++        for (size_t k = 0; k < v.size() && k < 8; ++k)
++        {
++            const auto &e2 = p.progs[v[k].second];
++            std::fprintf(stderr, "[vu1:prof]   prog pc=0x%04x runs=%llu pairs=%llu (%.1f%%) cycles=%llu pairs/run=%.0f\n",
++                         v[k].second, (unsigned long long)e2[0], (unsigned long long)e2[1],
++                         p.totalPairs ? 100.0 * e2[1] / p.totalPairs : 0.0, (unsigned long long)e2[2],
++                         e2[0] ? double(e2[1]) / e2[0] : 0.0);
++        }
++        std::vector<std::pair<uint64_t, uint32_t>> h;
++        for (uint32_t i = 0; i < 2048u; ++i)
++            if (p.pcHits[i])
++                h.emplace_back(p.pcHits[i], i);
++        std::sort(h.begin(), h.end(), [](auto &a, auto &b) { return a.first > b.first; });
++        uint64_t top = 0;
++        for (size_t k = 0; k < h.size() && k < 64; ++k)
++            top += h[k].first;
++        std::fprintf(stderr, "[vu1:prof]   %zu distinct pairs, top-64 pairs = %.1f%%\n", h.size(),
++                     p.totalPairs ? 100.0 * top / p.totalPairs : 0.0);
++        for (size_t k = 0; k < h.size() && k < 12; ++k)
++            std::fprintf(stderr, "[vu1:prof]   pc=0x%04x hits=%.1f%% upper=%08x lower=%08x\n", h[k].second * 8u,
++                         100.0 * h[k].first / p.totalPairs, p.pcUpper[h[k].second], p.pcLower[h[k].second]);
++        p.progs.clear();
++        std::memset(p.pcHits, 0, sizeof(p.pcHits));
++        p.totalPairs = p.totalCycles = 0;
++    }
++}
++
++namespace
++{
++    // PS2X_VU1_EXACTFLAGS=1: always compute FMAC flags through the long-double exact path.
++    // PS2X_VU1_JIT=0 reverts all VU1 interpreter fast paths added by the vu1-jit patch
++    // (fast FMAC flags, skipped reg-pipe commits, stall-cycle skipping, decoded-pair by ref).
++    bool vu1JitOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_JIT"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    bool vu1ExactFlagsOnly()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_EXACTFLAGS"); return (e && e[0] == '1') || !vu1JitOn(); }();
++        return on;
++    }
++    bool vu1FlagCheck()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_FLAGCHECK"); return e && e[0] == '1'; }();
++        return on;
++    }
++    void vu1FlagCheckNote(bool mismatch, uint32_t upper, uint8_t fast, uint8_t exact)
++    {
++        static uint64_t checks = 0, bad = 0;
++        ++checks;
++        if (mismatch && ++bad <= 20)
++            std::fprintf(stderr, "[vu1:flagcheck] MISMATCH upper=%08x fast=%x exact=%x\n", upper, fast, exact);
++        if ((checks & ((1ull << 24) - 1u)) == 0u)
++            std::fprintf(stderr, "[vu1:flagcheck] %llu lanes checked, %llu mismatches\n",
++                         (unsigned long long)checks, (unsigned long long)bad);
++    }
++    // FMAC ops whose flags come from calculateFmacExactResult: 1 = one rounding (add/sub/mul of
++    // two operands), 2 = product-sum (acc +- fs*ft, two roundings), 0 = other (exact path).
++    // code = bits 5:0, or the 11-bit special opcode for op >= 0x3C.
++    inline int fmacFastKind(uint8_t code, bool special)
++    {
++        if (code <= 0x07u)
++            return 1;
++        if (code <= 0x0Fu)
++            return 2;
++        if (code >= 0x18u && code <= 0x1Bu)
++            return 1;
++        switch (code)
++        {
++        case 0x1Cu: case 0x1Eu: case 0x20u: case 0x22u: case 0x24u: case 0x26u:
++        case 0x28u: case 0x2Au: case 0x2Cu:
++            return 1;
++        case 0x21u: case 0x23u: case 0x25u: case 0x27u: case 0x29u: case 0x2Du:
++            return 2;
++        case 0x2Eu:
++            return special ? 1 : 2; // OPMULA : OPMSUB (w lane excluded by the caller)
++        default:
++            return 0;
++        }
++    }
++}
++
+ namespace
+ {
+     constexpr uint8_t laneForComponent(uint32_t component)
+@@ -148,6 +292,7 @@ float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+ 
+ float VU1Interpreter::normalizeOperand(float value) const
+ {
++    return vuNormOperand(value);
+     uint32_t bits = 0;
+     std::memcpy(&bits, &value, sizeof(bits));
+     const uint32_t exponent = (bits >> 23) & 0xFFu;
+@@ -237,12 +382,61 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+                                          uint8_t laneFlags[4])
+ {
++    // Fast flag path (exactly the flags the long-double path computes, see fmacFastKind):
++    // a float result safely inside the normal range has an exact result that is nonzero,
++    // neither overflows nor underflows and has the same sign, so only the S flag can be set
++    // and the value is left unchanged. Anything near 0, FLT_MIN or FLT_MAX, or a product-sum
++    // with heavy cancellation, still goes through calculateFmacExactResult.
++    const uint32_t fastUpper = m_currentUpperInstruction;
++    const uint8_t fastOp = static_cast<uint8_t>(fastUpper & 0x3Fu);
++    const uint8_t fastCode = fastOp >= 0x3Cu ? static_cast<uint8_t>((fastUpper & 3u) | ((fastUpper >> 4) & 0x7Cu)) : fastOp;
++    const int fastKind = vu1ExactFlagsOnly() ? 0 : fmacFastKind(fastCode, fastOp >= 0x3Cu);
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         laneFlags[component] = 0u;
+         if ((dest & laneForComponent(component)) == 0u)
+             continue;
+ 
++        if (fastKind != 0 && !(fastCode == 0x2Eu && component == 3u))
++        {
++            uint32_t bits = 0;
++            std::memcpy(&bits, &result[component], sizeof(bits));
++            const uint32_t exponent = (bits >> 23) & 0xFFu;
++            if (exponent >= 3u && exponent <= 252u) // 2^-124 <= |r| < 2^126
++            {
++                bool safe = true;
++                if (fastKind == 2)
++                {
++                    // acc +- fs*ft: rounding the product can cost up to 2^-23 |p| (+ denormal
++                    // spacing). Require |r| >= 2^-20 (|acc| + |r|), which bounds that error by
++                    // |r|/8, and |acc| < 2^126 so the float product cannot have saturated.
++                    const float a = vuNormOperand(m_state.acc[component]);
++                    uint32_t abits = 0;
++                    std::memcpy(&abits, &a, sizeof(abits));
++                    const double ra = std::fabs(static_cast<double>(result[component]));
++                    safe = ((abits >> 23) & 0xFFu) <= 252u &&
++                           ra * 1048576.0 >= std::fabs(static_cast<double>(a)) + ra;
++                }
++                if (safe)
++                {
++                    laneFlags[component] = (bits & 0x80000000u) ? 0x2u : 0x0u;
++                    if (!vu1FlagCheck())
++                        continue;
++                    // PS2X_VU1_FLAGCHECK=1: also run the exact path and compare.
++                    long double exactCheck = 0.0L;
++                    float valueCheck = result[component];
++                    if (calculateFmacExactResult(component, exactCheck))
++                    {
++                        const uint8_t exactFlags = normalizeFmacExactResult(valueCheck, exactCheck);
++                        vu1FlagCheckNote(exactFlags != laneFlags[component] ||
++                                             std::memcmp(&valueCheck, &result[component], sizeof(float)) != 0,
++                                         fastUpper, laneFlags[component], exactFlags);
++                    }
++                    continue;
++                }
++            }
++        }
++
+         long double exactResult = 0.0L;
+         if (calculateFmacExactResult(component, exactResult))
+         {
+@@ -518,6 +712,27 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+         }
+ 
+         float product = left * right;
++        if (!vu1ExactFlagsOnly())
++        {
++            // Product safely in the normal range: the exact product is nonzero, in range and
++            // has the same sign, so its only flag is S (same as the long-double path).
++            uint32_t pbits = 0;
++            std::memcpy(&pbits, &product, sizeof(pbits));
++            const uint32_t pexp = (pbits >> 23) & 0xFFu;
++            if (pexp >= 3u && pexp <= 252u)
++            {
++                const uint32_t fastFlags = (pbits & 0x80000000u) ? 0x2u : 0x0u;
++                extraSticky |= fastFlags;
++                if (vu1FlagCheck())
++                {
++                    float pc2 = product;
++                    const uint8_t ef = normalizeFmacExactResult(
++                        pc2, static_cast<long double>(left) * static_cast<long double>(right));
++                    vu1FlagCheckNote((ef & 0xFu) != fastFlags, upper | 0x1u, static_cast<uint8_t>(fastFlags), ef);
++                }
++                continue;
++            }
++        }
+         const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
+         const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
+         // Product-sum instructions report Z/S/U/O from the add/subtract result
+@@ -853,6 +1068,11 @@ void VU1Interpreter::commitReadyPipelines()
+         store = {};
+     }
+ 
++    // VU1 fast mode writes VF/VI/ACC results straight into the register file (run()), so these
++    // three pipelines stay empty there and are not scanned.
++    const bool regPipesUnused = vu1JitOn() && vu1FastMode() && m_unit == Unit::VU1;
++    if (!regPipesUnused)
++    {
+     for (PendingVfWrite &write : m_vfWritePipeline)
+     {
+         if (!write.valid || write.readyCycle > m_cycle)
+@@ -891,6 +1111,7 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         write = {};
+     }
++    }
+ 
+     {
+         uint64_t next = ~0ull;
+@@ -901,12 +1122,15 @@ void VU1Interpreter::commitReadyPipelines()
+             if (e.valid) next = std::min(next, e.readyCycle);
+         for (const PendingStore &e : m_storePipeline)
+             if (e.valid) next = std::min(next, e.readyCycle);
++        if (!regPipesUnused)
++        {
+         for (const PendingVfWrite &e : m_vfWritePipeline)
+             if (e.valid) next = std::min(next, e.readyCycle);
+         for (const PendingViWrite &e : m_viWritePipeline)
+             if (e.valid) next = std::min(next, e.readyCycle);
+         for (const PendingAccWrite &e : m_accWritePipeline)
+             if (e.valid) next = std::min(next, e.readyCycle);
++        }
+         g_vu1HintOwner = this;
+         g_vu1CommitHint = next;
+     }
+@@ -1035,8 +1259,23 @@ void VU1Interpreter::advanceOneCycle()
+ 
+ void VU1Interpreter::advanceTo(uint64_t targetCycle)
+ {
++    static const bool s_jitOn = vu1JitOn();
+     while (m_cycle < targetCycle)
++    {
++        // Stall cycles where no pipeline entry can become ready and no PATH1 transfer is
++        // running do nothing in advanceOneCycle() (commitReadyPipelines returns on the hint,
++        // progressXgkick on !active): jump over them in one step.
++        if (s_jitOn && !m_xgkick.active && g_vu1HintOwner == this && g_vu1CommitHint > m_cycle + 1u)
++        {
++            const uint64_t jumpTo = std::min<uint64_t>(targetCycle, g_vu1CommitHint) - 1u;
++            if (jumpTo > m_cycle)
++            {
++                m_cycle = jumpTo;
++                m_state.cycles = m_cycle;
++            }
++        }
+         advanceOneCycle();
++    }
+ }
+ 
+ bool VU1Interpreter::pipelinesPending() const
+@@ -1072,32 +1311,36 @@ void VU1Interpreter::flushPipelines()
+ 
+ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
+ {
++    // Same result as the per-lane / per-register scan it replaced, but only set bits are visited.
+     uint64_t ready = m_cycle;
+     const InstructionUsage *usages[2] = {
+         &decoded.upperUsage,
+         &decoded.lowerUsage};
+     for (const InstructionUsage *usage : usages)
+     {
+-        if (!usage)
+-            continue;
+         for (uint32_t index = 0; index < usage->vfReadCount; ++index)
+         {
+             const VfAccess &access = usage->vfRead[index];
+-            for (uint32_t component = 0; component < 4u; ++component)
+-            {
+-                if ((access.lanes & laneForComponent(component)) != 0u)
+-                    ready = std::max(ready, m_vfReady[access.reg][component]);
+-            }
++            const auto &r = m_vfReady[access.reg];
++            const uint8_t lanes = access.lanes;
++            if (lanes & 0x8u) ready = std::max(ready, r[0]);
++            if (lanes & 0x4u) ready = std::max(ready, r[1]);
++            if (lanes & 0x2u) ready = std::max(ready, r[2]);
++            if (lanes & 0x1u) ready = std::max(ready, r[3]);
+         }
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
++        uint32_t vi = usage->viRead & 0xFFFEu;
++        while (vi != 0u)
+         {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
++            ready = std::max(ready, m_viReady[static_cast<uint32_t>(__builtin_ctz(vi))]);
++            vi &= vi - 1u;
+         }
+-        for (uint32_t component = 0; component < 4u; ++component)
++        const uint8_t accLanes = usage->accRead;
++        if (accLanes != 0u)
+         {
+-            if ((usage->accRead & laneForComponent(component)) != 0u)
+-                ready = std::max(ready, m_accReady[component]);
++            if (accLanes & 0x8u) ready = std::max(ready, m_accReady[0]);
++            if (accLanes & 0x4u) ready = std::max(ready, m_accReady[1]);
++            if (accLanes & 0x2u) ready = std::max(ready, m_accReady[2]);
++            if (accLanes & 0x1u) ready = std::max(ready, m_accReady[3]);
+         }
+     }
+ 
+@@ -1147,11 +1390,9 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+         }
+     }
+ 
+-    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-    {
+-        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+-    }
++    for (uint32_t vi = decoded.lowerUsage.viWrite & 0xFFFEu; vi != 0u; vi &= vi - 1u)
++        m_viReady[static_cast<uint32_t>(__builtin_ctz(vi))] =
++            m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
+@@ -1718,13 +1959,34 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
+     const bool fastMode = vu1FastMode() && m_unit == Unit::VU1;
++    const bool s_vu1Prof = vu1ProfOn() && m_unit == Unit::VU1;
++    const uint32_t profStartPc = m_state.pc;
++    const uint64_t profStartCycle = m_cycle;
++    if (s_vu1Prof)
++        vu1ProfBeginRun();
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         commitReadyPipelines();
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
+-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
++        // Use the pre-decoded pair in place when the cache is current (same check as
++        // getDecodedInstructionPairForPc, without copying the ~100-byte struct per pair).
++        DecodedInstructionPair decodedCopy;
++        const DecodedInstructionPair *decodedPtr = nullptr;
++        if (vu1JitOn() && m_unit == Unit::VU1 && memory && (m_state.pc & 7u) == 0u && (m_state.pc / 8u) < kMaxDecodedPairs &&
++            m_decodedCodeCacheValid && m_cachedVuCode == vuCode && vuCode == memory->getVU1Code() &&
++            m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
++            m_cachedCodeGeneration == memory->getVU1CodeGeneration())
++            decodedPtr = &m_decodedCodeCache[m_state.pc / 8u];
++        else
++        {
++            decodedCopy = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
++            decodedPtr = &decodedCopy;
++        }
++        const DecodedInstructionPair &decoded = *decodedPtr;
++        if (s_vu1Prof)
++            vu1ProfNotePair(m_state.pc, decoded.lower, decoded.upper);
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+@@ -1775,14 +2037,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+         uint8_t writtenVi = 0u;
+         int32_t oldVi = 0;
+-        for (uint32_t reg = 1; reg < 16u; ++reg)
++        if (const uint32_t viW = decoded.lowerUsage.viWrite & 0xFFFEu)
+         {
+-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            {
+-                writtenVi = static_cast<uint8_t>(reg);
+-                oldVi = m_state.vi[reg];
+-                break;
+-            }
++            writtenVi = static_cast<uint8_t>(__builtin_ctz(viW));
++            oldVi = m_state.vi[writtenVi];
+         }
+ 
+         const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+@@ -1796,12 +2054,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         float newLowerVf[4]{};
+         float oldAcc[4]{};
+         float newAcc[4]{};
+-        if (hasUpperWrite)
+-            std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+-        if (hasDistinctLowerWrite)
+-            std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+-        if (decoded.upperUsage.accWrite != 0u)
+-            std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
++        if (!fastMode) // the old values are only needed to defer the writes (accurate mode)
++        {
++            if (hasUpperWrite)
++                std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
++            if (hasDistinctLowerWrite)
++                std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++            if (decoded.upperUsage.accWrite != 0u)
++                std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
++        }
+ 
+         if (decoded.iBit)
+         {
+@@ -1975,6 +2236,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         m_pendingHaltD = false;
+         m_pendingHaltT = false;
+     }
++    if (s_vu1Prof)
++        vu1ProfEndRun(profStartPc, m_cycle - profStartCycle);
+     m_state.cycles = m_cycle;
+     if (useVuRounding && previousRoundingMode != -1)
+         std::fesetround(previousRoundingMode);
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+index ed0ee71..3bed880 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -2,6 +2,7 @@
+ #define PS2_VU1_DETAIL_H
+ 
+ #include <cstdint>
++#include <cstring>
+ 
+ // Instruction field extraction helpers
+ static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+@@ -26,4 +27,19 @@ static inline int16_t IMM15(uint32_t i)
+     return (int16_t)(int32_t)((int32_t)(raw << 17) >> 17);
+ }
+ 
++// Same as VU1Interpreter::normalizeOperand (denormal -> signed 0, Inf/NaN -> signed max), inline so
++// execUpper/execLower in other translation units do not pay a call per operand lane.
++static inline float vuNormOperand(float value)
++{
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    const uint32_t exponent = (bits >> 23) & 0xFFu;
++    if (exponent == 0u)
++        bits &= 0x80000000u;
++    else if (exponent == 0xFFu)
++        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++    std::memcpy(&value, &bits, sizeof(value));
++    return value;
++}
++
+ #endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+index 94be789..7a21595 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -500,8 +500,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             {
+                 int fsf = (instr >> 21) & 0x3;
+                 int ftf = (instr >> 23) & 0x3;
+-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
+-                const float den = normalizeOperand(m_state.vf[vfT][ftf]);
++                const float num = vuNormOperand(m_state.vf[vfS][fsf]);
++                const float den = vuNormOperand(m_state.vf[vfT][ftf]);
+                 uint32_t statusDi = 0u;
+                 float result = 0.0f;
+                 if (den == 0.0f)
+@@ -523,7 +523,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             case 0x39: // SQRT
+             {
+                 int ftf = (instr >> 23) & 0x3;
+-                const float val = normalizeOperand(m_state.vf[vfT][ftf]);
++                const float val = vuNormOperand(m_state.vf[vfT][ftf]);
+                 queueQ(std::sqrt(std::fabs(val)), 7u,
+                        val < 0.0f ? 0x10u : 0u);
+                 return;
+@@ -532,8 +532,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             {
+                 int fsf = (instr >> 21) & 0x3;
+                 int ftf = (instr >> 23) & 0x3;
+-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
+-                const float radicand = normalizeOperand(m_state.vf[vfT][ftf]);
++                const float num = vuNormOperand(m_state.vf[vfS][fsf]);
++                const float radicand = vuNormOperand(m_state.vf[vfT][ftf]);
+                 const float den = std::sqrt(std::fabs(radicand));
+                 uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
+                 float result = 0.0f;
+@@ -669,49 +669,49 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+                 return;
+             case 0x70: // ESADD
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormOperand(m_state.vf[vfS][0]);
++                const float y = vuNormOperand(m_state.vf[vfS][1]);
++                const float z = vuNormOperand(m_state.vf[vfS][2]);
+                 queueP(x * x + y * y + z * z, 11u);
+                 return;
+             }
+             case 0x71: // ERSADD
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormOperand(m_state.vf[vfS][0]);
++                const float y = vuNormOperand(m_state.vf[vfS][1]);
++                const float z = vuNormOperand(m_state.vf[vfS][2]);
+                 const float sum = x * x + y * y + z * z;
+                 queueP(sum != 0.0f ? 1.0f / sum : sum, 18u);
+                 return;
+             }
+             case 0x72: // ELENG
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormOperand(m_state.vf[vfS][0]);
++                const float y = vuNormOperand(m_state.vf[vfS][1]);
++                const float z = vuNormOperand(m_state.vf[vfS][2]);
+                 queueP(std::sqrt(x * x + y * y + z * z), 18u);
+                 return;
+             }
+             case 0x73: // ERLENG
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormOperand(m_state.vf[vfS][0]);
++                const float y = vuNormOperand(m_state.vf[vfS][1]);
++                const float z = vuNormOperand(m_state.vf[vfS][2]);
+                 const float len = std::sqrt(x * x + y * y + z * z);
+                 queueP(len != 0.0f ? 1.0f / len : len, 24u);
+                 return;
+             }
+             case 0x74: // EATANxy
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
++                const float x = vuNormOperand(m_state.vf[vfS][0]);
++                const float y = vuNormOperand(m_state.vf[vfS][1]);
+                 queueP(x != 0.0f ? vuEatan(y / x) : 0.0f, 54u);
+                 return;
+             }
+             case 0x75: // EATANxz
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormOperand(m_state.vf[vfS][0]);
++                const float z = vuNormOperand(m_state.vf[vfS][2]);
+                 queueP(x != 0.0f ? vuEatan(z / x) : 0.0f, 54u);
+                 return;
+             }
+@@ -719,14 +719,14 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             {
+                 float sum = 0.0f;
+                 for (uint32_t component = 0; component < 4u; ++component)
+-                    sum += normalizeOperand(m_state.vf[vfS][component]);
++                    sum += vuNormOperand(m_state.vf[vfS][component]);
+                 queueP(sum, 12u);
+                 return;
+             }
+             case 0x77: // ERSQRT
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
++                const float value = vuNormOperand(m_state.vf[vfS][component]);
+                 float result = value;
+                 if (result >= 0.0f)
+                 {
+@@ -740,21 +740,21 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             case 0x78: // ESQRT
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
++                const float value = vuNormOperand(m_state.vf[vfS][component]);
+                 queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
+                 return;
+             }
+             case 0x79: // ESIN
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
++                const float value = vuNormOperand(m_state.vf[vfS][component]);
+                 queueP(vuEsin(value), 29u);
+                 return;
+             }
+             case 0x7A: // ERCPR
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
++                const float value = vuNormOperand(m_state.vf[vfS][component]);
+                 queueP(value != 0.0f ? 1.0f / value : value, 12u);
+                 return;
+             }
+@@ -763,13 +763,13 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             case 0x7C: // EATAN
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
++                queueP(vuEatan(vuNormOperand(m_state.vf[vfS][component])), 54u);
+                 return;
+             }
+             case 0x7D: // EEXP
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
++                queueP(vuEexp(vuNormOperand(m_state.vf[vfS][component])), 44u);
+                 return;
+             }
+             default:
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+index 6974254..64f337e 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -36,15 +36,15 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     float normalizedAcc[4];
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
+-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
+-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
++        normalizedVs[component] = vuNormOperand(m_state.vf[fs][component]);
++        normalizedVt[component] = vuNormOperand(m_state.vf[ft][component]);
++        normalizedAcc[component] = vuNormOperand(m_state.acc[component]);
+     }
+     const float *vs = normalizedVs;
+     const float *vt = normalizedVt;
+     const float *acc = normalizedAcc;
+-    const float q = normalizeOperand(m_state.q);
+-    const float i = normalizeOperand(m_state.i);
++    const float q = vuNormOperand(m_state.q);
++    const float i = vuNormOperand(m_state.i);
+     float result[4];
+ 
+     // Upper opcode decoding (bits 5:0 of upper word)
+@@ -55,7 +55,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x02:
+     case 0x03: // ADDbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = vuNormOperand(vt[(op & 3) & 3u]);
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] + bc;
+         applyFmacDest(vd, result, dest);
+@@ -66,7 +66,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x06:
+     case 0x07: // SUBbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = vuNormOperand(vt[(op & 3) & 3u]);
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] - bc;
+         applyFmacDest(vd, result, dest);
+@@ -77,7 +77,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x0A:
+     case 0x0B: // MADDbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = vuNormOperand(vt[(op & 3) & 3u]);
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] + vs[c] * bc;
+         applyFmacDest(vd, result, dest);
+@@ -88,7 +88,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x0E:
+     case 0x0F: // MSUBbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = vuNormOperand(vt[(op & 3) & 3u]);
+         for (int c = 0; c < 4; c++)
+             result[c] = acc[c] - vs[c] * bc;
+         applyFmacDest(vd, result, dest);
+@@ -99,7 +99,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x12:
+     case 0x13: // MAXbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = vuNormOperand(vt[(op & 3) & 3u]);
+         for (int c = 0; c < 4; c++)
+             result[c] = (vs[c] > bc) ? vs[c] : bc;
+         applyDest(vd, result, dest);
+@@ -110,7 +110,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x16:
+     case 0x17: // MINIbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = vuNormOperand(vt[(op & 3) & 3u]);
+         for (int c = 0; c < 4; c++)
+             result[c] = (vs[c] < bc) ? vs[c] : bc;
+         applyDest(vd, result, dest);
+@@ -121,7 +121,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x1A:
+     case 0x1B: // MULbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = vuNormOperand(vt[(op & 3) & 3u]);
+         for (int c = 0; c < 4; c++)
+             result[c] = vs[c] * bc;
+         applyFmacDest(vd, result, dest);
+@@ -249,7 +249,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x02:
+         case 0x03: // ADDAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = vuNormOperand(vt[(specialOp & 3) & 3u]);
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] + bc;
+             applyFmacDestAcc(result, dest);
+@@ -260,7 +260,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x06:
+         case 0x07: // SUBAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = vuNormOperand(vt[(specialOp & 3) & 3u]);
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] - bc;
+             applyFmacDestAcc(result, dest);
+@@ -271,7 +271,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x0A:
+         case 0x0B: // MADDAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = vuNormOperand(vt[(specialOp & 3) & 3u]);
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] + vs[c] * bc;
+             applyFmacDestAcc(result, dest);
+@@ -282,7 +282,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x0E:
+         case 0x0F: // MSUBAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = vuNormOperand(vt[(specialOp & 3) & 3u]);
+             for (int c = 0; c < 4; c++)
+                 result[c] = acc[c] - vs[c] * bc;
+             applyFmacDestAcc(result, dest);
+@@ -361,7 +361,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x1A:
+         case 0x1B: // MULAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = vuNormOperand(vt[(specialOp & 3) & 3u]);
+             for (int c = 0; c < 4; c++)
+                 result[c] = vs[c] * bc;
+             applyFmacDestAcc(result, dest);

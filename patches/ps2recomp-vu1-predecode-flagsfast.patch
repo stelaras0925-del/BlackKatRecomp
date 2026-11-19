@@ -1,0 +1,434 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -347,6 +347,69 @@
+         static const bool on = []() { const char *e = std::getenv("PS2X_VU1_BLOCKEXEC_RES"); return !(e && e[0] == '0'); }();
+         return on;
+     }
++    bool vu1FlagsFastOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_FLAGSFAST"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // PS2X_VU1_PREDECODE=0: block pairs dispatch the upper through doUpper(). On (default): the
++    // upper is classified once per image (Vu1Xlat::upPre: NOP / FMAC kind+source+ACC dest /
++    // other) and the block loop calls the FMAC core directly.
++    bool vu1PreDecodeOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_PREDECODE"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // Same dispatch as fastUpper (block-cache loop mode): 0xFE NOP, 0xFF anything not reaching the
++    // FMAC core (or dest == 0, which fastUpper hands to execUpper), else kind | src << 3 | toAcc << 5.
++    inline uint8_t vu1UpperPre(uint32_t instr)
++    {
++        const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
++        const bool toAcc = op >= 0x3Cu;
++        const uint8_t code = toAcc ? static_cast<uint8_t>((instr & 3u) | ((instr >> 4) & 0x7Cu)) : op;
++        if (!toAcc && ((op >= 0x10u && op <= 0x17u) || op == 0x1Du || op == 0x1Fu || op == 0x2Bu || op == 0x2Fu))
++            return 0xFFu;
++        if (toAcc)
++        {
++            if (code == 0x2Fu || code == 0x30u)
++                return 0xFEu;
++            if ((code >= 0x10u && code <= 0x17u) || code == 0x1Du || code == 0x1Fu)
++                return 0xFFu;
++        }
++        int kind, src;
++        if (code <= 0x0Fu)
++        {
++            static constexpr int kinds[4] = {0, 1, 3, 4};
++            kind = kinds[code >> 2];
++            src = 0;
++        }
++        else if (code >= 0x18u && code <= 0x1Bu) { kind = 2; src = 0; }
++        else
++        {
++            switch (code)
++            {
++            case 0x1Cu: kind = 2; src = 1; break;
++            case 0x1Eu: kind = 2; src = 2; break;
++            case 0x20u: kind = 0; src = 1; break;
++            case 0x21u: kind = 3; src = 1; break;
++            case 0x22u: kind = 0; src = 2; break;
++            case 0x23u: kind = 3; src = 2; break;
++            case 0x24u: kind = 1; src = 1; break;
++            case 0x25u: kind = 4; src = 1; break;
++            case 0x26u: kind = 1; src = 2; break;
++            case 0x27u: kind = 4; src = 2; break;
++            case 0x28u: kind = 0; src = 3; break;
++            case 0x29u: kind = 3; src = 3; break;
++            case 0x2Au: kind = 2; src = 3; break;
++            case 0x2Cu: kind = 1; src = 3; break;
++            case 0x2Du: kind = 4; src = 3; break;
++            default: return 0xFFu;
++            }
++        }
++        if (((instr >> 21) & 0xFu) == 0u)
++            return 0xFFu;
++        return static_cast<uint8_t>(kind | (src << 3) | (toAcc ? 0x20 : 0));
++    }
+     bool vu1BlockExecOn()
+     {
+         static const bool on = []() { const char *e = std::getenv("PS2X_VU1_BLOCKEXEC"); return !(e && e[0] == '0'); }();
+@@ -519,6 +582,7 @@
+         // simple). Simple: slot lists fit the fixed 16-slot scan, no E/D/T/M bit, no VF shadow,
+         // lower is not a branch / XGKICK / FDIV / EFU / WAITQ / WAITP.
+         std::vector<uint8_t> beLen;
++        std::vector<uint8_t> upPre; // vu1UpperPre() of each pair's upper
+         uint32_t noStallPairs = 0;
+         uint32_t writers = 0;
+         uint32_t dead = 0;
+@@ -2853,6 +2917,9 @@
+                     }
+                 }
+                 x->beLen.assign(n + 1u, 0u);
++                x->upPre.assign(n, 0xFFu);
++                for (uint32_t k = 0; k < n; ++k)
++                    x->upPre[k] = vu1UpperPre(m_decodedCodeCache[k].upper);
+                 std::vector<uint8_t> beBranch(n + 1u, 0u);
+                 const bool beBranchOn = vu1BlockExecBranchOn();
+                 const bool beResOn = vu1BlockExecResOn(); // simple except that the lower is a branch
+@@ -2904,6 +2971,7 @@
+     // unchanged and the flags are just the signs); otherwise it returns false and execUpper
+     // runs the generic code. No state is touched before that decision.
+     const bool fastUpperOn = tl_runXlat != nullptr && !vu1ExactFlagsOnly() && !vu1FlagCheck();
++    const Vu1Xlat *const runXlFlags = (tl_runXlat != nullptr && tl_runOwner == this) ? tl_runXlat : nullptr;
+     const bool loopOn = tl_runXlat != nullptr && vu1LoopOn();
+     const bool zeroOn = tl_runXlat != nullptr && vu1FastZeroOn();
+     const bool fastLowerOn = tl_runXlat != nullptr && vu1FastLowerOn();
+@@ -2919,6 +2987,186 @@
+                            reinterpret_cast<const char *>(&m_accReady[0]) == reinterpret_cast<const char *>(flatRdy + 144);
+     const bool fixedScan = flatRdyOn && vu1FixedScanOn();
+     const bool stallOnce = vu1StallOnceOn();
++    // PS2X_VU1_FLAGSFAST=0: FMAC flags go through updateFmacFlags(). On (default): this inline
++    // copy with the run-constant checks hoisted (same dead-entry rule, sticky carry, slot choice
++    // and entry contents).
++    const bool flagsFast = vu1FlagsFastOn() && runXlFlags != nullptr && !tl_bcSuppress;
++    const uint8_t *const flagDeadArr = flagsFast ? runXlFlags->flagDead.data() : nullptr;
++    const uint32_t flagDeadCount = flagsFast ? static_cast<uint32_t>(runXlFlags->flagDead.size()) : 0u;
++    const auto fmacFlagsFast = [&](const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky) {
++        if (dest == 0u)
++            return;
++        const uint32_t pairIndex = m_state.pc / 8u;
++        if (pairIndex < flagDeadCount && flagDeadArr[pairIndex] && m_cycle + 1024u < budgetEnd && !m_stopRequested)
++        {
++            uint32_t sticky = extraSticky;
++            for (uint32_t component = 0; component < 4u; ++component)
++                if ((dest & laneForComponent(component)) != 0u)
++                    sticky |= laneFlags[component];
++            if (tl_carryOwner != this)
++            {
++                tl_carryOwner = this;
++                tl_carry = 0u;
++            }
++            tl_carry |= sticky & 0xFu;
++            if (vu1BcStats())
++                g_bcSkipped.fetch_add(1, std::memory_order_relaxed);
++            return;
++        }
++        if (tl_carryOwner == this && tl_carry != 0u)
++        {
++            extraSticky |= tl_carry;
++            tl_carry = 0u;
++        }
++        uint32_t mac = 0u;
++        uint32_t status = 0u;
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            const uint32_t lane = laneForComponent(component);
++            const uint32_t flags = (dest & lane) != 0u ? laneFlags[component] : 0u;
++            mac |= ((flags & 0x1u) ? lane : 0u) | ((flags & 0x2u) ? lane << 4 : 0u) |
++                   ((flags & 0x4u) ? lane << 8 : 0u) | ((flags & 0x8u) ? lane << 12 : 0u);
++            status |= flags;
++        }
++        FlagPipelineEntry *entry = nullptr;
++        for (FlagPipelineEntry &candidate : m_flagPipeline)
++        {
++            if (!candidate.valid)
++            {
++                entry = &candidate;
++                break;
++            }
++        }
++        if (!entry)
++        {
++            reportReservedInstruction(true, 0xFFFFFFFFu);
++            return;
++        }
++        *entry = {};
++        entry->valid = true;
++        if (tl_pm.owner == this)
++            tl_pm.flag |= 1u << static_cast<uint32_t>(entry - m_flagPipeline.data());
++        entry->issueCycle = m_cycle;
++        entry->readyCycle = m_cycle + kFmacLatency;
++        vu1NoteReady(this, entry->readyCycle);
++        entry->mac = mac;
++        entry->status = status;
++        entry->extraSticky = extraSticky;
++        entry->writesMac = true;
++        entry->writesStatus = true;
++    };
++    // FMAC ADD/SUB/MUL/MADD/MSUB core of fastUpper (kind 0..4, src 0 bc / 1 q / 2 i / 3 vector).
++    const auto fmacCore = [&](uint32_t instr, int kind, int src, bool toAcc) -> bool {
++        const uint8_t dest = DEST(instr);
++        if (dest == 0u)
++            return false;
++        const uint8_t fs = FS(instr);
++        const uint8_t ft = FT(instr);
++        float t[4];
++        if (src == 0)
++            t[0] = t[1] = t[2] = t[3] = vuNormOperand(m_state.vf[ft][instr & 3u]);
++        else if (src == 1)
++            t[0] = t[1] = t[2] = t[3] = vuNormOperand(m_state.q);
++        else if (src == 2)
++            t[0] = t[1] = t[2] = t[3] = vuNormOperand(m_state.i);
++        else
++            for (uint32_t c = 0; c < 4u; ++c)
++                t[c] = vuNormOperand(m_state.vf[ft][c]);
++        float res[4];
++        uint8_t laneFlags[4] = {0u, 0u, 0u, 0u};
++        uint32_t sticky = 0u;
++        if (simdOn)
++        {
++            if (!vu1FmacSimd(kind, dest, zeroOn, m_state.vf[fs], t, m_state.acc, res, laneFlags, sticky))
++                return false;
++        }
++        else
++        for (uint32_t c = 0; c < 4u; ++c)
++        {
++            if ((dest & laneForComponent(c)) == 0u)
++                continue;
++            const float sv = vuNormOperand(m_state.vf[fs][c]);
++            if (zeroOn)
++            {
++                // Exactly-zero results (the long-double path gives the same signed zero, flags Z|S):
++                // MUL with a zero operand, ADD of opposites, SUB of equals.
++                if ((kind == 2 && (sv == 0.0f || t[c] == 0.0f)) || (kind == 0 && sv == -t[c]) ||
++                    (kind == 1 && sv == t[c]))
++                {
++                    const float r0 = kind == 0 ? sv + t[c] : kind == 1 ? sv - t[c] : sv * t[c];
++                    uint32_t b0;
++                    std::memcpy(&b0, &r0, 4);
++                    laneFlags[c] = static_cast<uint8_t>(0x1u | ((b0 & 0x80000000u) ? 0x2u : 0x0u));
++                    res[c] = r0;
++                    continue;
++                }
++                // MADD/MSUB with a zero product: the product is an exact signed zero (sticky Z|S),
++                // and acc +- 0 is acc (normalised, so in range) or a signed zero.
++                if ((kind == 3 || kind == 4) && (sv == 0.0f || t[c] == 0.0f))
++                {
++                    const float a = vuNormOperand(m_state.acc[c]);
++                    const float prod = sv * t[c];
++                    const float r0 = kind == 3 ? a + prod : a - prod;
++                    uint32_t pb, rb;
++                    std::memcpy(&pb, &prod, 4);
++                    std::memcpy(&rb, &r0, 4);
++                    sticky |= 0x1u | ((pb & 0x80000000u) ? 0x2u : 0x0u);
++                    laneFlags[c] = static_cast<uint8_t>(((rb & 0x7FFFFFFFu) == 0u ? 0x1u : 0x0u) |
++                                                        ((rb & 0x80000000u) ? 0x2u : 0x0u));
++                    res[c] = r0;
++                    continue;
++                }
++            }
++            float r;
++            if (kind == 0)
++                r = sv + t[c];
++            else if (kind == 1)
++                r = sv - t[c];
++            else if (kind == 2)
++                r = sv * t[c];
++            else
++            {
++                const float a = vuNormOperand(m_state.acc[c]);
++                const float prod = sv * t[c];
++                r = kind == 3 ? a + prod : a - prod;
++                uint32_t pbits, abits;
++                std::memcpy(&pbits, &prod, 4);
++                std::memcpy(&abits, &a, 4);
++                const uint32_t pexp = (pbits >> 23) & 0xFFu;
++                if (pexp < 3u || pexp > 252u || ((abits >> 23) & 0xFFu) > 252u)
++                    return false;
++                const double ra = std::fabs(static_cast<double>(r));
++                if (!(ra * 1048576.0 >= std::fabs(static_cast<double>(a)) + ra))
++                    return false;
++                sticky |= (pbits & 0x80000000u) ? 0x2u : 0x0u;
++            }
++            uint32_t rbits;
++            std::memcpy(&rbits, &r, 4);
++            const uint32_t rexp = (rbits >> 23) & 0xFFu;
++            if (rexp < 3u || rexp > 252u)
++                return false;
++            laneFlags[c] = (rbits & 0x80000000u) ? 0x2u : 0x0u;
++            res[c] = r;
++        }
++        static const bool s_break = []() { const char *e = std::getenv("PS2X_VU1_BC_BREAK"); return e && e[0] == '1'; }();
++        if (s_break && (dest & 0x8u) && kind == 3) // checker self-test only: perturb MADD x by 1 ulp
++        {
++            uint32_t b;
++            std::memcpy(&b, &res[0], 4);
++            b ^= 1u;
++            std::memcpy(&res[0], &b, 4);
++        }
++        m_currentUpperInstruction = instr;
++        if (flagsFast)
++            fmacFlagsFast(laneFlags, dest, sticky);
++        else
++            updateFmacFlags(laneFlags, dest, sticky);
++        float *dst = toAcc ? m_state.acc : m_state.vf[FD(instr)];
++        for (uint32_t c = 0; c < 4u; ++c)
++            if ((dest & laneForComponent(c)) != 0u)
++                dst[c] = res[c];
++        return true;
++    };
+     const auto fastUpper = [&](uint32_t instr) -> bool {
+         const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
+         const bool toAcc = op >= 0x3Cu;
+@@ -3063,112 +3311,7 @@
+             default: return false;
+             }
+         }
+-        const uint8_t dest = DEST(instr);
+-        if (dest == 0u)
+-            return false;
+-        const uint8_t fs = FS(instr);
+-        const uint8_t ft = FT(instr);
+-        float t[4];
+-        if (src == 0)
+-            t[0] = t[1] = t[2] = t[3] = vuNormOperand(m_state.vf[ft][code & 3u]);
+-        else if (src == 1)
+-            t[0] = t[1] = t[2] = t[3] = vuNormOperand(m_state.q);
+-        else if (src == 2)
+-            t[0] = t[1] = t[2] = t[3] = vuNormOperand(m_state.i);
+-        else
+-            for (uint32_t c = 0; c < 4u; ++c)
+-                t[c] = vuNormOperand(m_state.vf[ft][c]);
+-        float res[4];
+-        uint8_t laneFlags[4] = {0u, 0u, 0u, 0u};
+-        uint32_t sticky = 0u;
+-        if (simdOn)
+-        {
+-            if (!vu1FmacSimd(kind, dest, zeroOn, m_state.vf[fs], t, m_state.acc, res, laneFlags, sticky))
+-                return false;
+-        }
+-        else
+-        for (uint32_t c = 0; c < 4u; ++c)
+-        {
+-            if ((dest & laneForComponent(c)) == 0u)
+-                continue;
+-            const float sv = vuNormOperand(m_state.vf[fs][c]);
+-            if (zeroOn)
+-            {
+-                // Exactly-zero results (the long-double path gives the same signed zero, flags Z|S):
+-                // MUL with a zero operand, ADD of opposites, SUB of equals.
+-                if ((kind == 2 && (sv == 0.0f || t[c] == 0.0f)) || (kind == 0 && sv == -t[c]) ||
+-                    (kind == 1 && sv == t[c]))
+-                {
+-                    const float r0 = kind == 0 ? sv + t[c] : kind == 1 ? sv - t[c] : sv * t[c];
+-                    uint32_t b0;
+-                    std::memcpy(&b0, &r0, 4);
+-                    laneFlags[c] = static_cast<uint8_t>(0x1u | ((b0 & 0x80000000u) ? 0x2u : 0x0u));
+-                    res[c] = r0;
+-                    continue;
+-                }
+-                // MADD/MSUB with a zero product: the product is an exact signed zero (sticky Z|S),
+-                // and acc +- 0 is acc (normalised, so in range) or a signed zero.
+-                if ((kind == 3 || kind == 4) && (sv == 0.0f || t[c] == 0.0f))
+-                {
+-                    const float a = vuNormOperand(m_state.acc[c]);
+-                    const float prod = sv * t[c];
+-                    const float r0 = kind == 3 ? a + prod : a - prod;
+-                    uint32_t pb, rb;
+-                    std::memcpy(&pb, &prod, 4);
+-                    std::memcpy(&rb, &r0, 4);
+-                    sticky |= 0x1u | ((pb & 0x80000000u) ? 0x2u : 0x0u);
+-                    laneFlags[c] = static_cast<uint8_t>(((rb & 0x7FFFFFFFu) == 0u ? 0x1u : 0x0u) |
+-                                                        ((rb & 0x80000000u) ? 0x2u : 0x0u));
+-                    res[c] = r0;
+-                    continue;
+-                }
+-            }
+-            float r;
+-            if (kind == 0)
+-                r = sv + t[c];
+-            else if (kind == 1)
+-                r = sv - t[c];
+-            else if (kind == 2)
+-                r = sv * t[c];
+-            else
+-            {
+-                const float a = vuNormOperand(m_state.acc[c]);
+-                const float prod = sv * t[c];
+-                r = kind == 3 ? a + prod : a - prod;
+-                uint32_t pbits, abits;
+-                std::memcpy(&pbits, &prod, 4);
+-                std::memcpy(&abits, &a, 4);
+-                const uint32_t pexp = (pbits >> 23) & 0xFFu;
+-                if (pexp < 3u || pexp > 252u || ((abits >> 23) & 0xFFu) > 252u)
+-                    return false;
+-                const double ra = std::fabs(static_cast<double>(r));
+-                if (!(ra * 1048576.0 >= std::fabs(static_cast<double>(a)) + ra))
+-                    return false;
+-                sticky |= (pbits & 0x80000000u) ? 0x2u : 0x0u;
+-            }
+-            uint32_t rbits;
+-            std::memcpy(&rbits, &r, 4);
+-            const uint32_t rexp = (rbits >> 23) & 0xFFu;
+-            if (rexp < 3u || rexp > 252u)
+-                return false;
+-            laneFlags[c] = (rbits & 0x80000000u) ? 0x2u : 0x0u;
+-            res[c] = r;
+-        }
+-        static const bool s_break = []() { const char *e = std::getenv("PS2X_VU1_BC_BREAK"); return e && e[0] == '1'; }();
+-        if (s_break && (dest & 0x8u) && kind == 3) // checker self-test only: perturb MADD x by 1 ulp
+-        {
+-            uint32_t b;
+-            std::memcpy(&b, &res[0], 4);
+-            b ^= 1u;
+-            std::memcpy(&res[0], &b, 4);
+-        }
+-        m_currentUpperInstruction = instr;
+-        updateFmacFlags(laneFlags, dest, sticky);
+-        float *dst = toAcc ? m_state.acc : m_state.vf[FD(instr)];
+-        for (uint32_t c = 0; c < 4u; ++c)
+-            if ((dest & laneForComponent(c)) != 0u)
+-                dst[c] = res[c];
+-        return true;
++        return fmacCore(instr, kind, src, toAcc);
+     };
+     static const bool s_opStats = []() { const char *e = std::getenv("PS2X_VU1_OPSTATS"); return e && e[0] == '1'; }();
+     const auto doUpper = [&](uint32_t instr) {
+@@ -3394,8 +3537,11 @@
+                       inlineAdv && !s_vu1Prof && !s_opStats && !runXl->beLen.empty() &&
+                       !std::getenv("PS2X_VU1_FAST_NOSTALL");
+     const uint8_t *const beLenArr = beOn ? runXl->beLen.data() : nullptr;
++
+     static const bool beStats = []() { const char *e = std::getenv("PS2X_VU1_BESTATS"); return e && e[0] == '1'; }();
+     const uint32_t beCount = beOn ? static_cast<uint32_t>(runXl->beLen.size() - 1u) : 0u;
++    const bool preOn = beOn && fastUpperOn && vu1PreDecodeOn() && runXl->upPre.size() >= beCount;
++    const uint8_t *const upPreArr = preOn ? runXl->upPre.data() : nullptr;
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         if (!skipCommitOn || committedCycle != m_cycle)
+@@ -3483,7 +3629,21 @@
+                         writtenVi = static_cast<uint8_t>(__builtin_ctz(viW));
+                         oldVi = m_state.vi[writtenVi];
+                     }
+-                    doUpper(decoded.upper);
++                    if (preOn)
++                    {
++                        const uint8_t up = upPreArr[idx];
++                        if (up == 0xFEu)
++                            m_currentUpperInstruction = decoded.upper;
++                        else if (up != 0xFFu)
++                        {
++                            if (!fmacCore(decoded.upper, up & 7u, (up >> 3) & 3u, (up & 0x20u) != 0u))
++                                execUpper(decoded.upper);
++                        }
++                        else
++                            doUpper(decoded.upper);
++                    }
++                    else
++                        doUpper(decoded.upper);
+                     if (decoded.iBit)
+                     {
+                         float immediate = 0.0f;

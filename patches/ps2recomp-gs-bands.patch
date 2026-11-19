@@ -1,0 +1,560 @@
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -123,19 +123,38 @@
+ // ---------------------------------------------------------------------------
+ #include <chrono>
+ #include <condition_variable>
++#include <memory>
++#include <vector>
+ #include <string>
+ #include <deque>
+ #include <mutex>
+ #include <thread>
+ namespace
+ {
++    // Multi-worker banded rasterizer. Worker k owns framebuffer rows y with
++    // (y / kBandRows) % N == k and draws each primitive only inside its bands
++    // (by narrowing the scissor; interpolation uses unclipped vertex data, so
++    // pixels are identical). Every worker has its own GSCpuBackend (texture
++    // page cache, CLUT) on the shared VRAM and sees the same ordered command
++    // stream. VRAM-mutating non-draw ops (transfers, uploads, WriteVram) are
++    // barriers: all workers arrive, the last executes on worker 0's backend
++    // and flushes every texture cache. A draw that samples (or a CLUT load
++    // that reads) memory written by draws since the last barrier also gets a
++    // barrier first, so cross-band render-to-texture stays ordered.
+     class GSThreadedBackend final : public GSRasterBackend
+     {
+     public:
+-        explicit GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
+-            : m_inner(std::move(inner))
++        static constexpr int kBandRows = 16;
++
++        GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner, int threads)
+         {
+-            m_worker = std::thread([this]() { workerLoop(); });
++            m_n = std::max(1, std::min(threads, 16));
++            m_workers.resize(static_cast<size_t>(m_n));
++            m_workers[0].be = std::move(inner);
++            for (int i = 1; i < m_n; ++i)
++                m_workers[i].be = std::make_unique<GSCpuBackend>();
++            for (int i = 0; i < m_n; ++i)
++                m_workers[i].th = std::thread([this, i]() { workerLoop(i); });
+         }
+         ~GSThreadedBackend() override
+         {
+@@ -144,190 +163,400 @@
+                 std::lock_guard<std::mutex> lk(m_mutex);
+                 m_quit = true;
+             }
+-            m_cv.notify_all();
+-            if (m_worker.joinable())
+-                m_worker.join();
++            for (auto &w : m_workers)
++                w.cv.notify_all();
++            for (auto &w : m_workers)
++                if (w.th.joinable())
++                    w.th.join();
+         }
+ 
+-        void Initialize(uint8_t *vram, uint32_t vramSize) override { drain(0); m_inner->Initialize(vram, vramSize); }
+-        void Reset() override { drain(0); m_inner->Reset(); }
++        void Initialize(uint8_t *vram, uint32_t vramSize) override
++        {
++            drain(0);
++            for (auto &w : m_workers)
++                w.be->Initialize(vram, vramSize);
++        }
++        void Reset() override
++        {
++            drain(0);
++            for (auto &w : m_workers)
++                w.be->Reset();
++            m_written.clear();
++        }
+ 
+         void Submit(const GSPrimitiveBatch &batch) override
+         {
++            if (m_n > 1)
++                trackDraw(batch);
+             Cmd c;
+             c.type = Cmd::SubmitT;
+             c.batch = batch;
+-            push(std::move(c));
++            pushAll(std::move(c));
+         }
+         void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
+         {
++            if (m_n > 1 && overlapsWritten(static_cast<uint64_t>(tex0.cbp) * 256u, 1024u))
++                pushBarrier(BarrierKind::Hazard);
+             Cmd c;
+             c.type = Cmd::ClutT;
+             c.tex0 = tex0;
+             c.clut = texclut;
+-            push(std::move(c));
++            pushAll(std::move(c));
+         }
+         void BeginTransfer(const GSTransferCommand &command) override
+         {
+-            Cmd c;
+-            c.type = Cmd::TransferT;
+-            c.transfer = command;
+-            push(std::move(c));
++            auto op = std::make_shared<Barrier>();
++            op->kind = BarrierKind::Transfer;
++            op->transfer = command;
++            pushBarrierOp(std::move(op));
+         }
+         void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
+         {
+             if (!data || sizeBytes == 0u)
+                 return;
+-            Cmd c;
+-            c.type = Cmd::UploadT;
+-            c.data.assign(data, data + sizeBytes);
+-            push(std::move(c));
+-        }
+-        // Flush and Sync(Finish) must drain: letting the EE run past FINISH
+-        // (tried 2026-11-11) produced corrupted gameplay frames and stalled
+-        // the host present for tens of seconds.
+-        void Flush() override { drain(1); m_inner->Flush(); }
+-        void Sync(GSSyncReason reason) override { drain(2); m_inner->Sync(reason); }
++            auto op = std::make_shared<Barrier>();
++            op->kind = BarrierKind::Upload;
++            op->data.assign(data, data + sizeBytes);
++            pushBarrierOp(std::move(op));
++        }
++        void Flush() override { drain(1); m_workers[0].be->Flush(); }
++        void Sync(GSSyncReason reason) override { drain(2); m_workers[0].be->Sync(reason); }
+         void TextureFlush() override
+         {
+             Cmd c;
+             c.type = Cmd::TexFlushT;
+-            push(std::move(c));
++            pushAll(std::move(c));
++        }
++        PresentationFrame Present(const GSPresentationRequest &request) override { drain(3); return m_workers[0].be->Present(request); }
++        bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
++        {
++            drain(4);
++            const bool r = m_workers[0].be->ClearFramebuffer(context, rgba);
++            flushAllCaches();
++            m_written.clear();
++            return r;
+         }
+-        PresentationFrame Present(const GSPresentationRequest &request) override { drain(3); return m_inner->Present(request); }
+-        bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override { drain(4); return m_inner->ClearFramebuffer(context, rgba); }
+-        uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override { drain(5); return m_inner->ConsumeLocalToHostBytes(dst, maxBytes); }
++        uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override { drain(5); return m_workers[0].be->ConsumeLocalToHostBytes(dst, maxBytes); }
+         uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
+         {
+             drain(6);
+-            return m_inner->ReadVram(psm, base, bw, x, y);
++            return m_workers[0].be->ReadVram(psm, base, bw, x, y);
+         }
+         void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
+         {
+-            Cmd c;
+-            c.type = Cmd::WriteT;
+-            c.w[0] = psm; c.w[1] = base; c.w[2] = bw; c.w[3] = x; c.w[4] = y; c.w[5] = value;
+-            push(std::move(c));
++            auto op = std::make_shared<Barrier>();
++            op->kind = BarrierKind::Write;
++            op->w[0] = psm; op->w[1] = base; op->w[2] = bw; op->w[3] = x; op->w[4] = y; op->w[5] = value;
++            pushBarrierOp(std::move(op));
+         }
+-        void SnapshotVram(std::vector<uint8_t> &out) const override { drain(7); m_inner->SnapshotVram(out); }
+-        GSTransferSnapshot GetTransferSnapshot() const override { return m_inner->GetTransferSnapshot(); }
++        void SnapshotVram(std::vector<uint8_t> &out) const override { drain(7); m_workers[0].be->SnapshotVram(out); }
++        GSTransferSnapshot GetTransferSnapshot() const override { return m_workers[0].be->GetTransferSnapshot(); }
+ 
+     private:
++        enum class BarrierKind : uint8_t { Hazard, Transfer, Upload, Write };
++        struct Barrier
++        {
++            BarrierKind kind = BarrierKind::Hazard;
++            GSTransferCommand transfer{};
++            std::vector<uint8_t> data;
++            uint32_t w[6] = {};
++            int arrived = 0;
++            bool done = false;
++        };
+         struct Cmd
+         {
+-            enum Type : uint8_t { SubmitT, ClutT, TransferT, UploadT, TexFlushT, WriteT } type = SubmitT;
++            enum Type : uint8_t { SubmitT, ClutT, TexFlushT, BarrierT } type = SubmitT;
+             GSPrimitiveBatch batch{};
+             GSTex0Reg tex0{};
+             GSTexClutReg clut{};
+-            GSTransferCommand transfer{};
+-            std::vector<uint8_t> data;
+-            uint32_t w[6] = {};
++            std::shared_ptr<Barrier> barrier;
++        };
++        struct Worker
++        {
++            std::unique_ptr<GSRasterBackend> be;
++            std::deque<Cmd> q;
++            uint64_t submitted = 0;
++            uint64_t completed = 0;
++            bool idle = false;
++            std::condition_variable cv;
++            std::thread th;
+         };
+ 
+-        void push(Cmd &&c)
++        static uint32_t psmBits(uint32_t psm)
+         {
+-            bool wake;
++            switch (psm & 0x3Fu)
+             {
+-                std::lock_guard<std::mutex> lk(m_mutex);
+-                m_queue.push_back(std::move(c));
+-                ++m_submitted;
+-                wake = m_workerIdle;
++            case 0x02: case 0x0A: case 0x32: case 0x3A: return 16u;
++            case 0x13: return 8u;
++            case 0x14: return 4u;
++            default: return 32u;
+             }
+-            if (wake)
+-                m_cv.notify_one();
+         }
+-
+-        // PS2X_GS_THREAD_STATS=1: every ~5 s log drains per reason, how many
+-        // had to wait, and the total wait time.
+-        void drain(int why) const
++        // Conservative byte range of a buffer: base bytes + width x height at
++        // psm depth, rounded up to whole 8 KiB pages plus one page of slack.
++        static void bufRange(uint64_t baseBytes, uint32_t widthPx, uint32_t heightPx, uint32_t psm, uint64_t &lo, uint64_t &hi)
++        {
++            const uint64_t bytes = (static_cast<uint64_t>(widthPx) * heightPx * psmBits(psm) + 7u) / 8u;
++            lo = baseBytes;
++            hi = baseBytes + ((bytes + 8191u) / 8192u + 1u) * 8192u;
++        }
++        bool overlapsWritten(uint64_t lo, uint64_t len) const
++        {
++            const uint64_t hi = lo + len;
++            for (const auto &r : m_written)
++                if (lo < r.second && r.first < hi)
++                    return true;
++            return false;
++        }
++        void addWritten(uint64_t lo, uint64_t hi)
+         {
+-            if (std::this_thread::get_id() == m_worker.get_id())
+-                return;
+-            static const bool s_stats = []() { const char *e = std::getenv("PS2X_GS_THREAD_STATS"); return e && e[0] == '1'; }();
+-            std::unique_lock<std::mutex> lk(m_mutex);
+-            const uint64_t target = m_submitted;
+-            if (s_stats)
+-                ++m_drainCalls[why & 7];
+-            if (m_completed >= target)
+-                return;
+-            m_cv.notify_one();
+-            const auto t0 = std::chrono::steady_clock::now();
+-            m_doneCv.wait(lk, [&]() { return m_completed >= target; });
+-            if (s_stats)
+-            {
+-                const auto t1 = std::chrono::steady_clock::now();
+-                ++m_drainWaits[why & 7];
+-                m_drainWaitNs[why & 7] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+-                if (t1 - m_lastStats > std::chrono::seconds(5))
++            for (auto &r : m_written)
++                if (r.first == lo)
+                 {
+-                    m_lastStats = t1;
+-                    static const char *names[8] = {"init/reset", "flush", "sync", "present", "clear", "l2h", "readvram", "snapshot"};
+-                    std::string line = "[gs:thread]";
+-                    for (int i = 0; i < 8; ++i)
+-                        if (m_drainCalls[i])
+-                            line += std::string(" ") + names[i] + "=" + std::to_string(m_drainCalls[i]) + "/" +
+-                                    std::to_string(m_drainWaits[i]) + "w/" + std::to_string(m_drainWaitNs[i] / 1000000ull) + "ms";
+-                    line += " cmds=" + std::to_string(m_submitted);
+-                    std::fprintf(stderr, "%s\n", line.c_str());
++                    r.second = std::max(r.second, hi);
++                    return;
+                 }
++            m_written.emplace_back(lo, hi);
++        }
++        void trackDraw(const GSPrimitiveBatch &batch)
++        {
++            const GSDrawState &st = batch.state;
++            const GSContext &ctx = st.context;
++            if (st.prim.tme)
++            {
++                const GSTex0Reg &t = ctx.tex0;
++                uint64_t lo, hi;
++                const uint32_t tw = 1u << std::min<uint32_t>(t.tw, 10u);
++                const uint32_t th = 1u << std::min<uint32_t>(t.th, 10u);
++                bufRange(static_cast<uint64_t>(t.tbp0) * 256u, std::max<uint32_t>(t.tbw, 1u) * 64u > tw ? std::max<uint32_t>(t.tbw, 1u) * 64u : tw,
++                         th, t.psm, lo, hi);
++                if (overlapsWritten(lo, hi - lo))
++                    pushBarrier(BarrierKind::Hazard);
++            }
++            const uint32_t h = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
++            const uint32_t w = std::max<uint32_t>(ctx.frame.fbw, 1u) * 64u;
++            uint64_t lo, hi;
++            bufRange(static_cast<uint64_t>(ctx.frame.fbp) * 8192u, w, h, ctx.frame.psm, lo, hi);
++            addWritten(lo, hi);
++            if (((ctx.test >> 16) & 1u) && !ctx.zbuf.zmask)
++            {
++                bufRange(static_cast<uint64_t>(ctx.zbuf.zbp) * 8192u, w, h, ctx.zbuf.psm, lo, hi);
++                addWritten(lo, hi);
+             }
+         }
+-        mutable uint64_t m_drainCalls[8] = {};
+-        mutable uint64_t m_drainWaits[8] = {};
+-        mutable uint64_t m_drainWaitNs[8] = {};
+-        mutable std::chrono::steady_clock::time_point m_lastStats{};
+ 
+-        void execute(Cmd &c)
++        void pushAll(Cmd &&c)
++        {
++            std::lock_guard<std::mutex> lk(m_mutex);
++            for (int i = 0; i < m_n; ++i)
++            {
++                Worker &w = m_workers[i];
++                if (i + 1 < m_n)
++                    w.q.push_back(c);
++                else
++                    w.q.push_back(std::move(c));
++                ++w.submitted;
++                if (w.idle)
++                    w.cv.notify_one();
++            }
++        }
++        void pushBarrier(BarrierKind kind)
++        {
++            auto op = std::make_shared<Barrier>();
++            op->kind = kind;
++            pushBarrierOp(std::move(op));
++        }
++        void pushBarrierOp(std::shared_ptr<Barrier> op)
++        {
++            m_written.clear();
++            ++m_barriers;
++            Cmd c;
++            c.type = Cmd::BarrierT;
++            c.barrier = std::move(op);
++            pushAll(std::move(c));
++        }
++        void flushAllCaches()
++        {
++            for (auto &w : m_workers)
++                w.be->TextureFlush();
++        }
++        void executeBarrier(Barrier &b)
++        {
++            GSRasterBackend &be0 = *m_workers[0].be;
++            switch (b.kind)
++            {
++            case BarrierKind::Hazard: break;
++            case BarrierKind::Transfer: be0.BeginTransfer(b.transfer); break;
++            case BarrierKind::Upload: be0.UploadImage(b.data.data(), static_cast<uint32_t>(b.data.size())); break;
++            case BarrierKind::Write: be0.WriteVram(b.w[0], b.w[1], b.w[2], b.w[3], b.w[4], b.w[5]); break;
++            }
++            if (m_n > 1)
++                flushAllCaches();
++        }
++
++        void drawBanded(int k, GSPrimitiveBatch &batch)
+         {
+-            switch (c.type)
++            GSRasterBackend &be = *m_workers[k].be;
++            if (m_n == 1)
+             {
+-            case Cmd::SubmitT: m_inner->Submit(c.batch); break;
+-            case Cmd::ClutT: m_inner->LoadClut(c.tex0, c.clut); break;
+-            case Cmd::TransferT: m_inner->BeginTransfer(c.transfer); break;
+-            case Cmd::UploadT: m_inner->UploadImage(c.data.data(), static_cast<uint32_t>(c.data.size())); break;
+-            case Cmd::TexFlushT: m_inner->TextureFlush(); break;
+-            case Cmd::WriteT: m_inner->WriteVram(c.w[0], c.w[1], c.w[2], c.w[3], c.w[4], c.w[5]); break;
++                be.Submit(batch);
++                return;
++            }
++            GSScissorReg &sc = batch.state.context.scissor;
++            const int ofy = batch.state.context.xyoffset.ofy >> 4;
++            const int cnt = std::max<int>(1, std::min<int>(batch.vertexCount, 3));
++            float ymin = batch.vertices[0].y, ymax = ymin;
++            for (int i = 1; i < cnt; ++i)
++            {
++                ymin = std::min(ymin, batch.vertices[i].y);
++                ymax = std::max(ymax, batch.vertices[i].y);
++            }
++            int y0 = static_cast<int>(std::floor(ymin)) - ofy - 1;
++            int y1 = static_cast<int>(std::ceil(ymax)) - ofy + 1;
++            const int s0 = sc.y0, s1 = sc.y1;
++            y0 = std::max(y0, s0);
++            y1 = std::min(y1, s1);
++            if (y0 > y1)
++                return;
++            for (int band = y0 / kBandRows; band * kBandRows <= y1; ++band)
++            {
++                if (band % m_n != k)
++                    continue;
++                const int b0 = std::max(s0, band * kBandRows);
++                const int b1 = std::min(s1, band * kBandRows + kBandRows - 1);
++                if (b0 > b1)
++                    continue;
++                sc.y0 = static_cast<uint16_t>(b0);
++                sc.y1 = static_cast<uint16_t>(b1);
++                be.Submit(batch);
+             }
+         }
+ 
+-        void workerLoop()
++        void workerLoop(int k)
+         {
++            Worker &self = m_workers[k];
+             std::deque<Cmd> local;
+             std::unique_lock<std::mutex> lk(m_mutex);
+             for (;;)
+             {
+-                m_workerIdle = true;
+-                m_cv.wait(lk, [&]() { return m_quit || !m_queue.empty(); });
+-                m_workerIdle = false;
+-                if (m_queue.empty() && m_quit)
++                self.idle = true;
++                self.cv.wait(lk, [&]() { return m_quit || !self.q.empty(); });
++                self.idle = false;
++                if (self.q.empty() && m_quit)
+                     return;
+-                local.swap(m_queue);
++                local.swap(self.q);
+                 lk.unlock();
+                 uint64_t n = 0;
+                 for (Cmd &c : local)
+                 {
+-                    execute(c);
++                    switch (c.type)
++                    {
++                    case Cmd::SubmitT: drawBanded(k, c.batch); break;
++                    case Cmd::ClutT: self.be->LoadClut(c.tex0, c.clut); break;
++                    case Cmd::TexFlushT: self.be->TextureFlush(); break;
++                    case Cmd::BarrierT:
++                    {
++                        Barrier &b = *c.barrier;
++                        std::unique_lock<std::mutex> bl(m_mutex);
++                        if (++b.arrived == m_n)
++                        {
++                            bl.unlock();
++                            executeBarrier(b);
++                            bl.lock();
++                            b.done = true;
++                            m_barrierCv.notify_all();
++                        }
++                        else
++                        {
++                            m_barrierCv.wait(bl, [&]() { return b.done; });
++                        }
++                        break;
++                    }
++                    }
+                     ++n;
+                 }
+                 local.clear();
+                 lk.lock();
+-                m_completed += n;
++                self.completed += n;
+                 m_doneCv.notify_all();
+             }
+         }
+ 
+-        std::unique_ptr<GSRasterBackend> m_inner;
++        bool allDone() const
++        {
++            for (const auto &w : m_workers)
++                if (w.completed < w.submitted)
++                    return false;
++            return true;
++        }
++
++        // PS2X_GS_THREAD_STATS=1: every ~5 s log drains per reason, how many
++        // had to wait, the total wait time, and barriers queued.
++        void drain(int why) const
++        {
++            const auto me = std::this_thread::get_id();
++            for (const auto &w : m_workers)
++                if (w.th.get_id() == me)
++                    return;
++            static const bool s_stats = []() { const char *e = std::getenv("PS2X_GS_THREAD_STATS"); return e && e[0] == '1'; }();
++            std::unique_lock<std::mutex> lk(m_mutex);
++            std::vector<uint64_t> target(m_workers.size());
++            for (size_t i = 0; i < m_workers.size(); ++i)
++                target[i] = m_workers[i].submitted;
++            auto reached = [&]() {
++                for (size_t i = 0; i < m_workers.size(); ++i)
++                    if (m_workers[i].completed < target[i])
++                        return false;
++                return true;
++            };
++            if (s_stats)
++                ++m_drainCalls[why & 7];
++            if (reached())
++                return;
++            const auto t0 = std::chrono::steady_clock::now();
++            m_doneCv.wait(lk, reached);
++            if (s_stats)
++            {
++                const auto t1 = std::chrono::steady_clock::now();
++                ++m_drainWaits[why & 7];
++                m_drainWaitNs[why & 7] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
++                if (t1 - m_lastStats > std::chrono::seconds(5))
++                {
++                    m_lastStats = t1;
++                    static const char *names[8] = {"init/reset", "flush", "sync", "present", "clear", "l2h", "readvram", "snapshot"};
++                    std::string line = "[gs:thread] workers=" + std::to_string(m_n);
++                    for (int i = 0; i < 8; ++i)
++                        if (m_drainCalls[i])
++                            line += std::string(" ") + names[i] + "=" + std::to_string(m_drainCalls[i]) + "/" +
++                                    std::to_string(m_drainWaits[i]) + "w/" + std::to_string(m_drainWaitNs[i] / 1000000ull) + "ms";
++                    line += " cmds=" + std::to_string(m_workers[0].submitted) + " barriers=" + std::to_string(m_barriers);
++                    std::fprintf(stderr, "%s\n", line.c_str());
++                }
++            }
++        }
++
++        int m_n = 1;
++        std::deque<Worker> m_workers;
+         mutable std::mutex m_mutex;
+-        mutable std::condition_variable m_cv;
+         mutable std::condition_variable m_doneCv;
+-        std::deque<Cmd> m_queue;
+-        uint64_t m_submitted = 0;
+-        uint64_t m_completed = 0;
+-        bool m_workerIdle = false;
++        std::condition_variable m_barrierCv;
+         bool m_quit = false;
+-        std::thread m_worker;
++        std::vector<std::pair<uint64_t, uint64_t>> m_written;
++        uint64_t m_barriers = 0;
++        mutable uint64_t m_drainCalls[8] = {};
++        mutable uint64_t m_drainWaits[8] = {};
++        mutable uint64_t m_drainWaitNs[8] = {};
++        mutable std::chrono::steady_clock::time_point m_lastStats{};
+     };
+ 
++    int gsThreadCount()
++    {
++        if (const char *e = std::getenv("PS2X_GS_THREADS"); e && e[0])
++            return std::max(1, std::atoi(e));
++        const unsigned hw = std::thread::hardware_concurrency();
++        return std::max(1, std::min(4, static_cast<int>(hw / 2u)));
++    }
++
+     bool gsSyncMode()
+     {
+         static const bool on = []() { const char *e = std::getenv("PS2X_GS_SYNC"); return e && e[0] == '1'; }();
+@@ -338,8 +567,10 @@
+     {
+         if (gsSyncMode())
+             return inner;
+-        std::fprintf(stderr, "[gs] rasterizer on worker thread (PS2X_GS_SYNC=1 to disable)\n");
+-        return std::make_unique<GSThreadedBackend>(std::move(inner));
++        const int n = gsThreadCount();
++        std::fprintf(stderr, "[gs] rasterizer on %d worker thread(s), %d-row bands (PS2X_GS_THREADS=N, PS2X_GS_SYNC=1 for none)\n",
++                     n, GSThreadedBackend::kBandRows);
++        return std::make_unique<GSThreadedBackend>(std::move(inner), n);
+     }
+ }
+ 

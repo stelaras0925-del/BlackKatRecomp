@@ -1,0 +1,20 @@
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -619,7 +619,16 @@
+         }
+         else if (opcode == VIF_MPG)
+         {
+-            uint32_t destAddr = (uint32_t)imm * 8u;
++            // VU1 micro memory is 2048 doublewords: MPG ADDR is 11 bits, upper IMM bits are
++            // ignored by the VIF (as the VU0 path above already masks to 9 bits). Unmasked,
++            // an ADDR >= 0x800 made destAddr >= 16 KB and the upload was silently skipped.
++            if ((imm & 0xF800u) != 0u)
++            {
++                static uint32_t s_hiLogged = 0;
++                if (s_hiLogged++ < 20)
++                    std::fprintf(stderr, "[vif1:mpg] addr has upper bits: cmd=%08x addr=%04x -> %03x\n", cmd, imm, imm & 0x7FFu);
++            }
++            uint32_t destAddr = static_cast<uint32_t>(imm & 0x7FFu) * 8u;
+             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+             const uint32_t mpgBytes = instructionCount * 8u;
+             if (pos + mpgBytes > sizeBytes && carryFrom(cmdStart, cmd, 4u + mpgBytes))
