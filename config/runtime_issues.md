@@ -928,3 +928,27 @@ Result (same session, 61 s vt_one, GS_GPU=1): all four off 28.0 Mcyc/busy-s, vif
 30.2 Mcyc/busy-s (+8%), vifw/s 16.15. BC_CHECK (121 s): 620000 runs, 0 mismatches.
 Remaining profile: per-pair interpreter overhead is spread over the loop (no single hot spot);
 VU1 stall cycles are ~44% of VU1 cycles. Next real step is a per-microprogram/block executor.
+
+## VU1 block executor (Nov 19 2026, uncommitted)
+Patch: `patches/ps2recomp-vu1-blockexec.patch` (ps2_vu1_core.cpp only).
+- Generic, not per-microprogram: at translation time every pair gets `beLen` = number of
+  consecutive "simple" pairs starting there (slot lists <= 16 reads/writes, no E/D/T/M bit, no VF
+  shadow, not reserved; a branch pair is allowed only together with its simple, non-branch delay
+  slot, which ends the block). At the generic loop top, a run of >= 2 such pairs (and no pending
+  branch / E-bit / halt-after-delay-slot) executes in a lean inner loop doing exactly the generic
+  steps in the same order: ready scan (fixed 8/16 slots, static no-stall skip inside the block) +
+  FDIV/EFU/WAITQ/WAITP/XGKICK resource terms, stall with the same budget handling, upper, lower or
+  I immediate, VI branch backup, slot writes, VF0/VI0 reset, pc advance + delay-slot branch
+  resolution, cycle advance with the same commit-hint / PATH1 calls, budget/stop checks.
+- Coverage 99.7% of executed pairs (PS2X_VU1_BESTATS=1 prints it), so 0x2c18, 0x1ee0, 0x2460 and
+  all other programs are covered.
+- Flags (all default on, `=0` reverts): `PS2X_VU1_BLOCKEXEC` (whole feature),
+  `PS2X_VU1_BLOCKEXEC_BRANCH` (branch + delay slot inside blocks), `PS2X_VU1_BLOCKEXEC_RES`
+  (FDIV/EFU/WAITQ/WAITP/XGKICK lowers inside blocks). Diagnostic: `PS2X_VU1_BESTATS=1`.
+- Disabled automatically with PS2X_VU1_PROFILE, PS2X_VU1_OPSTATS, PS2X_VU1_FAST_NOSTALL, accurate
+  mode, or when the decoded cache is not current.
+Results (same session, 61 s vt_one, GS_GPU=1): BLOCKEXEC=0 29.9 Mcyc/busy-s, vifw/s 16.01;
+on 38.5 Mcyc/busy-s (+29%), vifw/s 19.83 (+24%). Separate session: no-branch variant 36.3,
+with branches 39.7 vs 29.5 off. BC_CHECK (compares vf/vi/acc/q/p/i/r/mac/status/clip/pc/cycles/
+control/XGKICK hash/VU data): 181 s run, 1040000 runs, 0 mismatches (plus 60 s runs for each stage).
+Remaining cost is the ops themselves (doUpper SIMD FMAC + flag queue, fastLower, commits).

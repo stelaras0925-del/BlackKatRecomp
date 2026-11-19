@@ -1,0 +1,295 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -325,6 +325,33 @@
+         static const bool on = []() { const char *e = std::getenv("PS2X_VU1_STALLONCE"); return !(e && e[0] == '0'); }();
+         return on;
+     }
++    // PS2X_VU1_BLOCKEXEC=0: every pair goes through the generic run() loop. On (default): runs
++    // of >= 2 "simple" pairs (see Vu1Xlat::beLen) execute in a lean inner loop doing exactly the
++    // same steps in the same order (ready scan / stall, upper, lower or I, VF0/VI0 reset, slot
++    // writes, cycle advance with the same commit / PATH1 calls), without the per-pair checks for
++    // branches, halts, E-bit, shadows, accurate-mode pipelines and the decoded-pair lookup.
++    uint64_t g_beStatPairs = 0, g_beStatGeneric = 0; // PS2X_VU1_BESTATS=1 (VU1 worker thread only)
++    // PS2X_VU1_BLOCKEXEC_BRANCH=0: blocks stop before a branch pair. On (default): a branch pair
++    // and its delay slot end a block (the delay-slot branch resolution is done exactly as in the
++    // generic loop).
++    bool vu1BlockExecBranchOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_BLOCKEXEC_BRANCH"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // PS2X_VU1_BLOCKEXEC_RES=0: FDIV / EFU / WAITQ / WAITP / XGKICK lowers end a block. On
++    // (default): they run inside blocks with the same resource terms as pairReady() (XGKICK
++    // re-evaluated every stalled cycle like the generic loop).
++    bool vu1BlockExecResOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_BLOCKEXEC_RES"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    bool vu1BlockExecOn()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_VU1_BLOCKEXEC"); return !(e && e[0] == '0'); }();
++        return on;
++    }
+     // PS2X_VU1_NOPEXIT=0: upper NOP (0x2FF / 0x33C forms) goes through the full fastUpper decode
+     // instead of returning right at the top of doUpper (same effect: only m_currentUpperInstruction).
+     bool vu1NopExitOn()
+@@ -488,6 +515,10 @@
+         // previous `window` pairs ran straight through before it (see below).
+         std::vector<uint8_t> noRegStall; // per pair index
+         uint32_t window = 0;             // max write latency - 1 (pairs of look-back needed)
++        // PS2X_VU1_BLOCKEXEC: number of consecutive "simple" pairs starting at each pair (0 = not
++        // simple). Simple: slot lists fit the fixed 16-slot scan, no E/D/T/M bit, no VF shadow,
++        // lower is not a branch / XGKICK / FDIV / EFU / WAITQ / WAITP.
++        std::vector<uint8_t> beLen;
+         uint32_t noStallPairs = 0;
+         uint32_t writers = 0;
+         uint32_t dead = 0;
+@@ -2821,6 +2852,37 @@
+                         }
+                     }
+                 }
++                x->beLen.assign(n + 1u, 0u);
++                std::vector<uint8_t> beBranch(n + 1u, 0u);
++                const bool beBranchOn = vu1BlockExecBranchOn();
++                const bool beResOn = vu1BlockExecResOn(); // simple except that the lower is a branch
++                for (uint32_t k = n; k-- > 0u;)
++                {
++                    const DecodedInstructionPair &d = m_decodedCodeCache[k];
++                    const Vu1PairStall &st = x->stall[k];
++                    bool simple = st.nRead != 0xFFu && st.nRead <= 16u && st.nWrite <= 16u &&
++                                  !d.upperUsage.reserved && !d.lowerUsage.reserved && d.upperVfShadowReg == 0u &&
++                                  !d.eBit && !d.dBit && !d.tBit && !d.mBit &&
++                                  d.upperUsage.pipeline != PipelineBranch && d.upperUsage.pipeline != PipelineXgkick &&
++                                  d.upperUsage.pipeline != PipelineFdiv && d.upperUsage.pipeline != PipelineEfu &&
++                                  !d.upperUsage.waitQ && !d.upperUsage.waitP;
++                    if (simple && !d.iBit)
++                    {
++                        const InstructionUsage &lu = d.lowerUsage;
++                        const uint32_t hi = (d.lower >> 25) & 0x7Fu;
++                        const bool common = beResOn || (lu.pipeline != PipelineXgkick && lu.pipeline != PipelineFdiv &&
++                                                        lu.pipeline != PipelineEfu && !lu.waitQ && !lu.waitP);
++                        const bool isBranch = lu.pipeline == PipelineBranch || (hi >= 0x20u && hi <= 0x2Fu);
++                        beBranch[k] = (common && isBranch && beBranchOn) ? 1u : 0u;
++                        simple = common && !isBranch;
++                    }
++                    if (simple)
++                        x->beLen[k] = static_cast<uint8_t>(std::min<uint32_t>(255u, 1u + x->beLen[k + 1u]));
++                    else if (beBranch[k] && k + 1u < n && x->beLen[k + 1u] != 0u && !beBranch[k + 1u])
++                        x->beLen[k] = 2u; // branch + its (simple, non-branch) delay slot; the block ends there
++                    else
++                        x->beLen[k] = 0u;
++                }
+                 if (vu1BcStats())
+                     std::fprintf(stderr, "[vu1:bc] static no-stall: %u of %u pairs (window %u)\n", x->noStallPairs, n, x->window);
+                 (*tl_xlCache)[key] = std::move(made);
+@@ -3328,13 +3390,209 @@
+     const bool decodedCurrent = tl_runXlat != nullptr && m_decodedCodeCacheValid && m_cachedVuCode == vuCode &&
+                                 m_cachedMemory == memory && m_cachedCodeSize == codeSize &&
+                                 m_cachedCodeGeneration == memory->getVU1CodeGeneration();
++    const bool beOn = vu1BlockExecOn() && runXl != nullptr && decodedCurrent && loopOn && fastMode && fixedScan &&
++                      inlineAdv && !s_vu1Prof && !s_opStats && !runXl->beLen.empty() &&
++                      !std::getenv("PS2X_VU1_FAST_NOSTALL");
++    const uint8_t *const beLenArr = beOn ? runXl->beLen.data() : nullptr;
++    static const bool beStats = []() { const char *e = std::getenv("PS2X_VU1_BESTATS"); return e && e[0] == '1'; }();
++    const uint32_t beCount = beOn ? static_cast<uint32_t>(runXl->beLen.size() - 1u) : 0u;
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         if (!skipCommitOn || committedCycle != m_cycle)
+             commitReadyPipelines();
+         if (m_state.pc + 8u > codeSize)
+             break;
++        if (beOn && (m_state.pc & 7u) == 0u && !m_state.branchPending && !m_state.ebit &&
++            !m_state.haltAfterDelaySlot)
++        {
++            const uint32_t bi = m_state.pc / 8u;
++            const uint32_t len = bi < beCount ? beLenArr[bi] : 0u;
++            if (len >= 2u && (bi + len) * 8u <= codeSize)
++            {
++                const uint32_t entryPc = m_state.pc;
++                uint32_t done = 0u;
++                for (; done < len; ++done)
++                {
++                    const uint32_t idx = bi + done;
++                    const DecodedInstructionPair &decoded = m_decodedCodeCache[idx];
++                    const Vu1PairStall &ps = stallArr[idx];
++                    m_state.pc = idx * 8u;
++                    uint64_t regReady = m_cycle;
++                    if (!(done >= ssWindow && noRegArr && noRegArr[idx] != 0u))
++                    {
++                        const uint8_t *rd = ps.read;
++                        uint64_t a0 = std::max(flatRdy[rd[0]], flatRdy[rd[1]]);
++                        uint64_t a1 = std::max(flatRdy[rd[2]], flatRdy[rd[3]]);
++                        uint64_t a2 = std::max(flatRdy[rd[4]], flatRdy[rd[5]]);
++                        uint64_t a3 = std::max(flatRdy[rd[6]], flatRdy[rd[7]]);
++                        if (ps.nRead > 8u)
++                        {
++                            a0 = std::max(a0, std::max(flatRdy[rd[8]], flatRdy[rd[9]]));
++                            a1 = std::max(a1, std::max(flatRdy[rd[10]], flatRdy[rd[11]]));
++                            a2 = std::max(a2, std::max(flatRdy[rd[12]], flatRdy[rd[13]]));
++                            a3 = std::max(a3, std::max(flatRdy[rd[14]], flatRdy[rd[15]]));
++                        }
++                        regReady = std::max(std::max(a0, a1), std::max(a2, a3));
++                    }
++                    const InstructionUsage &lu = decoded.lowerUsage;
++                    const bool resTerms = lu.pipeline == PipelineFdiv || lu.pipeline == PipelineEfu ||
++                                          lu.pipeline == PipelineXgkick || lu.waitQ || lu.waitP;
++                    // Same value as pairReady() for a slot-list pair.
++                    const auto beReady = [&]() -> uint64_t {
++                        uint64_t r = std::max(m_cycle, regReady);
++                        if (resTerms)
++                        {
++                            if (lu.pipeline == PipelineFdiv && m_fdiv.valid)
++                                r = std::max(r, m_fdiv.readyCycle);
++                            if (lu.pipeline == PipelineEfu)
++                                r = std::max(r, m_efuResourceReady);
++                            if (lu.waitQ && m_fdiv.valid)
++                                r = std::max(r, m_fdiv.readyCycle);
++                            if (lu.waitP)
++                                for (const ScalarPipelineEntry &entry : m_efu)
++                                    if (entry.valid)
++                                        r = std::max(r, entry.readyCycle);
++                            if (lu.pipeline == PipelineXgkick && m_xgkick.active)
++                                r = std::max(r, m_cycle + 1u);
++                        }
++                        return r;
++                    };
++                    uint64_t readyCycle = beReady();
++                    while (readyCycle > m_cycle)
++                    {
++                        if (readyCycle >= budgetEnd)
++                        {
++                            advanceTo(budgetEnd);
++                            break;
++                        }
++                        advanceTo(readyCycle);
++                        if (!(resTerms && lu.pipeline == PipelineXgkick) && (stallOnce || !resTerms))
++                            break;
++                        readyCycle = beReady();
++                    }
++                    if (m_cycle >= budgetEnd)
++                        break; // the pair does not issue (same as the generic loop)
++                    if (beStats && ((++g_beStatPairs) & ((1u << 26) - 1u)) == 0u)
++                        std::fprintf(stderr, "[vu1:be] block pairs %llu generic pairs %llu (%.1f%% in blocks)\n",
++                                     (unsigned long long)g_beStatPairs, (unsigned long long)g_beStatGeneric,
++                                     100.0 * g_beStatPairs / double(g_beStatPairs + g_beStatGeneric));
++                    uint8_t writtenVi = 0u;
++                    int32_t oldVi = 0;
++                    if (const uint32_t viW = decoded.lowerUsage.viWrite & 0xFFFEu)
++                    {
++                        writtenVi = static_cast<uint8_t>(__builtin_ctz(viW));
++                        oldVi = m_state.vi[writtenVi];
++                    }
++                    doUpper(decoded.upper);
++                    if (decoded.iBit)
++                    {
++                        float immediate = 0.0f;
++                        std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
++                        m_state.i = normalizeOperand(immediate);
++                    }
++                    else if (!fastLowerOn || !fastLower(decoded.lower))
++                        execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++                    m_viBranchBackupValid = false;
++                    {
++                        const uint8_t *wr = ps.write;
++                        const uint8_t *wl = ps.writeLat;
++                        const uint64_t c = m_cycle;
++                        flatRdy[wr[0]] = c + wl[0];
++                        flatRdy[wr[1]] = c + wl[1];
++                        flatRdy[wr[2]] = c + wl[2];
++                        flatRdy[wr[3]] = c + wl[3];
++                        flatRdy[wr[4]] = c + wl[4];
++                        flatRdy[wr[5]] = c + wl[5];
++                        flatRdy[wr[6]] = c + wl[6];
++                        flatRdy[wr[7]] = c + wl[7];
++                        if (ps.nWrite > 8u)
++                            for (uint32_t k = 8; k < 16u; ++k)
++                                flatRdy[wr[k]] = c + wl[k];
++                    }
++                    if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
++                        recordViWriteForBranch(writtenVi, oldVi);
++                    m_state.vf[0][0] = 0.0f;
++                    m_state.vf[0][1] = 0.0f;
++                    m_state.vf[0][2] = 0.0f;
++                    m_state.vf[0][3] = 1.0f;
++                    m_state.vi[0] = 0;
++                    {
++                        uint32_t nextPc = idx * 8u + 8u;
++                        if (nextPc >= codeSize)
++                            nextPc = 0u;
++                        m_state.pc = nextPc;
++                        if (m_state.branchPending)
++                        {
++                            if (m_state.branchDelay == 0u)
++                            {
++                                m_state.pc = m_state.branchTarget & microAddressMask();
++                                m_state.branchPending = false;
++                            }
++                            else
++                                --m_state.branchDelay;
++                        }
++                    }
++                    ++m_cycle;
++                    m_state.cycles = m_cycle;
++                    if (!(g_vu1HintOwner == this && m_cycle < g_vu1CommitHint))
++                        commitReadyPipelines();
++                    if (m_xgkick.active)
++                        progressXgkick();
++                    if (m_stopRequested || m_state.ebit || m_cycle >= budgetEnd)
++                    {
++                        ++done;
++                        break;
++                    }
++                }
++                // Static-proof history for the generic loop (only affects which scans it skips).
++                if (done == 0u)
++                {
++                    committedCycle = m_cycle;
++                    continue;
++                }
++                if (entryPc == ssLastPc + 8u)
++                    ssSeq += done;
++                else
++                {
++                    jmpMask = 0u;
++                    ssSeq = done - 1u;
++                }
++                ssLastPc = (bi + done - 1u) * 8u;
++                committedCycle = m_cycle;
++                continue;
++            }
++        }
+ 
++        if (beStats)
++        {
++            static uint64_t s_pcHits[2048];
++            if ((m_state.pc / 8u) < 2048u)
++                ++s_pcHits[m_state.pc / 8u];
++            if (((++g_beStatGeneric) & ((1u << 22) - 1u)) == 0u)
++            {
++                std::fprintf(stderr, "[vu1:be] block pairs %llu generic pairs %llu (%.1f%% in blocks)\n",
++                             (unsigned long long)g_beStatPairs, (unsigned long long)g_beStatGeneric,
++                             100.0 * g_beStatPairs / double(g_beStatPairs + g_beStatGeneric));
++                for (int rep = 0; rep < 40; ++rep)
++                {
++                    uint32_t best = 0;
++                    for (uint32_t k = 1; k < 2048u; ++k)
++                        if (s_pcHits[k] > s_pcHits[best])
++                            best = k;
++                    if (!s_pcHits[best])
++                        break;
++                    const bool have = decodedCurrent && best < kMaxDecodedPairs && runXl && best < stallCount;
++                    const DecodedInstructionPair &d = m_decodedCodeCache[best];
++                    std::fprintf(stderr, "[vu1:be]   pc=0x%04x %.2f%% up=%08x lo=%08x nR=%u nW=%u be=%u lpipe=%u uPipe=%u i%u e%u m%u d%u t%u sh%u wq%u wp%u dnb%u\n",
++                                 best * 8u, 100.0 * s_pcHits[best] / double(g_beStatGeneric), d.upper, d.lower,
++                                 have ? stallArr[best].nRead : 999u, have ? stallArr[best].nWrite : 999u,
++                                 (beLenArr && best < beCount) ? beLenArr[best] : 999u, d.lowerUsage.pipeline, d.upperUsage.pipeline,
++                                 d.iBit, d.eBit, d.mBit, d.dBit, d.tBit, d.upperVfShadowReg, d.lowerUsage.waitQ, d.lowerUsage.waitP,
++                                 d.lowerUsage.delaysNextBranchRead);
++                    s_pcHits[best] = 0; // report-and-reset
++                }
++            }
++        }
+         // Use the pre-decoded pair in place when the cache is current (same check as
+         // getDecodedInstructionPairForPc, without copying the ~100-byte struct per pair).
+         DecodedInstructionPair decodedCopy;
