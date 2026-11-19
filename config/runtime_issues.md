@@ -952,3 +952,22 @@ on 38.5 Mcyc/busy-s (+29%), vifw/s 19.83 (+24%). Separate session: no-branch var
 with branches 39.7 vs 29.5 off. BC_CHECK (compares vf/vi/acc/q/p/i/r/mac/status/clip/pc/cycles/
 control/XGKICK hash/VU data): 181 s run, 1040000 runs, 0 mismatches (plus 60 s runs for each stage).
 Remaining cost is the ops themselves (doUpper SIMD FMAC + flag queue, fastLower, commits).
+
+## VU1 block executor: pre-decoded upper + inline FMAC flag queue (Nov 19 2026, uncommitted)
+Patch: `patches/ps2recomp-vu1-predecode-flagsfast.patch` (ps2_vu1_core.cpp only).
+- `PS2X_VU1_PREDECODE` (default on): each image's uppers are classified once (Vu1Xlat::upPre via
+  vu1UpperPre(), the same dispatch as fastUpper: NOP / FMAC kind+source+ACC dest / other). Block
+  pairs call the FMAC core (split out of fastUpper as fmacCore, unchanged) or set the NOP directly;
+  other uppers still go through doUpper. fastUpper itself now ends in fmacCore (same code).
+- `PS2X_VU1_FLAGSFAST` (default on): fmacCore queues FMAC flags through an inline copy of
+  updateFmacFlags with the run-constant checks hoisted (same dead-entry rule incl. budget/stop
+  condition, sticky carry, first free slot, entry contents, commit hint). Off in the compare-mode
+  reference run (tl_bcSuppress), so BC_CHECK compares it against updateFmacFlags.
+- Tried and dropped: per-block static dependency lists (producer issue cycle + latency) with
+  ready-slot writes deferred to block exit - BC_CHECK clean (300000 runs) but no measurable gain
+  (38.5 vs 38.4 Mcyc/busy-s), so not in the patch (copy at /tmp/core_with_deps.cpp on the PC).
+Results (same session while Stelios was streaming, so absolute numbers are lower than last night;
+61 s vt_one, GS_GPU=1): PREDECODE=0 FLAGSFAST=0 35.4 Mcyc/busy-s, vifw/s 18.25; on 38.4 (+8.5%),
+vifw/s 19.36. BC_CHECK 181 s: 1020000 runs, 0 mismatches.
+Remaining VU1 worker profile: fmacCore ~27%, run/block loop ~34%, fastLower ~10%,
+commitReadyPipelines ~9% (one call per live FMAC flag entry), execLower ~3%.
