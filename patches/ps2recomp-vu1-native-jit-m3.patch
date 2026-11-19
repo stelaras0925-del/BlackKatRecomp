@@ -1,0 +1,1400 @@
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,4 +1,5 @@
+ #include <emmintrin.h>
++#include <sys/mman.h>
+ #include "runtime/ps2_vu1.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -586,7 +587,11 @@
+         uint32_t noStallPairs = 0;
+         uint32_t writers = 0;
+         uint32_t dead = 0;
++        // PS2X_VU1_NATIVE: compiled entry per block-start pair (nullptr = not yet, 1 = failed)
++        mutable std::vector<void *> native;
++        mutable uint64_t nativeKey = 0; // codeSize << 32 | dataSize the native blocks were compiled for
+     };
++#include "ps2_vu1_native.inl"
+     struct Vu1XlatCur
+     {
+         const void *owner = nullptr;
+@@ -3542,6 +3547,1069 @@
+     const uint32_t beCount = beOn ? static_cast<uint32_t>(runXl->beLen.size() - 1u) : 0u;
+     const bool preOn = beOn && fastUpperOn && vu1PreDecodeOn() && runXl->upPre.size() >= beCount;
+     const uint8_t *const upPreArr = preOn ? runXl->upPre.data() : nullptr;
++
++    // ---- PS2X_VU1_NATIVE (see ps2_vu1_native.inl): helpers called from the native blocks ----
++    const bool nativeOn = vu1NativeOn() && beOn && preOn && !beStats && fastLowerOn;
++    // Exactly the block loop's stall section (pairReady terms + advanceTo loop) for pair idx;
++    // returns 1 when the budget ran out (the pair does not issue).
++    const auto jitStall = [&](uint32_t arg) -> uint32_t {
++        const uint32_t idx = arg & 0xFFFFu;
++        const bool skipReg = (arg >> 16) != 0u;
++        const DecodedInstructionPair &decoded = m_decodedCodeCache[idx];
++        const Vu1PairStall &ps = stallArr[idx];
++        uint64_t regReady = m_cycle;
++        if (!skipReg)
++        {
++            const uint8_t *rd = ps.read;
++            uint64_t a0 = std::max(flatRdy[rd[0]], flatRdy[rd[1]]);
++            uint64_t a1 = std::max(flatRdy[rd[2]], flatRdy[rd[3]]);
++            uint64_t a2 = std::max(flatRdy[rd[4]], flatRdy[rd[5]]);
++            uint64_t a3 = std::max(flatRdy[rd[6]], flatRdy[rd[7]]);
++            if (ps.nRead > 8u)
++            {
++                a0 = std::max(a0, std::max(flatRdy[rd[8]], flatRdy[rd[9]]));
++                a1 = std::max(a1, std::max(flatRdy[rd[10]], flatRdy[rd[11]]));
++                a2 = std::max(a2, std::max(flatRdy[rd[12]], flatRdy[rd[13]]));
++                a3 = std::max(a3, std::max(flatRdy[rd[14]], flatRdy[rd[15]]));
++            }
++            regReady = std::max(std::max(a0, a1), std::max(a2, a3));
++        }
++        const InstructionUsage &lu = decoded.lowerUsage;
++        const bool resTerms = lu.pipeline == PipelineFdiv || lu.pipeline == PipelineEfu ||
++                              lu.pipeline == PipelineXgkick || lu.waitQ || lu.waitP;
++        const auto beReady = [&]() -> uint64_t {
++            uint64_t r = std::max(m_cycle, regReady);
++            if (resTerms)
++            {
++                if (lu.pipeline == PipelineFdiv && m_fdiv.valid)
++                    r = std::max(r, m_fdiv.readyCycle);
++                if (lu.pipeline == PipelineEfu)
++                    r = std::max(r, m_efuResourceReady);
++                if (lu.waitQ && m_fdiv.valid)
++                    r = std::max(r, m_fdiv.readyCycle);
++                if (lu.waitP)
++                    for (const ScalarPipelineEntry &entry : m_efu)
++                        if (entry.valid)
++                            r = std::max(r, entry.readyCycle);
++                if (lu.pipeline == PipelineXgkick && m_xgkick.active)
++                    r = std::max(r, m_cycle + 1u);
++            }
++            return r;
++        };
++        uint64_t readyCycle = beReady();
++        while (readyCycle > m_cycle)
++        {
++            if (readyCycle >= budgetEnd)
++            {
++                advanceTo(budgetEnd);
++                break;
++            }
++            advanceTo(readyCycle);
++            if (!(resTerms && lu.pipeline == PipelineXgkick) && (stallOnce || !resTerms))
++                break;
++            readyCycle = beReady();
++        }
++        return m_cycle >= budgetEnd ? 1u : 0u;
++    };
++    const auto jitFmac = [&](uint32_t instr, uint32_t up) {
++        if (!fmacCore(instr, up & 7u, (up >> 3) & 3u, (up & 0x20u) != 0u))
++            execUpper(instr);
++    };
++    const auto jitUpper = [&](uint32_t instr) { doUpper(instr); };
++    const auto jitLower = [&](uint32_t idx) {
++        const DecodedInstructionPair &decoded = m_decodedCodeCache[idx];
++        uint8_t writtenVi = 0u;
++        int32_t oldVi = 0;
++        if (const uint32_t viW = decoded.lowerUsage.viWrite & 0xFFFEu)
++        {
++            writtenVi = static_cast<uint8_t>(__builtin_ctz(viW));
++            oldVi = m_state.vi[writtenVi];
++        }
++        if (decoded.iBit)
++        {
++            float immediate = 0.0f;
++            std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
++            m_state.i = normalizeOperand(immediate);
++        }
++        else if (!fastLowerOn || !fastLower(decoded.lower))
++            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++        m_viBranchBackupValid = false;
++        if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
++            recordViWriteForBranch(writtenVi, oldVi);
++    };
++    const auto jitFlags = [&](uint32_t packed, uint32_t b) {
++        const uint8_t lf[4] = {static_cast<uint8_t>(packed), static_cast<uint8_t>(packed >> 8), static_cast<uint8_t>(packed >> 16),
++                               static_cast<uint8_t>(packed >> 24)};
++        fmacFlagsFast(lf, static_cast<uint8_t>((b >> 8) & 0xFu), b & 0xFFu);
++    };
++    const auto jitStore = [&](uint32_t addr, uint32_t info) {
++        uint32_t words[4];
++        if (info & 0x10000u)
++        {
++            const uint32_t v = static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[(info >> 8) & 0xFu] & 0xFFFF));
++            words[0] = words[1] = words[2] = words[3] = v;
++        }
++        else
++            std::memcpy(words, m_state.vf[(info >> 8) & 0x1Fu], sizeof(words));
++        queueStore(addr, words, static_cast<uint8_t>(info & 0xFu));
++    };
++    const auto jitPcBranch = [&]() {
++        if (m_state.branchDelay == 0u)
++        {
++            m_state.pc = m_state.branchTarget & microAddressMask();
++            m_state.branchPending = false;
++        }
++        else
++            --m_state.branchDelay;
++    };
++    Vu1JitCtx jctx;
++    jctx.stall = const_cast<void *>(static_cast<const void *>(&jitStall));
++    jctx.fmac = const_cast<void *>(static_cast<const void *>(&jitFmac));
++    jctx.upper = const_cast<void *>(static_cast<const void *>(&jitUpper));
++    jctx.lower = const_cast<void *>(static_cast<const void *>(&jitLower));
++    jctx.pcBranch = const_cast<void *>(static_cast<const void *>(&jitPcBranch));
++    jctx.flags = const_cast<void *>(static_cast<const void *>(&jitFlags));
++    jctx.store = const_cast<void *>(static_cast<const void *>(&jitStore));
++    jctx.commit = this;
++    jctx.xgkick = this;
++    jctx.budgetEnd = budgetEnd;
++    jctx.vuData = vuData;
++    const bool nativeLowerOk = dataSize >= 16u && (dataSize & (dataSize - 1u)) == 0u;
++    const Vu1JitHelper hStall = +[](Vu1JitCtx *c, uint32_t a, uint32_t) -> uint32_t {
++        return (*static_cast<const decltype(jitStall) *>(c->stall))(a);
++    };
++    const Vu1JitHelper hFmac = +[](Vu1JitCtx *c, uint32_t a, uint32_t b) -> uint32_t {
++        (*static_cast<const decltype(jitFmac) *>(c->fmac))(a, b);
++        return 0u;
++    };
++    const Vu1JitHelper hUpper = +[](Vu1JitCtx *c, uint32_t a, uint32_t) -> uint32_t {
++        (*static_cast<const decltype(jitUpper) *>(c->upper))(a);
++        return 0u;
++    };
++    const Vu1JitHelper hLower = +[](Vu1JitCtx *c, uint32_t a, uint32_t) -> uint32_t {
++        (*static_cast<const decltype(jitLower) *>(c->lower))(a);
++        return 0u;
++    };
++    const Vu1JitHelper hPcBranch = +[](Vu1JitCtx *c, uint32_t, uint32_t) -> uint32_t {
++        (*static_cast<const decltype(jitPcBranch) *>(c->pcBranch))();
++        return 0u;
++    };
++    const Vu1JitHelper hFlags = +[](Vu1JitCtx *c, uint32_t a, uint32_t b) -> uint32_t {
++        (*static_cast<const decltype(jitFlags) *>(c->flags))(a, b);
++        return 0u;
++    };
++    // Native FMAC (ADD/SUB/MUL/MADD/MSUB, all operand forms): vu1FmacSimd + fmacCore's tail +
++    // fmacFlagsFast emitted as SSE2 with the instruction's fields baked in. Lanes that
++    // vu1FmacSimd would reject jump to an out-of-line call of the C++ path (nothing is written
++    // before that test).
++    static const bool s_nativeFmacEnv = []() { const char *e = std::getenv("PS2X_VU1_NATIVE_FMAC"); return !(e && e[0] == '0'); }();
++    static const bool s_bcBreakEnv = []() { const char *e = std::getenv("PS2X_VU1_BC_BREAK"); return e && e[0] == '1'; }();
++    const bool nativeFmacOk = s_nativeFmacEnv && simdOn && flagsFast && !s_bcBreakEnv;
++    const bool nativeBcCount = vu1BcStats();
++    const Vu1JitHelper hStore = +[](Vu1JitCtx *c, uint32_t a, uint32_t b) -> uint32_t {
++        (*static_cast<const decltype(jitStore) *>(c->store))(a, b);
++        return 0u;
++    };
++    static const bool s_nativeOpsEnv = []() { const char *e = std::getenv("PS2X_VU1_NATIVE_OPS"); return !(e && e[0] == '0'); }();
++    // PS2X_VU1_NATIVE_DSTORE=0: SQ/SQI/ISW/ISWR go through queueStore. On (default): the store
++    // is written to VU data memory directly. Equivalent: a queued store is ready at m_cycle + 1,
++    // vu1NoteReady makes the same pair's cycle advance commit it, so it is always visible from
++    // the next pair on and nothing reads VU data memory in between (the upper cannot, the lower
++    // is the store, and PATH1 progress runs after that commit).
++    static const bool s_nativeDStoreEnv = []() { const char *e = std::getenv("PS2X_VU1_NATIVE_DSTORE"); return !(e && e[0] == '0'); }();
++    // PS2X_VU1_NATIVE_STALL=0: every register stall calls the C++ stall code. On (default): a
++    // stall that ends before the budget runs a native copy of advanceTo(readyCycle) (hint jump,
++    // cycle++, hint-gated commit, PATH1 progress) shared by the block.
++    static const bool s_nativeStallEnv = []() { const char *e = std::getenv("PS2X_VU1_NATIVE_STALL"); return !(e && e[0] == '0'); }();
++    static const bool s_jitOnRun = vu1JitOn();
++    static const bool s_nativeVf0Env = []() { const char *e = std::getenv("PS2X_VU1_NATIVE_VF0"); return !(e && e[0] == '0'); }();
++    const Vu1JitHelper hCommit = +[](Vu1JitCtx *c, uint32_t, uint32_t) -> uint32_t {
++        static_cast<VU1Interpreter *>(c->commit)->commitReadyPipelines();
++        return 0u;
++    };
++    const Vu1JitHelper hXgkick = +[](Vu1JitCtx *c, uint32_t, uint32_t) -> uint32_t {
++        static_cast<VU1Interpreter *>(c->xgkick)->progressXgkick();
++        return 0u;
++    };
++    // Emit one block: pairs bi .. bi+len-1, same per-pair sequence as the C++ block loop.
++    const auto compileBlock = [&](uint32_t bi, uint32_t len) -> void * {
++        Vu1CodeArena &ar = tl_vu1Arena;
++        if (!ar.reserve())
++            return kVu1NativeFailed;
++        if (ar.size - ar.used < static_cast<size_t>(len) * 2048u + 1024u)
++        {
++            static thread_local bool s_full = false;
++            if (!s_full)
++                std::fprintf(stderr, "[vu1:native] code arena full (%zu bytes); further blocks interpreted\n", ar.used);
++            s_full = true;
++            return kVu1NativeFailed;
++        }
++        Vu1Emit e;
++        e.p = ar.base + ar.used;
++        e.end = ar.base + ar.size;
++        uint8_t *const start = e.p;
++        const char *const self = reinterpret_cast<const char *>(this);
++        const auto off = [&](const void *m) { return static_cast<int32_t>(reinterpret_cast<const char *>(m) - self); };
++        const int32_t oPc = off(&m_state.pc), oCyc = off(&m_cycle), oCycles = off(&m_state.cycles), oFlat = off(flatRdy),
++                      oCui = off(&m_currentUpperInstruction), oVbv = off(&m_viBranchBackupValid),
++                      oVf0 = off(&m_state.vf[0][0]), oVi0 = off(&m_state.vi[0]), oBp = off(&m_state.branchPending),
++                      oXga = off(&m_xgkick.active), oStop = off(&m_stopRequested), oEbit = off(&m_state.ebit);
++        const int32_t oBudget = static_cast<int32_t>(offsetof(Vu1JitCtx, budgetEnd));
++        static_assert(sizeof(m_stopRequested) == 1 && sizeof(m_state.ebit) == 1 && sizeof(m_state.branchPending) == 1, "flag sizes");
++        struct Exit { uint8_t *jmpEnd; uint32_t done; uint32_t pc; };
++        std::vector<Exit> exits;
++        constexpr uint32_t kNoPc = 0xFFFFFFFFu;
++        const auto pairBranches = [&](uint32_t k) {
++            const DecodedInstructionPair &dk = m_decodedCodeCache[k];
++            const uint32_t hi = (dk.lower >> 25) & 0x7Fu;
++            return !dk.iBit && (dk.lowerUsage.pipeline == PipelineBranch || (hi >= 0x20u && hi <= 0x2Fu));
++        };
++        bool mayBranch = false; // a pair up to the current one is a branch (branchPending may be set)
++        e.push(kRbx);
++        e.push(kR12);
++        e.push(kR13);
++        e.push(kR14);
++        e.push(kR15);
++        e.movRR(kRbx, kRdi);
++        e.movRR(kR12, kRsi);
++        e.movRI64(kR13, reinterpret_cast<uint64_t>(&vu1NativePool()));
++        e.movRI64(kR14, reinterpret_cast<uint64_t>(&g_vu1HintOwner));
++        e.movRI64(kR15, reinterpret_cast<uint64_t>(&g_vu1CommitHint));
++        const int32_t oVf = off(&m_state.vf[0][0]), oAcc = off(&m_state.acc[0]), oQ = off(&m_state.q), oI = off(&m_state.i);
++        struct SlowStub { uint8_t *jmpEnd; uint32_t instr, up; uint8_t *back; };
++        std::vector<SlowStub> slow;
++        uint32_t nNativeFmac = 0;
++        std::vector<uint8_t *> stallCalls;
++        bool pairWritesZero = true;
++        const auto emitFmac = [&](uint32_t idx, uint32_t instr, uint32_t up) -> bool {
++            const int kind = static_cast<int>(up & 7u), src = static_cast<int>((up >> 3) & 3u);
++            const bool toAcc = (up & 0x20u) != 0u;
++            const uint8_t dest = DEST(instr), fs = FS(instr), ft = FT(instr), fd = FD(instr);
++            if (!nativeFmacOk || dest == 0u || kind > 4)
++                return false;
++            const int32_t dmOff = kPoolDm + dest * 16;
++            using E = Vu1Emit;
++            if (!toAcc && fd == 0u)
++                pairWritesZero = true;
++            // S, T (normalised operands)
++            e.movupsLoad(0, kRbx, oVf + fs * 16);
++            vu1EmitNormPs(e, 0, 4, 5, 6, 7);
++            if (src == 0)
++            {
++                e.movupsLoad(1, kRbx, oVf + ft * 16);
++                e.pshufd(1, 1, static_cast<uint8_t>((instr & 3u) * 0x55u));
++            }
++            else if (src == 1 || src == 2)
++            {
++                e.movdLoad(1, kRbx, src == 1 ? oQ : oI);
++                e.pshufd(1, 1, 0);
++            }
++            else
++                e.movupsLoad(1, kRbx, oVf + ft * 16);
++            vu1EmitNormPs(e, 1, 4, 5, 6, 7);
++            uint8_t *jFail = nullptr;
++            bool hasSticky = false;
++            if (kind <= 2)
++            {
++                e.movaps(2, 0);
++                e.ps(kind == 0 ? E::kAddps : kind == 1 ? E::kSubps : E::kMulps, 2, 1); // R
++                if (zeroOn)
++                {
++                    if (kind == 2)
++                    {
++                        e.pi(E::kPxor, 4, 4);
++                        e.movaps(3, 0); e.cmpps(3, 4, 0);
++                        e.movaps(5, 1); e.cmpps(5, 4, 0);
++                        e.ps(E::kOrps, 3, 5);
++                    }
++                    else if (kind == 0)
++                    {
++                        e.movaps(5, 1); e.sseRM(0, E::kXorps, 5, kR13, kPoolSign);
++                        e.movaps(3, 0); e.cmpps(3, 5, 0);
++                    }
++                    else
++                    {
++                        e.movaps(3, 0); e.cmpps(3, 1, 0);
++                    }
++                }
++                else
++                    e.pi(E::kPxor, 3, 3); // zcase
++                vu1EmitExpOut(e, 4, 2, 5);
++                e.movaps(5, 3); e.pi(E::kPandn, 5, 4); e.piM(E::kPand, 5, kR13, dmOff);
++                e.pmovmskbEax(5); e.testEax();
++                jFail = e.jcc(kCcNE);
++                e.movaps(4, 2); e.piM(E::kPand, 4, kR13, kPoolSign); e.psrld(4, 30);
++                e.piM(E::kPand, 3, kR13, kPoolOne); e.pi(E::kPor, 4, 3); e.piM(E::kPand, 4, kR13, dmOff); // fl
++            }
++            else
++            {
++                e.movupsLoad(3, kRbx, oAcc);
++                vu1EmitNormPs(e, 3, 4, 5, 6, 7);                                   // A
++                e.movaps(4, 0); e.ps(E::kMulps, 4, 1);                            // P
++                e.movaps(2, 3); e.ps(kind == 3 ? E::kAddps : E::kSubps, 2, 4);    // R
++                e.movaps(5, 4); e.piM(E::kPand, 5, kR13, kPoolSign); e.psrld(5, 30); // pSign
++                if (zeroOn)
++                {
++                    e.pi(E::kPxor, 7, 7);
++                    e.movaps(6, 0); e.cmpps(6, 7, 0);
++                    e.cmpps(1, 7, 0);
++                    e.ps(E::kOrps, 6, 1);
++                }
++                else
++                    e.pi(E::kPxor, 6, 6); // zcase
++                vu1EmitExpOut(e, 0, 4, 1);                                         // pe < 3 | pe > 252
++                e.movaps(1, 3); e.psrld(1, 23); e.piM(E::kPand, 1, kR13, kPoolFF);
++                e.piM(E::kPcmpgtd, 1, kR13, kPoolC252); e.pi(E::kPor, 0, 1);      // | ae > 252
++                e.movaps(1, 2); e.piM(E::kPand, 1, kR13, kPoolAbs);               // Ra
++                e.movaps(7, 3); e.piM(E::kPand, 7, kR13, kPoolAbs);               // Aa
++                e.cvtps2pd(3, 1);                                                  // rlo
++                e.movhlps(1, 1); e.cvtps2pd(1, 1);                                 // rhi
++                e.cvtps2pd(4, 7);                                                  // alo
++                e.movhlps(7, 7); e.cvtps2pd(7, 7);                                 // ahi
++                e.pd(0x58, 4, 3); e.pdM(0x59, 3, kR13, kPoolK20); e.cmppd(4, 3, 2); // oklo
++                e.pd(0x58, 7, 1); e.pdM(0x59, 1, kR13, kPoolK20); e.cmppd(7, 1, 2); // okhi
++                e.shufps(4, 7, 0x88);
++                e.piM(E::kPandn, 4, kR13, kPoolOnes); e.pi(E::kPor, 0, 4);        // | !ok
++                vu1EmitExpOut(e, 1, 2, 3); e.pi(E::kPor, 0, 1);                    // | expOut(R)
++                e.movaps(1, 6); e.pi(E::kPandn, 1, 0); e.piM(E::kPand, 1, kR13, dmOff);
++                e.pmovmskbEax(1); e.testEax();
++                jFail = e.jcc(kCcNE);
++                e.movaps(7, 6); e.piM(E::kPand, 7, kR13, kPoolOne); e.pi(E::kPor, 5, 7);
++                e.piM(E::kPand, 5, kR13, dmOff);                                   // sticky lanes
++                e.movaps(3, 2); e.piM(E::kPand, 3, kR13, kPoolAbs); e.pi(E::kPxor, 4, 4); e.pi(E::kPcmpeqd, 3, 4); // rz
++                e.movaps(4, 2); e.piM(E::kPand, 4, kR13, kPoolSign); e.psrld(4, 30);
++                e.pi(E::kPand, 6, 3); e.piM(E::kPand, 6, kR13, kPoolOne); e.pi(E::kPor, 4, 6);
++                e.piM(E::kPand, 4, kR13, dmOff);                                   // fl
++                hasSticky = true;
++            }
++            e.movM32I(kRbx, oCui, instr);
++            {
++                const int32_t dstOff = toAcc ? oAcc : oVf + fd * 16;
++                if (dest == 0xFu)
++                    e.movupsStore(kRbx, dstOff, 2);
++                else
++                {
++                    e.movupsLoad(0, kRbx, dstOff);
++                    e.movapsLoad(1, kR13, dmOff);
++                    e.ps(E::kAndps, 2, 1);
++                    e.ps(E::kAndnps, 1, 0);
++                    e.ps(E::kOrps, 2, 1);
++                    e.movupsStore(kRbx, dstOff, 2);
++                }
++            }
++            uint8_t *jDone = nullptr;
++            if (idx < flagDeadCount && flagDeadArr[idx])
++            {
++                e.movRM(kRax, kRbx, oCyc);
++                e.addRaxI32(1024u);
++                e.cmpRM(kRax, kR12, static_cast<int32_t>(offsetof(Vu1JitCtx, budgetEnd)));
++                uint8_t *const jL1 = e.jcc(kCcAE);
++                e.cmpM8I(kRbx, off(&m_stopRequested), 0u);
++                uint8_t *const jL2 = e.jcc(kCcNE);
++                e.movaps(6, 4);
++                if (hasSticky)
++                    e.pi(E::kPor, 6, 5);
++                e.pshufd(7, 6, 0x4E); e.pi(E::kPor, 6, 7);
++                e.pshufd(7, 6, 0xB1); e.pi(E::kPor, 6, 7);
++                e.movdToEax(6);
++                e.movRI64(kRcx, reinterpret_cast<uint64_t>(&tl_carryOwner));
++                e.movRI64(kRdx, reinterpret_cast<uint64_t>(&tl_carry));
++                e.cmpM0R(kRcx, kRbx);
++                uint8_t *const jSame = e.jcc(kCcE);
++                e.movM0R(kRcx, kRbx);
++                e.movM0I32(kRdx, 0u);
++                e.patch(jSame, e.p);
++                e.andEaxI32(0xFu);
++                e.orM0Eax(kRdx);
++                if (nativeBcCount)
++                {
++                    e.movRI64(kRcx, reinterpret_cast<uint64_t>(&g_bcSkipped));
++                    e.lockIncM0(kRcx); // g_bcSkipped.fetch_add(1) (relaxed)
++                }
++                jDone = e.jmp();
++                e.patch(jL1, e.p);
++                e.patch(jL2, e.p);
++            }
++            if (hasSticky)
++            {
++                e.movaps(6, 5);
++                e.pshufd(7, 6, 0x4E); e.pi(E::kPor, 6, 7);
++                e.pshufd(7, 6, 0xB1); e.pi(E::kPor, 6, 7);
++                e.movdToEax(6);
++                e.movEdxEax();
++            }
++            else
++                e.movRI32(kRdx, 0u);
++            e.orEdxI32(static_cast<uint32_t>(dest) << 8);
++            e.movaps(6, 4); e.pi(E::kPackssdw, 6, 6); e.pi(E::kPackuswb, 6, 6);
++            e.movdToEax(6);
++            e.movRR(kRdi, kR12);
++            e.movRRd(kRsi, kRax);
++            e.call(reinterpret_cast<const void *>(hFlags));
++            if (jDone)
++                e.patch(jDone, e.p);
++            slow.push_back({jFail, instr, up, e.p});
++            ++nNativeFmac;
++            return true;
++        };
++        // xmm0 -> dst lanes selected by dest (applyDest); clobbers xmm1/xmm2
++        const auto emitApplyDest = [&](int32_t dstOff, uint8_t dest) {
++            if (dest == 0u)
++                return;
++            if (dest == 0xFu)
++            {
++                e.movupsStore(kRbx, dstOff, 0);
++                return;
++            }
++            e.movupsLoad(1, kRbx, dstOff);
++            e.movapsLoad(2, kR13, kPoolDm + dest * 16);
++            e.ps(Vu1Emit::kAndps, 0, 2);
++            e.ps(Vu1Emit::kAndnps, 2, 1);
++            e.ps(Vu1Emit::kOrps, 0, 2);
++            e.movupsStore(kRbx, dstOff, 0);
++        };
++        // fastLower's register-only / load cases inline (exact copies); false = call the helper.
++        uint32_t nNativeLower = 0;
++        std::string helperOps;
++        const auto emitLower = [&](const DecodedInstructionPair &d, uint32_t idx) -> bool {
++            const InstructionUsage &lu = d.lowerUsage;
++            const uint32_t instr = d.lower;
++            const auto vi = [&](uint32_t r) { return oVi0 + static_cast<int32_t>(r) * 4; };
++            const uint32_t mask = dataSize - 1u;
++            const uint32_t major = (instr >> 25) & 0x7Fu;
++            const uint8_t dest = (instr >> 21) & 0xF;
++            const int32_t oVuData = static_cast<int32_t>(offsetof(Vu1JitCtx, vuData));
++            const int32_t oOldVi = static_cast<int32_t>(offsetof(Vu1JitCtx, oldVi));
++            // recordViWriteForBranch for a VI write that delays the next branch read
++            uint8_t recVi = 0u;
++            if (const uint32_t viW = lu.viWrite & 0xFFFEu)
++                if (lu.delaysNextBranchRead)
++                    recVi = static_cast<uint8_t>(__builtin_ctz(viW));
++            const auto addrImm = [&](uint8_t base, int16_t imm) { // eax = ((vi[base] + imm) * 16) & mask
++                e.movRM32(kRax, kRbx, vi(base));
++                e.addEaxI32(static_cast<uint32_t>(static_cast<int32_t>(imm)));
++                e.shlEaxI(4);
++                e.andEaxI32(mask);
++            };
++            const auto addrU16 = [&](uint8_t base) { // eax = ((uint16)vi[base] * 16) & mask
++                e.movRM32(kRax, kRbx, vi(base));
++                e.movzxEaxAx();
++                e.shlEaxI(4);
++                e.andEaxI32(mask);
++            };
++            const auto dataPtr = [&]() { // rcx = vuData + rax
++                e.movRM(kRcx, kR12, oVuData);
++                e.addRcxRax();
++            };
++            const auto incVi = [&](uint8_t r) { // vi[r] = (int16)(vi[r] + 1)
++                e.movRM32(kRax, kRbx, vi(r));
++                e.addEaxI32(1u);
++                e.movsxEaxAx();
++                e.movMR32(kRbx, vi(r), kRax);
++            };
++            const auto storeCall = [&](uint32_t info) { // queueStore(eax, ...)
++                e.movRR(kRdi, kR12);
++                e.movRRd(kRsi, kRax);
++                e.movRI32(kRdx, info);
++                e.call(reinterpret_cast<const void *>(hStore));
++            };
++            const bool dstore = s_nativeDStoreEnv && m_activeVuData == vuData && m_activeVuDataSize == dataSize;
++            const auto storeDirect = [&](uint8_t dmask) { // VU data[eax] lanes <- xmm0 (commit's merge)
++                if (dmask == 0u)
++                    return;
++                dataPtr();
++                if (dmask == 0xFu)
++                {
++                    e.movupsStore(kRcx, 0, 0);
++                    return;
++                }
++                e.movupsLoad(1, kRcx, 0);
++                e.movapsLoad(2, kR13, kPoolDm + dmask * 16);
++                e.ps(Vu1Emit::kAndps, 0, 2);
++                e.ps(Vu1Emit::kAndnps, 2, 1);
++                e.ps(Vu1Emit::kOrps, 0, 2);
++                e.movupsStore(kRcx, 0, 0);
++            };
++            const auto storeVf = [&](uint8_t reg) {
++                if (dstore)
++                {
++                    e.movupsLoad(0, kRbx, oVf + reg * 16);
++                    storeDirect(dest);
++                }
++                else
++                    storeCall((static_cast<uint32_t>(reg) << 8) | dest);
++            };
++            const auto storeVi = [&](uint8_t reg) {
++                if (dstore)
++                {
++                    e.movRR(kRdx, kRax); // keep the address
++                    e.movRM32(kRax, kRbx, vi(reg));
++                    e.movzxEaxAx();
++                    e.movdFromEax(0);
++                    e.pshufd(0, 0, 0);
++                    e.movRR(kRax, kRdx);
++                    storeDirect(dest);
++                }
++                else
++                    storeCall(0x10000u | (static_cast<uint32_t>(reg) << 8) | dest);
++            };
++            const auto lwComp = [&]() -> int32_t { return (dest & 0x8) ? 0 : (dest & 0x4) ? 4 : (dest & 0x2) ? 8 : 12; };
++            const auto readBranchVi = [&](uint8_t r, int dst) {
++                if (r == 0u)
++                {
++                    e.xorRR32(dst);
++                    return;
++                }
++                e.movRM32(dst, kRbx, vi(r));
++                e.cmpM8I(kRbx, oVbv, 0u);
++                uint8_t *const j1 = e.jcc(kCcE);
++                e.cmpM8I(kRbx, off(&m_viBranchBackupReg), r);
++                uint8_t *const j2 = e.jcc(kCcNE);
++                e.movRM32(dst, kRbx, off(&m_viBranchBackupValue));
++                e.patch(j1, e.p);
++                e.patch(j2, e.p);
++            };
++            // Decide first (no code emitted for unsupported ops)
++            enum Op { kNone, kLQ, kSQ, kILW, kISW, kIADDIU, kISUBIU, kFCAND, kIBEQ, kIBNE, kIADD, kIADDI, kIAND, kIOR,
++                      kMOVE, kLQI, kSQI, kMTIR, kMFIR, kILWR, kISWR };
++            Op op = kNone;
++            const bool mem = nativeLowerOk;
++            if (major == 0x00u && mem) op = kLQ;
++            else if (major == 0x01u && mem && s_nativeOpsEnv) op = kSQ;
++            else if (major == 0x04u && mem && s_nativeOpsEnv) op = kILW;
++            else if (major == 0x05u && mem && s_nativeOpsEnv) op = kISW;
++            else if (major == 0x08u) op = kIADDIU;
++            else if (major == 0x09u) op = kISUBIU;
++            else if (major == 0x12u && s_nativeOpsEnv) op = kFCAND;
++            else if ((major == 0x28u || major == 0x29u) && s_nativeOpsEnv) op = major == 0x28u ? kIBEQ : kIBNE;
++            else if (major == 0x40u)
++            {
++                const uint8_t funct = instr & 0x3Fu;
++                if (funct == 0x30u) op = kIADD;
++                else if (funct == 0x32u) op = kIADDI;
++                else if (funct == 0x34u) op = kIAND;
++                else if (funct == 0x35u) op = kIOR;
++                else if (funct >= 0x3Cu)
++                {
++                    const uint8_t funct2 = (uint8_t)((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
++                    if (funct2 == 0x30u) op = kMOVE;
++                    else if (funct2 == 0x34u && mem) op = kLQI;
++                    else if (s_nativeOpsEnv)
++                    {
++                        if (funct2 == 0x35u && mem) op = kSQI;
++                        else if (funct2 == 0x3Cu) op = kMTIR;
++                        else if (funct2 == 0x3Du) op = kMFIR;
++                        else if (funct2 == 0x3Eu && mem) op = kILWR;
++                        else if (funct2 == 0x3Fu && mem) op = kISWR;
++                    }
++                }
++            }
++            if (op == kNone)
++                return false;
++            if (!s_nativeOpsEnv && recVi != 0u)
++                return false;
++            if (recVi != 0u)
++            {
++                e.movRM32(kRax, kRbx, vi(recVi));
++                e.movMR32(kR12, oOldVi, kRax);
++            }
++            const uint8_t it = VIT(instr), is = VIS(instr), id = VID(instr), vfT = FT(instr), vfS = FS(instr);
++            switch (op)
++            {
++            case kLQ:
++                addrImm(is, IMM11(instr));
++                dataPtr();
++                e.movupsLoad(0, kRcx, 0);
++                emitApplyDest(oVf + vfT * 16, dest);
++                if (vfT == 0u && dest != 0u) pairWritesZero = true;
++                break;
++            case kSQ:
++                addrImm(it, IMM11(instr));
++                storeVf(vfS);
++                break;
++            case kILW:
++            case kILWR:
++                if (op == kILW) addrImm(is, IMM11(instr)); else addrU16(is);
++                if (it != 0)
++                {
++                    dataPtr();
++                    e.movsxRM16(kRax, kRcx, lwComp());
++                    e.movMR32(kRbx, vi(it), kRax);
++                }
++                break;
++            case kISW:
++            case kISWR:
++                if (op == kISW) addrImm(is, IMM11(instr)); else addrU16(is);
++                storeVi(it);
++                break;
++            case kIADDIU:
++            case kISUBIU:
++            {
++                const int16_t imm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800);
++                if (it != 0)
++                {
++                    e.movRM32(kRax, kRbx, vi(is));
++                    if (op == kIADDIU)
++                        e.addEaxI32(static_cast<uint32_t>(static_cast<int32_t>(imm)));
++                    else
++                        e.subEaxI32(static_cast<uint32_t>(static_cast<int32_t>(imm)));
++                    e.movsxEaxAx();
++                    e.movMR32(kRbx, vi(it), kRax);
++                }
++                break;
++            }
++            case kFCAND:
++                e.testMI32(kRbx, off(&m_state.clip), instr & 0xFFFFFFu);
++                e.setneAl();
++                e.movzxEaxAl();
++                e.movMR32(kRbx, vi(1), kRax);
++                break;
++            case kIBEQ:
++            case kIBNE:
++            {
++                const int16_t imm = IMM11(instr);
++                const uint32_t target = (idx * 8u + 8u + static_cast<uint32_t>(static_cast<int32_t>(imm) * 8)) & microAddressMask();
++                readBranchVi(is, kRax);
++                readBranchVi(it, kRcx);
++                e.cmpAxCx();
++                uint8_t *const jNo = e.jcc(op == kIBEQ ? kCcNE : kCcE);
++                e.movM8I(kRbx, oBp, 1u);
++                e.movM32I(kRbx, off(&m_state.branchTarget), target);
++                e.movM32I(kRbx, off(&m_state.branchDelay), 1u);
++                e.patch(jNo, e.p);
++                break;
++            }
++            case kIADD:
++            case kIAND:
++            case kIOR:
++                if (id != 0)
++                {
++                    e.movRM32(kRax, kRbx, vi(is));
++                    e.aluRM32(op == kIADD ? 0x03 : op == kIAND ? 0x23 : 0x0B, kRax, kRbx, vi(it));
++                    if (op == kIADD)
++                        e.movsxEaxAx();
++                    e.movMR32(kRbx, vi(id), kRax);
++                }
++                break;
++            case kIADDI:
++            {
++                const int16_t imm5 = (int16_t)((int32_t)((instr >> 6) & 0x1F) << 27 >> 27);
++                if (it != 0)
++                {
++                    e.movRM32(kRax, kRbx, vi(is));
++                    e.addEaxI32(static_cast<uint32_t>(static_cast<int32_t>(imm5)));
++                    e.movsxEaxAx();
++                    e.movMR32(kRbx, vi(it), kRax);
++                }
++                break;
++            }
++            case kMOVE:
++                e.movupsLoad(0, kRbx, oVf + vfS * 16);
++                emitApplyDest(oVf + vfT * 16, dest);
++                if (vfT == 0u && dest != 0u) pairWritesZero = true;
++                break;
++            case kLQI:
++                addrU16(is);
++                dataPtr();
++                e.movupsLoad(0, kRcx, 0);
++                emitApplyDest(oVf + vfT * 16, dest);
++                if (vfT == 0u && dest != 0u) pairWritesZero = true;
++                if (is != 0)
++                    incVi(is);
++                break;
++            case kSQI:
++                addrU16(it);
++                storeVf(vfS);
++                if (it != 0)
++                    incVi(it);
++                break;
++            case kMTIR:
++                if (it != 0)
++                {
++                    e.movRM32(kRax, kRbx, oVf + vfS * 16 + static_cast<int32_t>((instr >> 21) & 0x3u) * 4);
++                    e.movsxEaxAx();
++                    e.movMR32(kRbx, vi(it), kRax);
++                }
++                break;
++            case kMFIR:
++                e.movRM32(kRax, kRbx, vi(is));
++                e.movsxEaxAx();
++                e.movdFromEax(0);
++                e.pshufd(0, 0, 0);
++                emitApplyDest(oVf + vfT * 16, dest);
++                if (vfT == 0u && dest != 0u) pairWritesZero = true;
++                break;
++            default:
++                break;
++            }
++            if (recVi != 0u)
++            {
++                e.movRM32(kRax, kR12, oOldVi);
++                e.movMR32(kRbx, off(&m_viBranchBackupValue), kRax);
++                e.movM8I(kRbx, off(&m_viBranchBackupReg), recVi);
++                e.movM8I(kRbx, oVbv, 1u);
++            }
++            else
++                e.movM8I(kRbx, oVbv, 0u);
++            ++nNativeLower;
++            return true;
++        };
++        // fastUpper's MAX/MINI, ITOF/FTOI and ABS inline (exact copies); false = helper.
++        uint32_t nNativeUpper = 0;
++        const auto emitUpper = [&](uint32_t instr) -> bool {
++            if (!s_nativeOpsEnv)
++                return false;
++            using E = Vu1Emit;
++            const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
++            const bool toAcc = op >= 0x3Cu;
++            const uint8_t code = toAcc ? static_cast<uint8_t>((instr & 3u) | ((instr >> 4) & 0x7Cu)) : op;
++            const uint8_t dest = DEST(instr), fs = FS(instr), ft = FT(instr), fd = FD(instr);
++            if ((instr & 0x7FFu) == 0x2FFu || (instr & 0x7FFu) == 0x33Cu)
++                return false; // NOPs (handled by the 0xFE pre-decode)
++            int32_t dstOff = 0;
++            uint8_t dstReg = 0;
++            if (!toAcc && ((op >= 0x10u && op <= 0x17u) || op == 0x1Du || op == 0x1Fu || op == 0x2Bu || op == 0x2Fu))
++            {
++                const bool isMax = (op >= 0x10u && op <= 0x13u) || op == 0x1Du || op == 0x2Bu;
++                if (op <= 0x17u)
++                {
++                    e.movupsLoad(1, kRbx, oVf + ft * 16);
++                    e.pshufd(1, 1, static_cast<uint8_t>((op & 3u) * 0x55u));
++                }
++                else if (op == 0x1Du || op == 0x1Fu)
++                {
++                    e.movdLoad(1, kRbx, oI);
++                    e.pshufd(1, 1, 0);
++                }
++                else
++                    e.movupsLoad(1, kRbx, oVf + ft * 16);
++                vu1EmitNormPs(e, 1, 4, 5, 6, 7);
++                e.movupsLoad(0, kRbx, oVf + fs * 16);
++                vu1EmitNormPs(e, 0, 4, 5, 6, 7);
++                e.ps(isMax ? E::kMaxps : E::kMinps, 0, 1);
++                dstReg = fd;
++            }
++            else if (toAcc && code >= 0x10u && code <= 0x13u) // ITOF
++            {
++                e.movupsLoad(1, kRbx, oVf + fs * 16);
++                e.sseRR(0, E::kCvtdq2ps, 0, 1);
++                if (code != 0x10u)
++                    e.psM(E::kDivps, 0, kR13, kPoolItof + (code - 0x10) * 16);
++                dstReg = ft;
++            }
++            else if (toAcc && code >= 0x14u && code <= 0x17u) // FTOI
++            {
++                e.movupsLoad(0, kRbx, oVf + fs * 16);
++                vu1EmitNormPs(e, 0, 4, 5, 6, 7);
++                const int32_t sc = kPoolFtoi + (code - 0x14) * 16;
++                e.cvtps2pd(1, 0);                       // lo
++                e.movhlps(0, 0); e.cvtps2pd(2, 0);      // hi
++                e.pdM(0x59, 1, kR13, sc);
++                e.pdM(0x59, 2, kR13, sc);
++                e.movapsLoad(3, kR13, kPoolTwo31); e.movaps(4, 1); e.cmppd(4, 3, 5); // lo >= 2^31
++                e.movaps(5, 2); e.cmppd(5, 3, 5);                                     // hi >= 2^31
++                e.shufps(4, 5, 0x88);
++                e.cvttpd2dq(0, 1);
++                e.cvttpd2dq(2, 2);
++                e.punpcklqdq(0, 2);
++                e.pi(E::kPxor, 0, 4); // 0x80000000 -> 0x7FFFFFFF where clamped high
++                dstReg = ft;
++            }
++            else if (toAcc && code == 0x1Du) // ABS
++            {
++                e.movupsLoad(0, kRbx, oVf + fs * 16);
++                vu1EmitNormPs(e, 0, 4, 5, 6, 7);
++                e.piM(E::kPand, 0, kR13, kPoolAbs);
++                dstReg = ft;
++            }
++            else
++                return false;
++            e.movM32I(kRbx, oCui, instr);
++            dstOff = oVf + dstReg * 16;
++            emitApplyDest(dstOff, dest);
++            if (dstReg == 0u && dest != 0u)
++                pairWritesZero = true;
++            ++nNativeUpper;
++            return true;
++        };
++        const auto callH = [&](Vu1JitHelper h, uint32_t a1, uint32_t a2) {
++            e.movRR(kRdi, kR12);
++            e.movRI32(kRsi, a1);
++            e.movRI32(kRdx, a2);
++            e.call(reinterpret_cast<const void *>(h));
++        };
++        for (uint32_t i = 0; i < len; ++i)
++        {
++            const uint32_t idx = bi + i;
++            const DecodedInstructionPair &d = m_decodedCodeCache[idx];
++            const Vu1PairStall &ps = stallArr[idx];
++            const InstructionUsage &lu = d.lowerUsage;
++            e.movM32I(kRbx, oPc, idx * 8u);
++            pairWritesZero = pairWritesZero || i == 0u || !s_nativeVf0Env; // first pair: VF0/VI0 state unknown
++            const bool resTerms = lu.pipeline == PipelineFdiv || lu.pipeline == PipelineEfu ||
++                                  lu.pipeline == PipelineXgkick || lu.waitQ || lu.waitP;
++            const bool skipReg = i >= ssWindow && noRegArr && noRegArr[idx] != 0u;
++            if (resTerms)
++            {
++                callH(hStall, idx | (skipReg ? 0x10000u : 0u), 0u);
++                e.testEax();
++                exits.push_back({e.jcc(kCcNE), i, kNoPc});
++            }
++            else if (!skipReg)
++            {
++                // same slots as the C++ fixed scan (padding entries are slot 0), duplicates dropped
++                const uint32_t nr = ps.nRead > 8u ? 16u : 8u;
++                uint8_t seen[16];
++                uint32_t ns = 0;
++                for (uint32_t r = 0; r < nr; ++r)
++                {
++                    bool dup = false;
++                    for (uint32_t q = 0; q < ns; ++q)
++                        dup = dup || seen[q] == ps.read[r];
++                    if (!dup)
++                        seen[ns++] = ps.read[r];
++                }
++                e.movRM(kRax, kRbx, oFlat + seen[0] * 8);
++                for (uint32_t q = 1; q < ns; ++q)
++                {
++                    e.movRM(kRcx, kRbx, oFlat + seen[q] * 8);
++                    e.cmpRR(kRax, kRcx);
++                    e.cmovbRR(kRax, kRcx);
++                }
++                e.cmpRM(kRax, kRbx, oCyc);
++                uint8_t *const jOk = e.jcc(kCcBE);
++                if (s_nativeStallEnv)
++                {
++                    e.cmpRM(kRax, kR12, oBudget);
++                    uint8_t *const jBudget = e.jcc(kCcAE);
++                    stallCalls.push_back(e.callRel());
++                    uint8_t *const jDone = e.jmp();
++                    e.patch(jBudget, e.p);
++                    callH(hStall, idx, 0u);
++                    e.testEax();
++                    exits.push_back({e.jcc(kCcNE), i, kNoPc});
++                    e.patch(jDone, e.p);
++                }
++                else
++                {
++                    callH(hStall, idx, 0u);
++                    e.testEax();
++                    exits.push_back({e.jcc(kCcNE), i, kNoPc});
++                }
++                e.patch(jOk, e.p);
++            }
++            const uint8_t up = upPreArr[idx];
++            if (up == 0xFEu)
++                e.movM32I(kRbx, oCui, d.upper);
++            else if (up != 0xFFu)
++            {
++                if (!emitFmac(idx, d.upper, up))
++                {
++                    pairWritesZero = true;
++                    callH(hFmac, d.upper, up);
++                }
++            }
++            else if (!emitUpper(d.upper))
++            {
++                pairWritesZero = true;
++                callH(hUpper, d.upper, 0u);
++                if (vu1NativeStats())
++                {
++                    char buf[24];
++                    std::snprintf(buf, sizeof buf, " U%03x", d.upper & 0x7FFu);
++                    helperOps += buf;
++                }
++            }
++            if (!d.iBit && (d.lower == 0x00000000u || d.lower == 0x8000033Cu) && (lu.viWrite & 0xFFFEu) == 0u)
++                e.movM8I(kRbx, oVbv, 0u); // fastLower's NOP case: nothing but the backup reset
++            else if (d.iBit && (lu.viWrite & 0xFFFEu) == 0u)
++            {
++                float immediate = 0.0f;
++                std::memcpy(&immediate, &d.lower, sizeof(immediate));
++                const float nv = normalizeOperand(immediate);
++                uint32_t nb = 0u;
++                std::memcpy(&nb, &nv, sizeof(nb));
++                e.movM32I(kRbx, oI, nb);
++                e.movM8I(kRbx, oVbv, 0u);
++            }
++            else if (d.iBit || !emitLower(d, idx))
++            {
++                pairWritesZero = true;
++                callH(hLower, idx, 0u);
++                if (vu1NativeStats())
++                {
++                    char buf[24];
++                    std::snprintf(buf, sizeof buf, " L%02x/%02x%s", (d.lower >> 25) & 0x7Fu,
++                                  ((d.lower >> 25) & 0x7Fu) == 0x40u && (d.lower & 0x3Fu) >= 0x3Cu
++                                      ? ((d.lower & 0x3u) | ((d.lower >> 4) & 0x7Cu)) : (d.lower & 0x3Fu),
++                                  ((d.lower >> 25) & 0x7Fu) == 0x40u && (d.lower & 0x3Fu) >= 0x3Cu ? "f2" : (d.lowerUsage.delaysNextBranchRead ? "r" : ""));
++                    helperOps += buf;
++                }
++            }
++            mayBranch = mayBranch || pairBranches(idx);
++            {
++                // ready-slot writes in the C++ order; a slot written again later is skipped
++                const uint32_t nw = ps.nWrite > 8u ? 16u : 8u;
++                e.movRM(kRax, kRbx, oCyc);
++                for (uint32_t k = 0; k < nw; ++k)
++                {
++                    bool later = false;
++                    for (uint32_t k2 = k + 1u; k2 < nw; ++k2)
++                        later = later || ps.write[k2] == ps.write[k];
++                    if (later)
++                        continue;
++                    if (ps.writeLat[k] == 0u)
++                        e.movMR(kRbx, oFlat + ps.write[k] * 8, kRax);
++                    else
++                    {
++                        e.leaRM(kRcx, kRax, ps.writeLat[k]);
++                        e.movMR(kRbx, oFlat + ps.write[k] * 8, kRcx);
++                    }
++                }
++            }
++            if (pairWritesZero)
++            {
++                // nothing but this pair's ops can write VF0/VI0 (pipelines never queue reg 0), so
++                // the reset is only emitted after a pair that may have written them
++                e.movM32I(kRbx, oVf0, 0u);
++                e.movM32I(kRbx, oVf0 + 4, 0u);
++                e.movM32I(kRbx, oVf0 + 8, 0u);
++                e.movM32I(kRbx, oVf0 + 12, 0x3F800000u);
++                e.movM32I(kRbx, oVi0, 0u);
++            }
++            pairWritesZero = false;
++            uint32_t pairPc = kNoPc;
++            {
++                uint32_t nextPc = idx * 8u + 8u;
++                if (nextPc >= codeSize)
++                    nextPc = 0u;
++                if (mayBranch)
++                {
++                    e.movM32I(kRbx, oPc, nextPc);
++                    e.cmpM8I(kRbx, oBp, 0u);
++                    uint8_t *const jNoBr = e.jcc(kCcE);
++                    callH(hPcBranch, 0u, 0u);
++                    e.patch(jNoBr, e.p);
++                    pairPc = kNoPc;
++                }
++                else
++                {
++                    // branchPending is false here: the pc store is left to the exits / block end
++                    // (the next pair stores its own pc first)
++                    pairPc = nextPc;
++                    if (i + 1u == len)
++                        e.movM32I(kRbx, oPc, nextPc);
++                }
++            }
++            e.movRM(kRax, kRbx, oCyc);
++            e.incR(kRax);
++            e.movMR(kRbx, oCyc, kRax);
++            e.movMR(kRbx, oCycles, kRax);
++            e.cmpM0R(kR14, kRbx);
++            uint8_t *const jCommit = e.jcc(kCcNE);
++            e.cmpRM0(kRax, kR15);
++            uint8_t *const jSkipCommit = e.jcc(kCcB);
++            e.patch(jCommit, e.p);
++            callH(hCommit, 0u, 0u);
++            e.patch(jSkipCommit, e.p);
++            e.cmpM8I(kRbx, oXga, 0u);
++            uint8_t *const jNoX = e.jcc(kCcE);
++            callH(hXgkick, 0u, 0u);
++            e.patch(jNoX, e.p);
++            e.cmpM8I(kRbx, oStop, 0u);
++            exits.push_back({e.jcc(kCcNE), i + 1u, i + 1u == len ? kNoPc : pairPc});
++            e.cmpM8I(kRbx, oEbit, 0u);
++            exits.push_back({e.jcc(kCcNE), i + 1u, i + 1u == len ? kNoPc : pairPc});
++            e.movRM(kRax, kRbx, oCyc);
++            e.cmpRM(kRax, kR12, oBudget);
++            exits.push_back({e.jcc(kCcAE), i + 1u, i + 1u == len ? kNoPc : pairPc});
++        }
++        e.movRI32(kRax, len);
++        uint8_t *const epi = e.p;
++        e.pop(kR15);
++        e.pop(kR14);
++        e.pop(kR13);
++        e.pop(kR12);
++        e.pop(kRbx);
++        e.ret();
++        if (!stallCalls.empty())
++        {
++            // advanceTo(rax) for rax < budgetEnd (called with rsp 16-aligned -> realign)
++            const int32_t oTgt = static_cast<int32_t>(offsetof(Vu1JitCtx, stallTarget));
++            for (uint8_t *c : stallCalls)
++                e.patch(c, e.p);
++            e.subRsp8();
++            e.movMR(kR12, oTgt, kRax);
++            uint8_t *const top = e.p;
++            e.movRM(kRdx, kRbx, oCyc);
++            e.cmpRM(kRdx, kR12, oTgt);
++            uint8_t *const jEnd = e.jcc(kCcAE);
++            if (s_jitOnRun)
++            {
++                e.cmpM8I(kRbx, oXga, 0u);
++                uint8_t *const a1 = e.jcc(kCcNE);
++                e.cmpM0R(kR14, kRbx);
++                uint8_t *const a2 = e.jcc(kCcNE);
++                e.movRM(kRcx, kR15, 0);
++                e.leaRM(kRsi, kRdx, 1);
++                e.cmpRR(kRcx, kRsi);
++                uint8_t *const a3 = e.jcc(kCcBE);           // hint <= cycle + 1
++                e.movRM(kRax, kR12, oTgt);
++                e.cmpRR(kRcx, kRax);
++                e.cmovaRR(kRcx, kRax);                       // min(target, hint)
++                e.leaRM(kRcx, kRcx, -1);
++                e.cmpRR(kRcx, kRdx);
++                uint8_t *const a4 = e.jcc(kCcBE);           // jumpTo <= cycle
++                e.movRR(kRdx, kRcx);
++                e.patch(a1, e.p); e.patch(a2, e.p); e.patch(a3, e.p); e.patch(a4, e.p);
++            }
++            e.incR(kRdx);
++            e.movMR(kRbx, oCyc, kRdx);
++            e.movMR(kRbx, oCycles, kRdx);
++            e.cmpM0R(kR14, kRbx);
++            uint8_t *const c1 = e.jcc(kCcNE);
++            e.cmpRM0(kRdx, kR15);
++            uint8_t *const c2 = e.jcc(kCcB);
++            e.patch(c1, e.p);
++            callH(hCommit, 0u, 0u);
++            e.patch(c2, e.p);
++            e.cmpM8I(kRbx, oXga, 0u);
++            uint8_t *const x1 = e.jcc(kCcE);
++            callH(hXgkick, 0u, 0u);
++            e.patch(x1, e.p);
++            e.patch(e.jmp(), top);
++            e.patch(jEnd, e.p);
++            e.addRsp8();
++            e.ret();
++        }
++        for (const SlowStub &st : slow)
++        {
++            e.patch(st.jmpEnd, e.p);
++            callH(hFmac, st.instr, st.up);
++            e.patch(e.jmp(), st.back);
++        }
++        for (const Exit &x : exits)
++        {
++            e.patch(x.jmpEnd, e.p);
++            if (x.pc != kNoPc)
++                e.movM32I(kRbx, oPc, x.pc);
++            e.movRI32(kRax, x.done);
++            e.patch(e.jmp(), epi);
++        }
++        if (e.overflow)
++            return kVu1NativeFailed;
++        ar.used += static_cast<size_t>(e.p - start);
++        ar.used = (ar.used + 15u) & ~static_cast<size_t>(15u);
++        ++ar.blocks;
++        ar.pairs += len;
++        if (vu1NativeStats())
++            std::fprintf(stderr, "[vu1:native] block pc=0x%04x len=%u fmac=%u upper=%u lower=%u bytes=%zu (arena %zu KB, %llu blocks, %llu pairs)\n",
++                         bi * 8u, len, nNativeFmac, nNativeUpper, nNativeLower, static_cast<size_t>(e.p - start), ar.used >> 10,
++                         (unsigned long long)ar.blocks, (unsigned long long)ar.pairs);
++        if (vu1NativeStats() && !helperOps.empty())
++            std::fprintf(stderr, "[vu1:native]   helpers:%s\n", helperOps.c_str());
++        return start;
++    };
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         if (!skipCommitOn || committedCycle != m_cycle)
+@@ -3557,6 +4625,25 @@
+             {
+                 const uint32_t entryPc = m_state.pc;
+                 uint32_t done = 0u;
++                bool ranNative = false;
++                if (nativeOn)
++                {
++                    const uint64_t key = (static_cast<uint64_t>(codeSize) << 32) | dataSize;
++                    if (runXl->native.size() != beCount || runXl->nativeKey != key)
++                    {
++                        runXl->native.assign(beCount, nullptr); // (old code stays in the arena)
++                        runXl->nativeKey = key;
++                    }
++                    void *&slot = runXl->native[bi];
++                    if (!slot)
++                        slot = compileBlock(bi, len);
++                    if (slot != kVu1NativeFailed)
++                    {
++                        done = reinterpret_cast<Vu1NativeFn>(slot)(this, &jctx);
++                        ranNative = true;
++                    }
++                }
++                if (!ranNative)
+                 for (; done < len; ++done)
+                 {
+                     const uint32_t idx = bi + done;
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_native.inl
+@@ -0,0 +1,281 @@
++// ps2_vu1_native.inl - PS2X_VU1_NATIVE: x86-64 code for the VU1 block executor's blocks.
++// Included inside an anonymous namespace of ps2_vu1_core.cpp (no CMake change needed).
++//
++// Milestone 1 ("call-threaded" native blocks): every pair of a block is emitted as straight-line
++// x86-64 with all per-pair constants baked in. The stall check (max over the pair's ready slots
++// against m_cycle), the ready-slot writes, the VF0/VI0 reset, PC update, cycle advance, commit
++// hint test, XGKICK test and stop test are inline. The upper and lower ops are direct calls
++// into the exact interpreter code (fmacCore/execUpper, fastLower/execLower), and so is any
++// actual stall. The C++ block loop stays the fallback and the BC_CHECK reference
++// runs the plain interpreter.
++//
++// Milestone 2: native SSE2 FMAC (exact vu1FmacSimd math; rejected lanes call the C++ path),
++// inline dead-flag carry. Milestone 3: native MAX/MINI/ITOF/FTOI/ABS uppers, native
++// LQ/LQI/SQ/SQI/ILW/ILWR/ISW/ISWR/MOVE/MTIR/MFIR/FCAND/IADD*/IAND/IOR/IBEQ/IBNE lowers (incl. the
++// branch-read VI backup), VF0/VI0 reset only after a pair that may write them, I-bit immediates.
++// Default ON since milestone 3 (0 mismatches: 1.22M BC_CHECK runs / 200 s title-path scene and
++// 0.98M runs / 200 s slot-4 save scene). PS2X_VU1_NATIVE=0 reverts to the C++ block loop.
++// Sub-switches: PS2X_VU1_NATIVE_FMAC=0, PS2X_VU1_NATIVE_OPS=0 (milestone-2 op set),
++// PS2X_VU1_NATIVE_VF0=0 (reset every pair), PS2X_VU1_NATIVE_STATS=1 (log blocks + helper ops).
++
++struct Vu1JitCtx
++{
++    void *stall = nullptr;   // lambdas of the current run() (type-erased)
++    void *fmac = nullptr;
++    void *upper = nullptr;
++    void *lower = nullptr;
++    void *pcBranch = nullptr;
++    void *flags = nullptr;
++    const uint8_t *vuData = nullptr;
++    int32_t oldVi = 0;
++    uint64_t stallTarget = 0;
++    void *store = nullptr;
++    void *commit = nullptr;
++    void *xgkick = nullptr;
++    uint64_t budgetEnd = 0;
++};
++using Vu1JitHelper = uint32_t (*)(Vu1JitCtx *, uint32_t, uint32_t);
++using Vu1NativeFn = uint32_t (*)(void *self, Vu1JitCtx *ctx);
++static void *const kVu1NativeFailed = reinterpret_cast<void *>(1);
++
++bool vu1NativeOn()
++{
++    static const bool on = []() { const char *e = std::getenv("PS2X_VU1_NATIVE"); return !(e && e[0] == '0'); }();
++    return on;
++}
++bool vu1NativeStats()
++{
++    static const bool on = []() { const char *e = std::getenv("PS2X_VU1_NATIVE_STATS"); return e && e[0] == '1'; }();
++    return on;
++}
++
++// Per-thread executable arena (Vu1Xlat caches are thread_local too, and the emitted code
++// embeds this thread's TLS addresses of the commit hint).
++struct Vu1CodeArena
++{
++    uint8_t *base = nullptr;
++    size_t size = 0, used = 0;
++    bool failed = false;
++    uint64_t blocks = 0, pairs = 0;
++    bool reserve()
++    {
++        if (base || failed)
++            return base != nullptr;
++        size = 64u << 20;
++        void *m = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (m == MAP_FAILED)
++        {
++            failed = true;
++            std::fprintf(stderr, "[vu1:native] mmap of the code arena failed; native blocks disabled\n");
++            return false;
++        }
++        base = static_cast<uint8_t *>(m);
++        return true;
++    }
++};
++thread_local Vu1CodeArena tl_vu1Arena;
++
++enum : int { kRax = 0, kRcx = 1, kRdx = 2, kRbx = 3, kRsp = 4, kRbp = 5, kRsi = 6, kRdi = 7, kR12 = 12, kR13 = 13, kR14 = 14, kR15 = 15 };
++enum : uint8_t { kCcB = 0x2, kCcAE = 0x3, kCcE = 0x4, kCcNE = 0x5, kCcBE = 0x6, kCcA = 0x7 };
++
++struct Vu1Emit
++{
++    uint8_t *p = nullptr, *end = nullptr;
++    bool overflow = false;
++    void b(uint8_t v) { if (p < end) *p++ = v; else overflow = true; }
++    void d32(uint32_t v) { for (int i = 0; i < 4; ++i) b(static_cast<uint8_t>(v >> (8 * i))); }
++    void d64(uint64_t v) { for (int i = 0; i < 8; ++i) b(static_cast<uint8_t>(v >> (8 * i))); }
++    void rex(bool w, int reg, int rm)
++    {
++        const uint8_t r = static_cast<uint8_t>(0x40 | (w ? 8 : 0) | ((reg & 8) ? 4 : 0) | ((rm & 8) ? 1 : 0));
++        if (r != 0x40)
++            b(r);
++    }
++    void mem(int reg, int base, int32_t disp) // [base + disp32]
++    {
++        b(static_cast<uint8_t>(0x80 | ((reg & 7) << 3) | (base & 7)));
++        if ((base & 7) == 4)
++            b(0x24);
++        d32(static_cast<uint32_t>(disp));
++    }
++    void movRM(int reg, int base, int32_t disp) { rex(true, reg, base); b(0x8B); mem(reg, base, disp); }
++    void movMR(int base, int32_t disp, int reg) { rex(true, reg, base); b(0x89); mem(reg, base, disp); }
++    void movM32I(int base, int32_t disp, uint32_t imm) { rex(false, 0, base); b(0xC7); mem(0, base, disp); d32(imm); }
++    void movM8I(int base, int32_t disp, uint8_t imm) { rex(false, 0, base); b(0xC6); mem(0, base, disp); b(imm); }
++    void cmpM8I(int base, int32_t disp, uint8_t imm) { rex(false, 0, base); b(0x80); mem(7, base, disp); b(imm); }
++    void cmpRM(int reg, int base, int32_t disp) { rex(true, reg, base); b(0x3B); mem(reg, base, disp); }
++    void cmpRR(int a, int c) { rex(true, c, a); b(0x39); b(static_cast<uint8_t>(0xC0 | ((c & 7) << 3) | (a & 7))); } // flags of a - c
++    void cmovbRR(int dst, int src) { rex(true, dst, src); b(0x0F); b(0x42); b(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7))); }
++    void leaRM(int dst, int base, int32_t disp) { rex(true, dst, base); b(0x8D); mem(dst, base, disp); }
++    void movRR(int dst, int src) { rex(true, src, dst); b(0x89); b(static_cast<uint8_t>(0xC0 | ((src & 7) << 3) | (dst & 7))); }
++    void movRI32(int r, uint32_t imm) { rex(false, 0, r); b(static_cast<uint8_t>(0xB8 | (r & 7))); d32(imm); }
++    void movRI64(int r, uint64_t imm) { rex(true, 0, r); b(static_cast<uint8_t>(0xB8 | (r & 7))); d64(imm); }
++    void incR(int r) { rex(true, 0, r); b(0xFF); b(static_cast<uint8_t>(0xC0 | (r & 7))); }
++    void callR(int r) { rex(false, 0, r); b(0xFF); b(static_cast<uint8_t>(0xD0 | (r & 7))); }
++    void call(const void *fn) { movRI64(kRax, reinterpret_cast<uint64_t>(fn)); callR(kRax); }
++    void push(int r) { if (r & 8) b(0x41); b(static_cast<uint8_t>(0x50 | (r & 7))); }
++    void pop(int r) { if (r & 8) b(0x41); b(static_cast<uint8_t>(0x58 | (r & 7))); }
++    void ret() { b(0xC3); }
++    void testEax() { b(0x85); b(0xC0); }
++    // cmp qword [base], reg   (no displacement; base must not be rsp/rbp/r12/r13)
++    void cmpM0R(int base, int reg) { rex(true, reg, base); b(0x39); b(static_cast<uint8_t>(((reg & 7) << 3) | (base & 7))); }
++    // cmp reg, qword [base]
++    void cmpRM0(int reg, int base) { rex(true, reg, base); b(0x3B); b(static_cast<uint8_t>(((reg & 7) << 3) | (base & 7))); }
++    uint8_t *jcc(uint8_t cc) { b(0x0F); b(static_cast<uint8_t>(0x80 | cc)); d32(0); return p; }
++    uint8_t *jmp() { b(0xE9); d32(0); return p; }
++    uint8_t *callRel() { b(0xE8); d32(0); return p; }
++    void subRsp8() { b(0x48); b(0x83); b(0xEC); b(0x08); }
++    void addRsp8() { b(0x48); b(0x83); b(0xC4); b(0x08); }
++    void cmovaRR(int dst, int src) { rex(true, dst, src); b(0x0F); b(0x47); b(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7))); }
++    // ---- SSE (xmm0..xmm7) ----
++    void sseRR(uint8_t pfx, uint8_t op, int x, int y)
++    {
++        if (pfx) b(pfx);
++        rex(false, x, y);
++        b(0x0F); b(op);
++        b(static_cast<uint8_t>(0xC0 | ((x & 7) << 3) | (y & 7)));
++    }
++    void sseRM(uint8_t pfx, uint8_t op, int x, int base, int32_t disp)
++    {
++        if (pfx) b(pfx);
++        rex(false, x, base);
++        b(0x0F); b(op);
++        mem(x, base, disp);
++    }
++    void movupsLoad(int x, int base, int32_t d) { sseRM(0, 0x10, x, base, d); }
++    void movupsStore(int base, int32_t d, int x) { sseRM(0, 0x11, x, base, d); }
++    void movaps(int x, int y) { sseRR(0, 0x28, x, y); }
++    void movapsLoad(int x, int base, int32_t d) { sseRM(0, 0x28, x, base, d); } // 16-aligned
++    void movdLoad(int x, int base, int32_t d) { sseRM(0x66, 0x6E, x, base, d); }
++    void movdToEax(int x) { sseRR(0x66, 0x7E, x, kRax); }
++    void pmovmskbEax(int x) { sseRR(0x66, 0xD7, kRax, x); }
++    void psrld(int x, uint8_t imm) { sseRR(0x66, 0x72, 2, x); b(imm); }
++    void pshufd(int x, int y, uint8_t imm) { sseRR(0x66, 0x70, x, y); b(imm); }
++    void shufps(int x, int y, uint8_t imm) { sseRR(0, 0xC6, x, y); b(imm); }
++    void cmpps(int x, int y, uint8_t pred) { sseRR(0, 0xC2, x, y); b(pred); }
++    void cmppd(int x, int y, uint8_t pred) { sseRR(0x66, 0xC2, x, y); b(pred); }
++    void cvtps2pd(int x, int y) { sseRR(0, 0x5A, x, y); }
++    void movhlps(int x, int y) { sseRR(0, 0x12, x, y); }
++    // packed ops: dst op= src (register) or dst op= [base+d]
++    enum : uint8_t { kAndps = 0x54, kAndnps = 0x55, kOrps = 0x56, kXorps = 0x57, kAddps = 0x58, kMulps = 0x59, kSubps = 0x5C };
++    enum : uint8_t { kPand = 0xDB, kPandn = 0xDF, kPor = 0xEB, kPxor = 0xEF, kPcmpeqd = 0x76, kPcmpgtd = 0x66,
++                     kPackssdw = 0x6B, kPackuswb = 0x67 };
++    void ps(uint8_t op, int x, int y) { sseRR(0, op, x, y); }
++    void pd(uint8_t op, int x, int y) { sseRR(0x66, op, x, y); } // addpd 0x58, mulpd 0x59
++    void pi(uint8_t op, int x, int y) { sseRR(0x66, op, x, y); }
++    void piM(uint8_t op, int x, int base, int32_t d) { sseRM(0x66, op, x, base, d); } // 16-aligned mem
++    void pdM(uint8_t op, int x, int base, int32_t d) { sseRM(0x66, op, x, base, d); }
++    // ---- a few more GPR forms ----
++    void addRaxI32(uint32_t imm) { b(0x48); b(0x05); d32(imm); }
++    void andEaxI32(uint32_t imm) { b(0x25); d32(imm); }
++    void movEdxEax() { b(0x89); b(0xC2); }
++    void orM0Eax(int base) { rex(false, 0, base); b(0x09); b(static_cast<uint8_t>(base & 7)); } // or dword [base], eax
++    void lockIncM0(int base) { b(0xF0); rex(true, 0, base); b(0xFF); b(static_cast<uint8_t>(base & 7)); } // lock inc qword [base]
++    void movRM32(int reg, int base, int32_t disp) { rex(false, reg, base); b(0x8B); mem(reg, base, disp); }
++    void movMR32(int base, int32_t disp, int reg) { rex(false, reg, base); b(0x89); mem(reg, base, disp); }
++    void aluRM32(uint8_t op, int reg, int base, int32_t disp) { rex(false, reg, base); b(op); mem(reg, base, disp); } // 03 add, 23 and, 0B or
++    void addEaxI32(uint32_t imm) { b(0x05); d32(imm); }
++    void subEaxI32(uint32_t imm) { b(0x2D); d32(imm); }
++    void movsxEaxAx() { b(0x0F); b(0xBF); b(0xC0); }
++    void movzxEaxAx() { b(0x0F); b(0xB7); b(0xC0); }
++    void shlEaxI(uint8_t n) { b(0xC1); b(0xE0); b(n); }
++    void addRcxRax() { b(0x48); b(0x01); b(0xC1); }
++    void movsxRM16(int reg, int base, int32_t disp) { rex(false, reg, base); b(0x0F); b(0xBF); mem(reg, base, disp); }
++    void testMI32(int base, int32_t disp, uint32_t imm) { rex(false, 0, base); b(0xF7); mem(0, base, disp); d32(imm); }
++    void setneAl() { b(0x0F); b(0x95); b(0xC0); }
++    void movzxEaxAl() { b(0x0F); b(0xB6); b(0xC0); }
++    void cmpAxCx() { b(0x66); b(0x39); b(0xC8); }
++    void xorRR32(int r) { rex(false, r, r); b(0x31); b(static_cast<uint8_t>(0xC0 | ((r & 7) << 3) | (r & 7))); }
++    void movdFromEax(int x) { sseRR(0x66, 0x6E, x, kRax); }
++    void psM(uint8_t op, int x, int base, int32_t d) { sseRM(0, op, x, base, d); }
++    enum : uint8_t { kCvtdq2ps = 0x5B, kMinps = 0x5D, kDivps = 0x5E, kMaxps = 0x5F };
++    void cvttpd2dq(int x, int y) { sseRR(0x66, 0xE6, x, y); }
++    void punpcklqdq(int x, int y) { sseRR(0x66, 0x6C, x, y); }
++    void movM0R(int base, int reg) { rex(true, reg, base); b(0x89); b(static_cast<uint8_t>(((reg & 7) << 3) | (base & 7))); }
++    void movM0I32(int base, uint32_t imm) { rex(false, 0, base); b(0xC7); b(static_cast<uint8_t>(base & 7)); d32(imm); }
++    void shlEdxI(uint8_t n) { b(0xC1); b(0xE2); b(n); }
++    void orEdxI32(uint32_t imm) { b(0x81); b(0xCA); d32(imm); }
++    void movRRd(int dst, int src) { rex(false, src, dst); b(0x89); b(static_cast<uint8_t>(0xC0 | ((src & 7) << 3) | (dst & 7))); }
++    void patch(uint8_t *after, const uint8_t *target)
++    {
++        if (overflow || !after)
++            return;
++        const int32_t rel = static_cast<int32_t>(target - after);
++        std::memcpy(after - 4, &rel, 4);
++    }
++};
++
++// Constant pool for the native FMAC code (r13 points here; SSE memory operands need 16-byte alignment).
++struct alignas(16) Vu1NativePool
++{
++    uint32_t sign[4], ff[4], maxv[4], c3[4], c252[4], one[4], abs[4], ones[4];
++    double k20[2];
++    uint32_t zero[4];
++    float itofDiv[4][4];   // 1, 16, 4096, 32768
++    double ftoiMul[4][2];  // 1, 16, 4096, 32768
++    double two31[2];
++    uint32_t dm[16][4]; // dest masks, lane0 = x (dest bit 8)
++};
++inline const Vu1NativePool &vu1NativePool()
++{
++    static const Vu1NativePool pool = []() {
++        Vu1NativePool p{};
++        for (int c = 0; c < 4; ++c)
++        {
++            p.sign[c] = 0x80000000u; p.ff[c] = 0xFFu; p.maxv[c] = 0x7F7FFFFFu; p.c3[c] = 3u; p.c252[c] = 252u;
++            p.one[c] = 1u; p.abs[c] = 0x7FFFFFFFu; p.ones[c] = 0xFFFFFFFFu; p.zero[c] = 0u;
++        }
++        p.k20[0] = p.k20[1] = 1048576.0;
++        {
++            static constexpr float sc[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
++            for (int k = 0; k < 4; ++k)
++            {
++                for (int c = 0; c < 4; ++c)
++                    p.itofDiv[k][c] = sc[k];
++                p.ftoiMul[k][0] = p.ftoiMul[k][1] = static_cast<double>(sc[k]);
++            }
++            p.two31[0] = p.two31[1] = 2147483648.0;
++        }
++        for (int d = 0; d < 16; ++d)
++        {
++            p.dm[d][0] = (d & 8) ? ~0u : 0u;
++            p.dm[d][1] = (d & 4) ? ~0u : 0u;
++            p.dm[d][2] = (d & 2) ? ~0u : 0u;
++            p.dm[d][3] = (d & 1) ? ~0u : 0u;
++        }
++        return p;
++    }();
++    return pool;
++}
++enum : int32_t
++{
++    kPoolSign = offsetof(Vu1NativePool, sign), kPoolFF = offsetof(Vu1NativePool, ff), kPoolMaxv = offsetof(Vu1NativePool, maxv),
++    kPoolC3 = offsetof(Vu1NativePool, c3), kPoolC252 = offsetof(Vu1NativePool, c252), kPoolOne = offsetof(Vu1NativePool, one),
++    kPoolAbs = offsetof(Vu1NativePool, abs), kPoolOnes = offsetof(Vu1NativePool, ones), kPoolK20 = offsetof(Vu1NativePool, k20),
++    kPoolDm = offsetof(Vu1NativePool, dm), kPoolItof = offsetof(Vu1NativePool, itofDiv),
++    kPoolFtoi = offsetof(Vu1NativePool, ftoiMul), kPoolTwo31 = offsetof(Vu1NativePool, two31)
++};
++
++// vu1NormPs(x) in place; t1..t4 are scratch (all distinct from x).
++inline void vu1EmitNormPs(Vu1Emit &e, int x, int t1, int t2, int t3, int t4)
++{
++    e.movaps(t1, x); e.piM(Vu1Emit::kPand, t1, kR13, kPoolSign);            // sign
++    e.movaps(t2, x); e.psrld(t2, 23); e.piM(Vu1Emit::kPand, t2, kR13, kPoolFF); // e
++    e.pi(Vu1Emit::kPxor, t3, t3); e.pi(Vu1Emit::kPcmpeqd, t3, t2);           // isZ
++    e.piM(Vu1Emit::kPcmpeqd, t2, kR13, kPoolFF);                           // isM
++    e.movaps(t4, t3); e.pi(Vu1Emit::kPor, t4, t2); e.pi(Vu1Emit::kPandn, t4, x); // ~(isZ|isM) & b
++    e.pi(Vu1Emit::kPand, t3, t1);                                          // isZ & sign
++    e.pi(Vu1Emit::kPor, t4, t3);
++    e.piM(Vu1Emit::kPor, t1, kR13, kPoolMaxv);                             // sign | 0x7F7FFFFF
++    e.pi(Vu1Emit::kPand, t2, t1);                                          // isM & maxv
++    e.pi(Vu1Emit::kPor, t4, t2);
++    e.movaps(x, t4);
++}
++// vu1ExpOut(r) -> out (lanes with exponent < 3 or > 252); t is scratch.
++inline void vu1EmitExpOut(Vu1Emit &e, int out, int r, int t)
++{
++    e.movaps(out, r); e.psrld(out, 23); e.piM(Vu1Emit::kPand, out, kR13, kPoolFF);
++    e.movapsLoad(t, kR13, kPoolC3); e.pi(Vu1Emit::kPcmpgtd, t, out); // 3 > e
++    e.piM(Vu1Emit::kPcmpgtd, out, kR13, kPoolC252);                  // e > 252
++    e.pi(Vu1Emit::kPor, out, t);
++}

@@ -971,3 +971,61 @@ Results (same session while Stelios was streaming, so absolute numbers are lower
 vifw/s 19.36. BC_CHECK 181 s: 1020000 runs, 0 mismatches.
 Remaining VU1 worker profile: fmacCore ~27%, run/block loop ~34%, fastLower ~10%,
 commitReadyPipelines ~9% (one call per live FMAC flag entry), execLower ~3%.
+
+## GS GPU backend: content-hashed texture cache, lazy Present, faster host->local upload (Nov 19 2026, uncommitted)
+Patch: `patches/ps2recomp-gs-gpu-texcache2-lazypresent-uploadfast.patch` (gs_gpu_backend.inl,
+gs_cpu_backend.cpp, gs_cpu_backend.h; backups `*.pre-texcache2.bak`). Only affects PS2X_GS_GPU=1,
+except UPLOAD_FAST which is in GSCpuBackend::UploadImage (bit-exact, used by both paths).
+Why: the generation-only cache missed 88% of the time (6500 decodes vs 900 hits per 5 s). Pages are
+re-uploaded every frame with the same bytes, and several textures share VRAM slots.
+- `PS2X_GS_TEXCACHE2` (default on, `=0` = old generation-only cache; unrelated to the CPU path's
+  PS2X_GS_TEXCACHE_OFF): when the page generations of a texture's range change, the source pages
+  are hashed (64-bit, 8 KiB pages, re-hashed only when that page's generation moved). The texture
+  key gets that content hash, so identical re-uploads and A/B textures sharing a slot hit instead of
+  re-running ReadTexture/DecodeTextureRgba/glTexSubImage. Entries not bound for ~120 presents are
+  evicted above 256 MB / 4096 entries (the old clear-all at 768 MB stays as a backstop).
+  Result: decodes 6500 -> ~185 per 5 s, hits 900 -> ~7700. The decodes left are real content
+  changes (render-to-texture of fbp 70/350/382).
+- `PS2X_GS_PRESENT_LAZY` (default on): Present no longer runs resolveAll + a 4 MiB VRAM snapshot.
+  It resolves only what Present can read: enabled DISPFBs at their display height and the preferred
+  source. The context frames are only read by the fbp-0 all-black fallback, so they are
+  resolved after the fact, and the frame redone, only if that fallback could have been taken
+  (`PS2X_GS_PRESENT_CTXLAZY=0` resolves them up front). It then converts in place
+  (GSCpuBackend::PresentInPlace). It reuses the last converted frame (one per field parity,
+  since this game runs interlaced field mode) when the request and the read pages are unchanged.
+  Result: the in-progress fbp 70 back buffer is no longer read back every vsync. Resolved px went
+  from 75M to 40M per 5 s, and ~58% of presents reuse the converted frame.
+- `PS2X_GS_UPLOAD_FAST` (default on): UploadImage steps x/y instead of doing div/mod per pixel,
+  and calls the write function directly. Same writes, same order, same transfer state.
+Debug compare modes (decode/convert anyway and compare bytes):
+  `PS2X_GS_TEXCACHE2_CHECK=1` (texels of every cache hit vs a fresh decode),
+  `PS2X_GS_PRESENT_CHECK=1` (every Present vs full resolveAll + original snapshot Present),
+  `PS2X_GS_UPLOAD_CHECK=1` (fast vs old upload on the same input: VRAM bytes + transfer state).
+  Stats line additions under `PS2X_GS_GPU_STATS=1` (tc2/hash/evict/present counters, resolve
+  reasons, present diagnostics).
+Verification: 7 check runs: 442269 texture checks with 0 mismatches, 12532 present checks
+(1866 of them reused frames) with 0 mismatches, and 49152 upload checks with 0 mismatches.
+Screenshots on/off at 30/40/50/57 s
+(`build/shots/tcab_{off,on}_*.png`, diff tool `build/imgdiff.py`, heatmaps `build/shots/diff/`)
+differ by as much as two "on" runs differ from each other (17-22 dB PSNR, game timing is not
+deterministic), with matching mean/std per channel. The in-run compare modes above are the exact test.
+Results (same session, 61 s vt_one, GS_GPU=1, all three =0 vs on): GSGpu thread CPU 67.3% -> 37.6%
+(worker busy 69% -> 36%), producer sync wait 1.95 s -> 1.0 s per 5 s, vifw/s 20.20 -> 20.90,
+vsync/s 48.07 -> 49.65 (VU1 is still the limiter; at 36% busy for ~21 drawn fps, GSGpu would cap near ~55-60 fps).
+Remaining GSGpu cost: resolve of render targets used as textures (fbp 70 640x448 + 256x256
+effects, ~58/s) + their CPU decode, Present conversion (CT16 ReadCT16) on non-reused vsyncs.
+
+## VU1 native block compiler (JIT), milestone 2 — 2026-11-19 (uncommitted, default OFF)
+- Patch: `patches/ps2recomp-vu1-native-jit-m2.patch` (ps2_vu1_core.cpp vs `ps2_vu1_core.cpp.pre-native.bak` + new `vu/ps2_vu1_native.inl`).
+- `PS2X_VU1_NATIVE=1` turns it on (default off; =0/unset = previous exact block loop). `PS2X_VU1_NATIVE_FMAC=0` keeps native blocks but calls the C++ FMAC. `PS2X_VU1_NATIVE_STATS=1` logs each compiled block.
+- Design: hand-written x86-64 emitter (no deps), per-thread 64 MB RWX arena, blocks = the block executor's blocks (beLen), compiled lazily per Vu1Xlat (keyed by codeSize/dataSize). Per pair: inline fixed-scan stall max (helper only when it would stall / resource terms), native SSE2 FMAC ADD/SUB/MUL/MADD/MSUB (all bc/q/i/vector forms; exact vu1FmacSimd math, rejected lanes jump to an out-of-line call of the C++ path), dead flag entries (flagDead) carried inline into tl_carry, live ones via fmacFlagsFast helper; inline lowers NOP/IADDIU/ISUBIU/IADD/IADDI/IAND/IOR/MOVE/LQ/LQI and I-bit immediates, others via helper; inline ready-slot writes, VF0/VI0 reset, cycle++, commit hint test, xgkick test, exits; pc store deferred until a branch can be pending.
+- Reference: PS2X_VU1_BC_CHECK reference path never runs native code (tl_bcSuppress). 1,040,000 runs compared (181 s) + 320,000 (61 s): 0 mismatches.
+- A/B (61 s, GS_GPU=1): VU1 Mcyc/busy-s ~37.4 -> ~41.1 (+10%), vifw/s 20.29 -> 22.02, vsync/s 54.53 -> 52.92 (noise range). Program 0x2c18 loop block (77 pairs: 37 FMAC + 30 lowers native) runs natively.
+- Remaining: native stall/advanceTo + commit fast path, SQ/SQI (queueStore) and more uppers (MAX/MINI/FTOI/ITOF/OPMULA/OPMSUB/CLIP) inline, VF0-reset elision, register caching of VI.
+
+## VU1 native block compiler (JIT), milestone 3 — 2026-11-19 (uncommitted, now DEFAULT ON)
+- Patch: `patches/ps2recomp-vu1-native-jit-m3.patch` (cumulative; supersedes -m2). Backups: `ps2_vu1_core.cpp.pre-native.bak` (original), `.native-m2.bak`, `.native-m3.bak`, `.native-m3b.bak` (+ matching `ps2_vu1_native.inl.*.bak`).
+- `PS2X_VU1_NATIVE=0` reverts to the C++ block loop. Sub-switches (default on, =0 disables): `PS2X_VU1_NATIVE_FMAC`, `PS2X_VU1_NATIVE_OPS` (uppers MAX/MINI/ITOF/FTOI/ABS + lowers SQ/SQI/ILW/ILWR/ISW/ISWR/MTIR/MFIR/FCAND/IBEQ/IBNE and VI writes with branch-read backup), `PS2X_VU1_NATIVE_DSTORE` (stores written to VU mem directly instead of queueStore: a queued store is always committed by its own pair's cycle advance, nothing reads VU mem in between), `PS2X_VU1_NATIVE_STALL` (native advanceTo for register stalls ending before the budget), `PS2X_VU1_NATIVE_VF0` (VF0/VI0 reset only after pairs that may write them). `PS2X_VU1_NATIVE_STATS=1` logs blocks + remaining helper ops.
+- Verification (BC_CHECK compares vf/vi/acc/q/p/i/r/mac/status/clip/pc/cycles/control/xgkick hash/VU data): final code 1,220,000 runs / 200 s title-path scene + 960,000 runs / 200 s slot-4 save scene (keyscript), 0 mismatches. Earlier m3 stages: 1.22M + 0.98M, 0 mismatches.
+- A/B (61 s, GS_GPU=1): NATIVE=0 VU1 ~37.9 Mcyc/busy-s, vifw/s 20.44, vsync/s 51.57 -> default ~60.3 Mcyc/busy-s (+59%), vifw/s 29.78 (+46%), vsync/s 46.03. vsync/s drops because the EE now spends less time waiting on VU1 per game frame (more frames per emulated vsync); VU1 worker busy 84% -> 76%, EE/IOP thread is the next limiter.
+- Remaining VU1 profile (native on): JIT code 54%, commitReadyPipelines 8%, live FMAC flag entries (fmacFlagsFast) 7%, processVIF1Data 7%. Not done yet: CLIP/OPMULA/OPMSUB/DIV/SQD natively, native live-flag entries, VI/cycle register caching, NormPs elision via known-normal dataflow.
