@@ -1149,3 +1149,27 @@ effects, ~58/s) + their CPU decode, Present conversion (CT16 ReadCT16) on non-re
   PS2X_IOP_PCTRAP=hex,... (IOP PC trap log, diagnostic).
 - Patches: patches/ps2recomp-spu2-adma-output.patch (regenerated, ADMA capture/output + sim),
   patches/ps2recomp-spu2-hw-voices.patch, patches/blackkat-menu-pacing-and-snd-upload.patch.
+
+## 2026-11-19 Sound: output on by default, Gaussian voice interpolation, crackle review
+- PS2X_SPU2_OUT is now on by default (=0 off, =sim WAV consumer). If the host device or stream
+  can't be opened (or PS2X_HOST_AUDIO=0, new: skip InitAudioDevice entirely) the runtime logs
+  "[spu2] no host audio device/stream ... sound output off, continuing" and calls
+  ps2x_spu2_out_disable(); verified: menu runs at 60 vsync/s with no device.
+- Hardware voices: SPU 4-point Gaussian interpolation, table (512 x s16) and formula taken from
+  nocash psx-spx, "SPU ADPCM Pitch" -> "4-Point Gaussian Interpolation"
+  (problemkaputt.de/psx-spx.htm, mirror psx-spx.consoledev.net): phase = pitch counter bits 4..11,
+  out = sum of (gauss[0FFh-i]*oldest, gauss[1FFh-i]*older, gauss[100h+i]*old, gauss[i]*new),
+  each SAR 15. Re-sourced from psx-spx (bit-identical to the table used before).
+  PS2X_SPU2_INTERP=0 reverts to linear. Sea battle, effects-only audio: energy >12 kHz
+  -42.4 dB -> -68.9 dB (rel. total), >16 kHz -43.7 -> -79.5 dB; offline same-sample renders at
+  the game's pitches: imaging above source Nyquist 9-14 dB lower, >12 kHz 20-50 dB lower.
+- Crackle review: voice sum already saturates (float clamp); no large deltas (>4000) in the
+  effects-only audio before or after; envelope steps and loop/end handling follow hardware
+  (left as is). The large sample-to-sample deltas in playback (~85/min >4000) are already in the
+  game-side stream (~120/min in the pre-ring WAV), none at ADMA block seams -> source content,
+  not the output path. Drift step smoothing (<=2.5e-4 per 21 ms callback) is inaudible.
+  Cheap wins added: PS2X_SPU2_DRIFT_INTERP (default 1, 4-point Catmull-Rom in the drift resampler
+  instead of linear) and PS2X_SPU2_DECLICK (default 1: on underrun the last sample decays instead
+  of a hard cut; 64-frame crossfade after an underrun or a kHigh skip). Underruns only occur in the
+  first ~5 s of a session.
+- Patch: patches/ps2recomp-spu2-gauss-default-out.patch (vs *.pre-gauss.bak).

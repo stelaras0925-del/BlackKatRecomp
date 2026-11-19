@@ -1,0 +1,312 @@
+--- a/third_party/PS2Recomp/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/third_party/PS2Recomp/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -20,7 +20,8 @@
+ // paced by PS2X_IOP_ADMA_PACE. At each ADMA start the block is de-interleaved and pushed to:
+ //  - PS2X_SPU2_WAV=<path>: a 48 kHz stereo s16 WAV (header patched about once a second);
+ //  - a lock-free SPSC ring that the host audio stream pulls from (ps2x_spu2_pull), only when
+-//    PS2X_SPU2_OUT=1 (the runtime opens the stream).
++//    PS2X_SPU2_OUT is on by default (=0 off; the runtime opens the stream, or turns output off
++//    when no host audio device is available).
+ // PS2X_SPU2_CAPTURE=0 turns all of it off.
+ // ---------------------------------------------------------------------------------------------
+ namespace
+@@ -40,6 +41,10 @@
+         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+         bool started = false;
+         bool sim = false;
++        bool declick = true, cubic = true;
++        float lastL = 0.0f, lastR = 0.0f; // last output frame (declick)
++        uint32_t rampIn = 0;
++        static constexpr uint32_t kRamp = 64;
+         FILE *simWav = nullptr;
+         uint64_t simFrames = 0;
+         std::chrono::steady_clock::time_point lastBlock{};
+@@ -51,8 +56,12 @@
+             const char *c = std::getenv("PS2X_SPU2_CAPTURE");
+             capture = !(c && c[0] == '0');
+             const char *o = std::getenv("PS2X_SPU2_OUT");
+-            outOn = capture && o && (o[0] == '1' || o[0] == 's');
++            // Default on (PS2X_SPU2_OUT unset or 1); =0 off; =sim wall-clock consumer to a WAV. If the
++            // runtime cannot open a host audio device it calls ps2x_spu2_out_disable().
+             sim = capture && o && o[0] == 's';
++            outOn = capture && !(o && o[0] == '0');
++            if (const char *dc = std::getenv("PS2X_SPU2_DECLICK")) declick = dc[0] != '0';
++            if (const char *di = std::getenv("PS2X_SPU2_DRIFT_INTERP")) cubic = di[0] != '0';
+             if (const char *ow = std::getenv("PS2X_SPU2_OUTWAV"); sim && ow && *ow)
+                 simWav = std::fopen(ow, "wb");
+             if (const char *w = std::getenv("PS2X_SPU2_WAV"); capture && w && *w)
+@@ -170,14 +179,19 @@
+         static constexpr uint32_t kTarget = 4096, kHigh = 16384;
+         bool primed = false;
+         double frac = 0.0, stepSm = 1.0;
++        // PS2X_SPU2_DRIFT_INTERP (default 1): 4-point Catmull-Rom instead of linear for the drift
++        // resampler (linear at a step of ~1.000x is a phase-dependent low-pass). PS2X_SPU2_DECLICK
++        // (default 1): on underrun the last output decays to zero instead of cutting, and after an
++        // underrun or a kHigh skip the stream crossfades in over kRamp frames.
+         void pull(int16_t *out, uint32_t frames)
+         {
+             uint32_t r = rpos.load(std::memory_order_relaxed);
+             const uint32_t w = wpos.load(std::memory_order_acquire);
+             uint32_t avail = w - r;
+-            if (avail > kHigh) { r = w - kTarget; avail = kTarget; frac = 0.0; ++drops; }
+-            if (!primed && avail >= kTarget) primed = true;
++            if (avail > kHigh) { r = w - kTarget; avail = kTarget; frac = 0.0; ++drops; if (declick) rampIn = kRamp; }
++            if (!primed && avail >= kTarget) { primed = true; if (declick) rampIn = kRamp; }
+             uint32_t n = 0;
++            const uint32_t need = cubic ? 2u : 1u;
+             if (primed)
+             {
+                 const double err = ((double)avail - (double)kTarget) / (double)kTarget;
+@@ -186,11 +200,36 @@
+                 for (; n < frames; ++n)
+                 {
+                     const uint32_t i0 = (uint32_t)frac;
+-                    if (i0 + 1u >= avail) { primed = false; ++underruns; break; }
+-                    const double t = frac - i0;
+-                    const uint32_t k0 = (r + i0) & (kRing - 1u), k1 = (r + i0 + 1u) & (kRing - 1u);
+-                    out[n * 2] = (int16_t)std::lrint(ring[k0 * 2] + (ring[k1 * 2] - ring[k0 * 2]) * t);
+-                    out[n * 2 + 1] = (int16_t)std::lrint(ring[k0 * 2 + 1] + (ring[k1 * 2 + 1] - ring[k0 * 2 + 1]) * t);
++                    if (i0 + need >= avail) { primed = false; ++underruns; break; }
++                    const float t = (float)(frac - i0);
++                    float o[2];
++                    for (int c = 0; c < 2; ++c)
++                    {
++                        const float y1 = ring[((r + i0) & (kRing - 1u)) * 2 + c];
++                        const float y2 = ring[((r + i0 + 1u) & (kRing - 1u)) * 2 + c];
++                        if (cubic)
++                        {
++                            const float y0 = ring[((r + i0 - 1u) & (kRing - 1u)) * 2 + c];
++                            const float y3 = ring[((r + i0 + 2u) & (kRing - 1u)) * 2 + c];
++                            const float c1 = 0.5f * (y2 - y0);
++                            const float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
++                            const float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
++                            o[c] = ((c3 * t + c2) * t + c1) * t + y1;
++                        }
++                        else
++                            o[c] = y1 + (y2 - y1) * t;
++                    }
++                    if (rampIn)
++                    {
++                        const float g = (float)rampIn / (float)kRamp;
++                        o[0] = o[0] * (1.0f - g) + lastL * g;
++                        o[1] = o[1] * (1.0f - g) + lastR * g;
++                        --rampIn;
++                    }
++                    lastL = std::clamp(o[0], -32768.0f, 32767.0f);
++                    lastR = std::clamp(o[1], -32768.0f, 32767.0f);
++                    out[n * 2] = (int16_t)std::lrint(lastL);
++                    out[n * 2 + 1] = (int16_t)std::lrint(lastR);
+                     frac += stepSm;
+                 }
+                 const uint32_t used = (uint32_t)frac;
+@@ -198,7 +237,17 @@
+                 rpos.store(r + used, std::memory_order_release);
+             }
+             silent += frames - n;
+-            std::memset(out + n * 2, 0, (size_t)(frames - n) * 4);
++            if (declick)
++            {
++                for (; n < frames; ++n)
++                {
++                    lastL *= 0.92f; lastR *= 0.92f;
++                    out[n * 2] = (int16_t)std::lrint(lastL);
++                    out[n * 2 + 1] = (int16_t)std::lrint(lastR);
++                }
++            }
++            else
++                std::memset(out + n * 2, 0, (size_t)(frames - n) * 4);
+         }
+     };
+     Spu2Out &spu2Out() { static Spu2Out s; return s; }
+@@ -242,6 +291,7 @@
+             uint8_t flags = 0;
+             uint32_t counter = 0;  // 12.12 pitch counter
+             int16_t prev = 0, cur = 0;
++            int16_t h[4] = {0, 0, 0, 0}; // decoded history, h[3] newest (gaussian)
+             int phase = 0;         // 0 off, 1 attack, 2 decay, 3 sustain, 4 release
+             int32_t env = 0;
+             uint32_t envCounter = 0;
+@@ -249,8 +299,82 @@
+             uint8_t core = 0, idx = 0;
+         } v[2][24];
+ 
++        // SPU 4-point Gaussian interpolation table (512 x s16, a hardware constant). Source:
++        // Martin Korth (nocash), "PlayStation Specifications - psx-spx", section "SPU ADPCM
++        // Pitch" -> "4-Point Gaussian Interpolation" (problemkaputt.de/psx-spx.htm, mirror
++        // psx-spx.consoledev.net). The SPU2 uses the same interpolator. PS2X_SPU2_INTERP=0
++        // reverts to linear interpolation.
++        static constexpr int16_t kGauss[512] = {
++        -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001,
++        -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001,
++        0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0001,
++        0x0001, 0x0001, 0x0001, 0x0002, 0x0002, 0x0002, 0x0003, 0x0003,
++        0x0003, 0x0004, 0x0004, 0x0005, 0x0005, 0x0006, 0x0007, 0x0007,
++        0x0008, 0x0009, 0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x000E,
++        0x000F, 0x0010, 0x0011, 0x0012, 0x0013, 0x0015, 0x0016, 0x0018,
++        0x0019, 0x001B, 0x001C, 0x001E, 0x0020, 0x0021, 0x0023, 0x0025,
++        0x0027, 0x0029, 0x002C, 0x002E, 0x0030, 0x0033, 0x0035, 0x0038,
++        0x003A, 0x003D, 0x0040, 0x0043, 0x0046, 0x0049, 0x004D, 0x0050,
++        0x0054, 0x0057, 0x005B, 0x005F, 0x0063, 0x0067, 0x006B, 0x006F,
++        0x0074, 0x0078, 0x007D, 0x0082, 0x0087, 0x008C, 0x0091, 0x0096,
++        0x009C, 0x00A1, 0x00A7, 0x00AD, 0x00B3, 0x00BA, 0x00C0, 0x00C7,
++        0x00CD, 0x00D4, 0x00DB, 0x00E3, 0x00EA, 0x00F2, 0x00FA, 0x0101,
++        0x010A, 0x0112, 0x011B, 0x0123, 0x012C, 0x0135, 0x013F, 0x0148,
++        0x0152, 0x015C, 0x0166, 0x0171, 0x017B, 0x0186, 0x0191, 0x019C,
++        0x01A8, 0x01B4, 0x01C0, 0x01CC, 0x01D9, 0x01E5, 0x01F2, 0x0200,
++        0x020D, 0x021B, 0x0229, 0x0237, 0x0246, 0x0255, 0x0264, 0x0273,
++        0x0283, 0x0293, 0x02A3, 0x02B4, 0x02C4, 0x02D6, 0x02E7, 0x02F9,
++        0x030B, 0x031D, 0x0330, 0x0343, 0x0356, 0x036A, 0x037E, 0x0392,
++        0x03A7, 0x03BC, 0x03D1, 0x03E7, 0x03FC, 0x0413, 0x042A, 0x0441,
++        0x0458, 0x0470, 0x0488, 0x04A0, 0x04B9, 0x04D2, 0x04EC, 0x0506,
++        0x0520, 0x053B, 0x0556, 0x0572, 0x058E, 0x05AA, 0x05C7, 0x05E4,
++        0x0601, 0x061F, 0x063E, 0x065C, 0x067C, 0x069B, 0x06BB, 0x06DC,
++        0x06FD, 0x071E, 0x0740, 0x0762, 0x0784, 0x07A7, 0x07CB, 0x07EF,
++        0x0813, 0x0838, 0x085D, 0x0883, 0x08A9, 0x08D0, 0x08F7, 0x091E,
++        0x0946, 0x096F, 0x0998, 0x09C1, 0x09EB, 0x0A16, 0x0A40, 0x0A6C,
++        0x0A98, 0x0AC4, 0x0AF1, 0x0B1E, 0x0B4C, 0x0B7A, 0x0BA9, 0x0BD8,
++        0x0C07, 0x0C38, 0x0C68, 0x0C99, 0x0CCB, 0x0CFD, 0x0D30, 0x0D63,
++        0x0D97, 0x0DCB, 0x0E00, 0x0E35, 0x0E6B, 0x0EA1, 0x0ED7, 0x0F0F,
++        0x0F46, 0x0F7F, 0x0FB7, 0x0FF1, 0x102A, 0x1065, 0x109F, 0x10DB,
++        0x1116, 0x1153, 0x118F, 0x11CD, 0x120B, 0x1249, 0x1288, 0x12C7,
++        0x1307, 0x1347, 0x1388, 0x13C9, 0x140B, 0x144D, 0x1490, 0x14D4,
++        0x1517, 0x155C, 0x15A0, 0x15E6, 0x162C, 0x1672, 0x16B9, 0x1700,
++        0x1747, 0x1790, 0x17D8, 0x1821, 0x186B, 0x18B5, 0x1900, 0x194B,
++        0x1996, 0x19E2, 0x1A2E, 0x1A7B, 0x1AC8, 0x1B16, 0x1B64, 0x1BB3,
++        0x1C02, 0x1C51, 0x1CA1, 0x1CF1, 0x1D42, 0x1D93, 0x1DE5, 0x1E37,
++        0x1E89, 0x1EDC, 0x1F2F, 0x1F82, 0x1FD6, 0x202A, 0x207F, 0x20D4,
++        0x2129, 0x217F, 0x21D5, 0x222C, 0x2282, 0x22DA, 0x2331, 0x2389,
++        0x23E1, 0x2439, 0x2492, 0x24EB, 0x2545, 0x259E, 0x25F8, 0x2653,
++        0x26AD, 0x2708, 0x2763, 0x27BE, 0x281A, 0x2876, 0x28D2, 0x292E,
++        0x298B, 0x29E7, 0x2A44, 0x2AA1, 0x2AFF, 0x2B5C, 0x2BBA, 0x2C18,
++        0x2C76, 0x2CD4, 0x2D33, 0x2D91, 0x2DF0, 0x2E4F, 0x2EAE, 0x2F0D,
++        0x2F6C, 0x2FCC, 0x302B, 0x308B, 0x30EA, 0x314A, 0x31AA, 0x3209,
++        0x3269, 0x32C9, 0x3329, 0x3389, 0x33E9, 0x3449, 0x34A9, 0x3509,
++        0x3569, 0x35C9, 0x3629, 0x3689, 0x36E8, 0x3748, 0x37A8, 0x3807,
++        0x3867, 0x38C6, 0x3926, 0x3985, 0x39E4, 0x3A43, 0x3AA2, 0x3B00,
++        0x3B5F, 0x3BBD, 0x3C1B, 0x3C79, 0x3CD7, 0x3D35, 0x3D92, 0x3DEF,
++        0x3E4C, 0x3EA9, 0x3F05, 0x3F62, 0x3FBD, 0x4019, 0x4074, 0x40D0,
++        0x412A, 0x4185, 0x41DF, 0x4239, 0x4292, 0x42EB, 0x4344, 0x439C,
++        0x43F4, 0x444C, 0x44A3, 0x44FA, 0x4550, 0x45A6, 0x45FC, 0x4651,
++        0x46A6, 0x46FA, 0x474E, 0x47A1, 0x47F4, 0x4846, 0x4898, 0x48E9,
++        0x493A, 0x498A, 0x49D9, 0x4A29, 0x4A77, 0x4AC5, 0x4B13, 0x4B5F,
++        0x4BAC, 0x4BF7, 0x4C42, 0x4C8D, 0x4CD7, 0x4D20, 0x4D68, 0x4DB0,
++        0x4DF7, 0x4E3E, 0x4E84, 0x4EC9, 0x4F0E, 0x4F52, 0x4F95, 0x4FD7,
++        0x5019, 0x505A, 0x509A, 0x50DA, 0x5118, 0x5156, 0x5194, 0x51D0,
++        0x520C, 0x5247, 0x5281, 0x52BA, 0x52F3, 0x532A, 0x5361, 0x5397,
++        0x53CC, 0x5401, 0x5434, 0x5467, 0x5499, 0x54CA, 0x54FA, 0x5529,
++        0x5558, 0x5585, 0x55B2, 0x55DE, 0x5609, 0x5632, 0x565B, 0x5684,
++        0x56AB, 0x56D1, 0x56F6, 0x571B, 0x573E, 0x5761, 0x5782, 0x57A3,
++        0x57C3, 0x57E2, 0x57FF, 0x581C, 0x5838, 0x5853, 0x586D, 0x5886,
++        0x589E, 0x58B5, 0x58CB, 0x58E0, 0x58F4, 0x5907, 0x5919, 0x592A,
++        0x593A, 0x5949, 0x5958, 0x5965, 0x5971, 0x597C, 0x5986, 0x598F,
++        0x5997, 0x599E, 0x59A4, 0x59A9, 0x59AD, 0x59B0, 0x59B2, 0x59B3,
++        };
++        bool gaussOn = true;
++
+         Spu2Voices()
+         {
++            if (const char *ie = std::getenv("PS2X_SPU2_INTERP")) gaussOn = ie[0] != '0';
+             const char *e = std::getenv("PS2X_SPU2_VOICES");
+             on = !(e && e[0] == '0');
+             if (const char *g = std::getenv("PS2X_SPU2_VOICE_GAIN"))
+@@ -562,10 +686,32 @@
+                             x.counter -= 0x1000u;
+                             x.prev = x.cur;
+                             x.cur = nextSample(x);
++                            x.h[0] = x.h[1]; x.h[1] = x.h[2]; x.h[2] = x.h[3]; x.h[3] = x.cur;
+                             if (!x.active) break;
+                         }
+-                        const float t = (float)x.counter / 4096.0f;
+-                        const float s = ((float)x.prev + ((float)x.cur - (float)x.prev) * t) * ((float)x.env / 32768.0f);
++                        float smp;
++                        if (gaussOn)
++                        {
++                            // psx-spx: pitch counter bits 4..11 select the table phase; the four
++                            // most recent samples (oldest..new = h[0]..h[3]) are weighted by
++                            // gauss[0FFh-i], gauss[1FFh-i], gauss[100h+i], gauss[i], each product
++                            // shifted right by 15 before summing.
++                            const uint32_t phase = (x.counter >> 4) & 0xFFu;
++                            static constexpr uint32_t kTap[4][2] = {{0x0FFu, 1u}, {0x1FFu, 1u}, {0x100u, 0u}, {0x000u, 0u}};
++                            int32_t o = 0;
++                            for (int k = 0; k < 4; ++k)
++                            {
++                                const uint32_t idx = kTap[k][1] ? kTap[k][0] - phase : kTap[k][0] + phase;
++                                o += (static_cast<int32_t>(kGauss[idx]) * x.h[k]) >> 15;
++                            }
++                            smp = (float)std::clamp(o, -32768, 32767);
++                        }
++                        else
++                        {
++                            const float t = (float)x.counter / 4096.0f;
++                            smp = (float)x.prev + ((float)x.cur - (float)x.prev) * t;
++                        }
++                        const float s = smp * ((float)x.env / 32768.0f);
+                         acc[i * 2] += s * vl * gl;
+                         acc[i * 2 + 1] += s * vr * gr;
+                         envelope(x, a1, a2);
+@@ -611,6 +757,7 @@
+     }
+ }
+ extern "C" void ps2x_spu2_pull(int16_t *out, uint32_t frames) { spu2Out().pull(out, frames); }
++extern "C" void ps2x_spu2_out_disable() { if (!spu2Out().sim) spu2Out().outOn.store(false); }
+ extern "C" bool ps2x_spu2_out_enabled() { return spu2Out().outOn.load() && !spu2Out().sim; }
+ 
+ namespace ps2x::iop::detail
+--- a/third_party/PS2Recomp/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/third_party/PS2Recomp/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -32,6 +32,7 @@
+ #include <sstream>
+ extern "C" void ps2x_spu2_pull(int16_t *out, uint32_t frames);
+ extern "C" bool ps2x_spu2_out_enabled();
++extern "C" void ps2x_spu2_out_disable();
+ 
+ 
+ namespace ps2_stubs
+@@ -775,17 +776,36 @@
+ #else
+         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+-        InitAudioDevice();
+-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+-        // PS2X_SPU2_OUT=1: play the captured SPU2 ADMA stream (48 kHz stereo) through the host
+-        // audio device (miniaudio -> PipeWire/Pulse). Off by default.
+-        if (IsAudioDeviceReady() && ps2x_spu2_out_enabled())
+-        {
+-            SetAudioStreamBufferSizeDefault(1024);
+-            static AudioStream s_spu2Stream = LoadAudioStream(48000, 16, 2);
+-            SetAudioStreamCallback(s_spu2Stream, [](void *buffer, unsigned int frames) { ps2x_spu2_pull(static_cast<int16_t *>(buffer), frames); });
+-            PlayAudioStream(s_spu2Stream);
+-            std::cerr << "[spu2] host audio stream started (48000 Hz stereo)" << std::endl;
++        // PS2X_HOST_AUDIO=0 skips opening the host audio device (headless / testing).
++        const char *hostAudioEnv = std::getenv("PS2X_HOST_AUDIO");
++        const bool hostAudio = !(hostAudioEnv && hostAudioEnv[0] == '0');
++        if (hostAudio)
++            InitAudioDevice();
++        m_audioBackend.setAudioReady(hostAudio && IsAudioDeviceReady());
++        // SPU2 sound output (default on; PS2X_SPU2_OUT=0 off): play the captured 48 kHz stereo
++        // SPU2 stream through the host device (miniaudio -> PipeWire/Pulse). If no device or
++        // stream is available, fall back silently: output off, the game keeps running.
++        if (ps2x_spu2_out_enabled())
++        {
++            bool started = false;
++            if (hostAudio && IsAudioDeviceReady())
++            {
++                SetAudioStreamBufferSizeDefault(1024);
++                static AudioStream s_spu2Stream = LoadAudioStream(48000, 16, 2);
++                if (IsAudioStreamValid(s_spu2Stream))
++                {
++                    SetAudioStreamCallback(s_spu2Stream, [](void *buffer, unsigned int frames) { ps2x_spu2_pull(static_cast<int16_t *>(buffer), frames); });
++                    PlayAudioStream(s_spu2Stream);
++                    started = true;
++                    std::cerr << "[spu2] host audio stream started (48000 Hz stereo)" << std::endl;
++                }
++            }
++            if (!started)
++            {
++                ps2x_spu2_out_disable();
++                std::cerr << "[spu2] no host audio device/stream" << (hostAudio ? "" : " (PS2X_HOST_AUDIO=0)")
++                          << ": sound output off, continuing" << std::endl;
++            }
+         }
+ #endif
+         SetTargetFPS(60);
