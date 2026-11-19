@@ -29,6 +29,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "runtime/ee_scheduler.h"
+extern "C" void ps2x_spu2_upload(uint32_t spuByteAddr, const uint8_t *src, uint32_t bytes);
 
 namespace
 {
@@ -420,7 +422,12 @@ namespace
             uint32_t f[11];
             for (int i = 0; i < 11; ++i)
                 std::memcpy(&f[i], rdram + 0x3A3DD4u + 4u * i, 4);
-            if (first || cbNow != lastCb || std::memcmp(f, lastFlags, sizeof f) != 0)
+            // The flags include per-frame counters, so this fired ~2000 times/s on the main menu
+            // (std::endl flush each time), halving the EE speed there (vsync/s ~29, ADMA audio at
+            // half rate -> music skipping). Log the first 64 changes; BLACKKAT_MENU_LOG=1 logs all.
+            static const bool s_menuLogAll = []() { const char *e = std::getenv("BLACKKAT_MENU_LOG"); return e && e[0] == '1'; }();
+            static uint32_t s_menuLogged = 0;
+            if ((first || cbNow != lastCb || std::memcmp(f, lastFlags, sizeof f) != 0) && (s_menuLogAll || s_menuLogged++ < 64u))
             {
                 first = false;
                 lastCb = cbNow;
@@ -543,6 +550,21 @@ namespace
                 SET_GPR_U32(ctx, 31, ra);
                 ctx->pc = ra;
             }
+        }
+        // Real DecodeFrame waits for the IPU to decode a movie frame; the stub returns at once, so
+        // the main menu loop spun ~4000 times per emulated second and the EE could only reach
+        // ~150-170 Mcyc/s there (vsync/s ~29-34, ADMA audio at half rate -> menu music skipping).
+        // Charge one vsync worth of EE time per completed flag-0 frame (after the pump and the
+        // frame callback ran; charging before them made every pump get preempted, so the menu
+        // callback never ran) instead (an "IPU decode" that takes
+        // a frame). BLACKKAT_FMV_STUB_CYCLES=N overrides (0 = old behaviour).
+        {
+            static const uint32_t s_stubCycles = []() -> uint32_t {
+                const char *e = std::getenv("BLACKKAT_FMV_STUB_CYCLES");
+                return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 4915200u;
+            }();
+            if (s_stubCycles != 0u && runtime)
+                runtime->eeScheduler().accountCycles(s_stubCycles);
         }
         setReturnS32(ctx, 0);
     }
@@ -1012,6 +1034,13 @@ namespace
     // Replacement for 0x2F45D0: complete every queued transfer at once (no SPU2
     // emulation, so the data has nowhere to go anyway).
     // BLACKKAT_SND_QUEUE_REAL=1 keeps the original.
+    // Entry layout (from 0x2F45D0): +0 id, +4 EE source, +8 SPU2 RAM byte address,
+    // +0xC u16 size, +0xE priority. The original copies EE source -> IOP staging buffer
+    // (sceSifSetDma) and sends {id, iopbuf, spuaddr, size} to SNDDRV's cmd handler, which
+    // queues sceSdVoiceTrans(core1). Since that SIF cmd path is not wired, the replacement
+    // now writes the EE data straight into the emulated SPU2 RAM (ps2x_spu2_upload, used by
+    // the SPU2 hardware-voice emulation for SFX) before completing the entry.
+    // BLACKKAT_SND_UPLOAD=0 skips the upload (old behaviour).
     constexpr uint32_t kSndSendNext = 0x002F45D0u;
     constexpr uint32_t kSndState = 0x006914C0u;
     uint64_t g_sndCompleted = 0;
@@ -1029,6 +1058,22 @@ namespace
             std::memcpy(&id, slot, 4);
             if (id != 0u)
             {
+                static const bool s_upload = []() { const char *e = std::getenv("BLACKKAT_SND_UPLOAD"); return !(e && e[0] == '0'); }();
+                uint32_t src = 0, spu = 0;
+                uint16_t size = 0;
+                std::memcpy(&src, slot + 4, 4);
+                std::memcpy(&spu, slot + 8, 4);
+                std::memcpy(&size, slot + 12, 2);
+                const uint32_t srcPhys = src & 0x1FFFFFFFu;
+                if (s_upload && size != 0u && srcPhys + size <= 0x02000000u)
+                    ps2x_spu2_upload(spu, rdram + srcPhys, size);
+                static unsigned upLogged = 0;
+                if (upLogged < 12u)
+                {
+                    ++upLogged;
+                    std::cerr << "[blackkat] snd upload id=0x" << std::hex << id << " ee=0x" << src << " spu=0x" << spu
+                              << " size=0x" << size << std::dec << (s_upload ? "" : " (skipped)") << std::endl;
+                }
                 std::memset(slot, 0, 4);
                 ++freed;
             }

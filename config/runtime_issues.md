@@ -1069,3 +1069,83 @@ effects, ~58/s) + their CPU decode, Present conversion (CT16 ReadCT16) on non-re
   tex_<hex>.ppm/_a.pgm); PS2X_GS_WATCHBP=lo,hi (log transfers/draws/uploads into a VRAM block range);
   PS2X_GS_DUMPRUNS now also dumps the run's texture; PS2X_DMA_GIFQWC=N (GIF tags with N qwords);
   PS2X_DMA_SPRLOG=1; PS2X_DMA_STARTLOG=1 (distinct non-VIF1/GIF DMA starts).
+
+## 2026-11-19 Sound: SPU2 ADMA capture + host output path (patches/ps2recomp-spu2-adma-output.patch)
+- Audit: there is no SPU2 emulation (no SPU RAM, voices, ADPCM decode, ADSR or reverb); IopMemory only stores
+  the registers. Black Kat does not need it for audible output: SNDDRV.IRX mixes every voice in software
+  (SNDIOP_ee36_iop36 = native sndMixRun, 36->48 kHz) and streams the mix to core0 by AutoDMA. ADMA
+  transfers: BCR 0x00200010 = 512 words, double buffer IOP 0x12c400/0x12cc00, layout 2 x (0x200 B left,
+  0x200 B right) = 512 stereo s16 frames, ~93.75/s at 48 kHz thanks to PS2X_IOP_ADMA_PACE.
+  Core0 MMIX 0x0FC0 / core1 MMIX 0x0FCC: ADMA input goes out dry (InpWet off), so SPU2 reverb would not
+  touch it. Hardware KON writes (~5/s per core) are LIBSD key-on/off of all 24 voices with volume 0
+  (PS2X_SPU2_KONLOG=1 logs them), i.e. no audible hardware voices in the scenes checked.
+- Host backend: raylib's audio module (miniaudio, built into raylib, no extra package) -> PipeWire via the
+  Pulse/ALSA backend; the runtime already calls InitAudioDevice().
+- Built (iop_memory.cpp, ps2_runtime.cpp):
+  - At each core0 ADMA start (512-word block, ADMAS core+0x1B0 != 0) the block is de-interleaved and pushed
+    to (a) PS2X_SPU2_WAV=<path> (48 kHz stereo s16 WAV, header patched every ~1 s so a killed run is valid)
+    and (b) a lock-free SPSC ring (32768 frames).
+  - PS2X_SPU2_OUT=1 (default OFF): the runtime opens a raylib AudioStream (48000 Hz, 16-bit, 2 ch,
+    1024-frame buffers) whose callback pulls from the ring. Drift control: fractional read step 1 +/- 0.5%
+    steered by ring fill (target 4096 frames ~85 ms) with linear interpolation; underrun -> silence until
+    refilled; > 16384 frames -> skip to target. Offline harness (/tmp/bk/spu2h/h2.cpp, 600 s simulated):
+    producer x0.995..x1.004 of device rate -> 0 underruns, 0 drops; x0.98 -> 140 underruns (game < 98% speed).
+  - PS2X_SPU2_CAPTURE=0 disables capture entirely. [spu2] status line every 940 blocks (rms, clip, KON
+    writes, ring fill, underruns, drops).
+- WAV check (title path -> sea battle, 60 s, build/aud3.log): 48000 Hz stereo, 93.6 blocks/s, RMS -25/-24 dBFS,
+  peak -4.2 dBFS, 0 clipped samples, L/R corr 0.64, centroid ~770 Hz, 98% of energy < 4 kHz (36 kHz source
+  material), silence only during loading (0-6 s), no discontinuities at block boundaries.
+  Spectrogram + WAV copied to the box (/workspace/spu2_spectrogram.png, spu2_titlepath_seabattle.wav).
+- Speed: same session A/B 45 s: CAPTURE=0 vsync/s 60.00 vifw/s 28.82; CAPTURE=1 60.01 / 28.97 (no change).
+- Not yet done: speakers test (PS2X_SPU2_OUT=1), core1/master volume registers (MVOL/AVOL not applied; the
+  driver's own mix is used as-is), hardware voices/ADPCM/reverb (not needed for the paths checked; the FMV
+  audio would need IPU + its own path).
+
+## 2026-11-19 Sound follow-up: main-menu music skipping, crackle, missing SFX
+
+### Main-menu skipping (fixed)
+- Cause: producer side. On the main menu the EE ran at ~143 Mcyc/s (vsync ~29/s), so SNDDRV's
+  ADMA stream arrived at ~45 blocks/s instead of 93.75; the game-side WAV was continuous (game
+  time) but the live ring underran constantly (menu1: 158 underruns / 28 s of silence in 60 s).
+- Two causes of the slow menu: (a) the "menu state" log in blackkatFmvFrameEnd printed ~2000
+  lines/s with std::endl (now rate-limited: first 64, all with BLACKKAT_MENU_LOG=1);
+  (b) the stubbed FMV::DecodeFrame (flag 0) returned at once, so the menu loop spun thousands of
+  times per emulated second. The stub now charges BLACKKAT_FMV_STUB_CYCLES (default 4915200 =
+  one vsync) of EE time per completed frame via eeScheduler().accountCycles(). It must be
+  charged AFTER the pump/frame callback: charging before them made every pump get preempted and
+  the menu stuck on "Loading" (menu3).
+- After (menu4): 93.6 blocks/s, vsync 60/s, GameThread 7%, 0 underruns after startup, menu
+  renders/animates. vt_one (New Game -> sea battle) and s4_one (slot-4 on foot) unchanged:
+  vsync 60, vifw ~29.9 / ~40.
+
+### Crackle
+- With the producer at full rate the ring holds 2-4k frames, maxGap ~28-33 ms, drift step
+  within +-0.05% once settled; no underruns/drops after the first ~5 s in menu, sea battle or
+  on foot (sim consumer). Likely causes of the crackle Stelios heard were the same starvation
+  (menu and any slow segment). Startup: 4-6 underruns + ~4 drops in the first 5 s while the
+  producer bursts (ring briefly overfills, then drains at +0.5% over ~50 s ~ up to 250 ms latency).
+  Needs a real-device listen to confirm.
+
+### Missing SFX (implemented: minimal SPU2 hardware voices)
+- In-game SFX (cannon, sword, ambience) are real SPU2 voices keyed by SNDDRV (KON with nonzero
+  VOL/PITCH/SSA), not part of the ADMA stream.
+- Their sample banks never reached SPU2 RAM: our own override 0x2F45D0 (blackkatSndSendNext)
+  "completed" every EE->IOP sound transfer without doing it (EE sceSifSendCmd is not routed to
+  IOP cmd handlers). Queue entry: +0 id, +4 EE src, +8 SPU2 byte addr, +0xC u16 size. The
+  override now copies EE data into emulated SPU2 RAM (ps2x_spu2_upload); BLACKKAT_SND_UPLOAD=0
+  restores the old behaviour. ~611 x 4 KB uploads at scene load.
+- iop_memory.cpp Spu2Voices: 2 MB SPU RAM (also DMA ch4/ch7 non-ADMA and data port 0x1AC),
+  VAG ADPCM + loop flags, pitch (linear interp), ADSR, fixed volume (sweep = full), KON/KOFF
+  (16-bit/split 32-bit writes), VMIX dry/wet enables; rendered per ADMA block and mixed into the
+  stream. Register feedback is required: ENVX/VOLX, NAX and ENDX. SNDDRV (updatevoices) only
+  re-keys a voice when sceSdGetParam(ENVX)==0 and treats NAX < 0x5040 as finished; LSA must come
+  from LSAX (SNDDRV points it at the 0x5000 silent loop). Without ENVX it keyed every SFX off
+  after ~50 ms; without the LSAX fix voices never freed and SFX stopped after ~20 key-ons.
+- Mix regs seen: core0 MVOL 3fff, BVOL(ADMA in) 7fff, core1 MVOL 3fff, core1 ext-in 7fff,
+  MMIX 0fc0/0fcc -> voices and ADMA at unity, as implemented. Not done: reverb, noise, pitch
+  mod, sweep volumes, gaussian interpolation.
+- Flags: PS2X_SPU2_VOICES=0 (off), PS2X_SPU2_VOICE_GAIN=<f>, PS2X_SPU2_VOICELOG=1,
+  PS2X_SPU2_VOICERAW=<path> (raw s16 stereo voice-only dump), PS2X_SPU2_RAMDUMP=<path>,
+  PS2X_IOP_PCTRAP=hex,... (IOP PC trap log, diagnostic).
+- Patches: patches/ps2recomp-spu2-adma-output.patch (regenerated, ADMA capture/output + sim),
+  patches/ps2recomp-spu2-hw-voices.patch, patches/blackkat-menu-pacing-and-snd-upload.patch.

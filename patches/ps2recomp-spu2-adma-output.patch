@@ -1,0 +1,299 @@
+--- a/third_party/PS2Recomp/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/third_party/PS2Recomp/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -5,6 +5,208 @@
+ #include <algorithm>
+ #include <cstring>
+ 
++
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <string>
++#include <thread>
++#include <vector>
++
++// ---------------------------------------------------------------------------------------------
++// SPU2 output capture (PS2X_SPU2_*). Black Kat's SNDDRV mixes every voice in software (native
++// sndMixRun) and streams the result to SPU2 core0 through AutoDMA (ADMA): each transfer is
++// 512 words = 2 x (0x200 bytes left, 0x200 bytes right) = 512 stereo s16 frames at 48 kHz,
++// paced by PS2X_IOP_ADMA_PACE. At each ADMA start the block is de-interleaved and pushed to:
++//  - PS2X_SPU2_WAV=<path>: a 48 kHz stereo s16 WAV (header patched about once a second);
++//  - a lock-free SPSC ring that the host audio stream pulls from (ps2x_spu2_pull), only when
++//    PS2X_SPU2_OUT=1 (the runtime opens the stream).
++// PS2X_SPU2_CAPTURE=0 turns all of it off.
++// ---------------------------------------------------------------------------------------------
++namespace
++{
++    struct Spu2Out
++    {
++        static constexpr uint32_t kRing = 1u << 15; // stereo frames (~680 ms)
++        int16_t ring[kRing * 2] = {};
++        std::atomic<uint32_t> wpos{0}, rpos{0};
++        std::atomic<bool> outOn{false};
++        bool capture = true;
++        FILE *wav = nullptr;
++        uint64_t wavFrames = 0;
++        uint64_t blocks = 0, konWrites[2] = {0, 0};
++        uint64_t underruns = 0, drops = 0, silent = 0;
++        double sumSq = 0.0; uint64_t sqN = 0; uint32_t clip = 0;
++        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++        bool started = false;
++        bool sim = false;
++        FILE *simWav = nullptr;
++        uint64_t simFrames = 0;
++        std::chrono::steady_clock::time_point lastBlock{};
++        double maxGapMs = 0.0;
++        uint32_t fillMin = ~0u, fillMax = 0;
++
++        Spu2Out()
++        {
++            const char *c = std::getenv("PS2X_SPU2_CAPTURE");
++            capture = !(c && c[0] == '0');
++            const char *o = std::getenv("PS2X_SPU2_OUT");
++            outOn = capture && o && (o[0] == '1' || o[0] == 's');
++            sim = capture && o && o[0] == 's';
++            if (const char *ow = std::getenv("PS2X_SPU2_OUTWAV"); sim && ow && *ow)
++                simWav = std::fopen(ow, "wb");
++            if (const char *w = std::getenv("PS2X_SPU2_WAV"); capture && w && *w)
++            {
++                wav = std::fopen(w, "wb");
++                if (wav)
++                {
++                    writeHeader();
++                    std::fprintf(stderr, "[spu2] WAV capture -> %s (48000 Hz, stereo, s16)\n", w);
++                }
++            }
++        }
++        ~Spu2Out() { if (wav) { patchHeader(); std::fclose(wav); } }
++        void writeHeader()
++        {
++            const uint32_t rate = 48000, byteRate = rate * 4, dataBytes = (uint32_t)(wavFrames * 4);
++            uint8_t h[44];
++            std::memcpy(h, "RIFF", 4); put32(h + 4, 36 + dataBytes); std::memcpy(h + 8, "WAVEfmt ", 8);
++            put32(h + 16, 16); put16(h + 20, 1); put16(h + 22, 2); put32(h + 24, rate); put32(h + 28, byteRate);
++            put16(h + 32, 4); put16(h + 34, 16); std::memcpy(h + 36, "data", 4); put32(h + 40, dataBytes);
++            std::fseek(wav, 0, SEEK_SET); std::fwrite(h, 1, 44, wav); std::fseek(wav, 0, SEEK_END);
++        }
++        void patchHeader() { writeHeader(); std::fflush(wav); }
++        void patchSimHeader()
++        {
++            const uint32_t dataBytes = (uint32_t)(simFrames * 4);
++            uint8_t h[44];
++            std::memcpy(h, "RIFF", 4); put32(h + 4, 36 + dataBytes); std::memcpy(h + 8, "WAVEfmt ", 8);
++            put32(h + 16, 16); put16(h + 20, 1); put16(h + 22, 2); put32(h + 24, 48000); put32(h + 28, 192000);
++            put16(h + 32, 4); put16(h + 34, 16); std::memcpy(h + 36, "data", 4); put32(h + 40, dataBytes);
++            const long pos = std::ftell(simWav); std::fseek(simWav, 0, SEEK_SET); std::fwrite(h, 1, 44, simWav); std::fseek(simWav, pos, SEEK_SET); std::fflush(simWav);
++        }
++        static void put32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
++        static void put16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
++
++        void push(const int16_t *lr, uint32_t frames)
++        {
++            if (!started)
++            {
++                started = true;
++                std::fprintf(stderr, "[spu2] first ADMA block captured (out=%d sim=%d)\n", outOn ? 1 : 0, sim ? 1 : 0);
++                if (sim)
++                    std::thread([this]() {
++                        // PS2X_SPU2_OUT=sim: a wall-clock consumer standing in for the audio device
++                        // (1024 frames every 21.33 ms) writing what would be played to PS2X_SPU2_OUTWAV.
++                        std::vector<int16_t> buf(1024 * 2);
++                        auto next = std::chrono::steady_clock::now();
++                        if (simWav) { uint8_t z[44] = {}; std::fwrite(z, 1, 44, simWav); }
++                        for (;;)
++                        {
++                            next += std::chrono::microseconds(21333);
++                            std::this_thread::sleep_until(next);
++                            pull(buf.data(), 1024);
++                            if (simWav)
++                            {
++                                std::fwrite(buf.data(), 2, buf.size(), simWav);
++                                simFrames += 1024;
++                                if ((simFrames % (1024 * 47)) == 0) patchSimHeader();
++                            }
++                        }
++                    }).detach();
++            }
++            {
++                const auto now = std::chrono::steady_clock::now();
++                if (lastBlock.time_since_epoch().count())
++                    maxGapMs = std::max(maxGapMs, std::chrono::duration<double, std::milli>(now - lastBlock).count());
++                lastBlock = now;
++                const uint32_t f = wpos.load() - rpos.load();
++                fillMin = std::min(fillMin, f); fillMax = std::max(fillMax, f);
++            }
++            ++blocks;
++            for (uint32_t i = 0; i < frames * 2; ++i)
++            {
++                const int v = lr[i];
++                sumSq += (double)v * v;
++                clip += (v >= 32767 || v <= -32768);
++            }
++            sqN += frames * 2;
++            if (wav)
++            {
++                std::fwrite(lr, sizeof(int16_t), frames * 2, wav);
++                wavFrames += frames;
++                if ((blocks % 94u) == 0u) patchHeader();
++            }
++            if (outOn)
++            {
++                uint32_t w = wpos.load(std::memory_order_relaxed);
++                const uint32_t r = rpos.load(std::memory_order_acquire);
++                if (w - r + frames > kRing) { ++drops; return; } // consumer stalled: drop the block
++                for (uint32_t i = 0; i < frames; ++i)
++                {
++                    const uint32_t k = (w + i) & (kRing - 1u);
++                    ring[k * 2] = lr[i * 2]; ring[k * 2 + 1] = lr[i * 2 + 1];
++                }
++                wpos.store(w + frames, std::memory_order_release);
++            }
++            if ((blocks % 470u) == 0u)
++            {
++                const double rms = sqN ? std::sqrt(sumSq / (double)sqN) : 0.0;
++                const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++                std::fprintf(stderr, "[spu2] t=%.1f blocks=%llu (%.1f/s avg) rms=%.0f clip=%u kon0=%llu kon1=%llu ring=%u fill=[%u,%u] maxGap=%.1fms step=%.4f underruns=%llu drops=%llu silent=%llu\n",
++                             el, (unsigned long long)blocks, blocks / el, rms, clip, (unsigned long long)konWrites[0], (unsigned long long)konWrites[1],
++                             wpos.load() - rpos.load(), fillMin == ~0u ? 0u : fillMin, fillMax, maxGapMs, stepSm, (unsigned long long)underruns, (unsigned long long)drops,
++                             (unsigned long long)silent);
++                fillMin = ~0u; fillMax = 0; maxGapMs = 0.0;
++                sumSq = 0.0; sqN = 0; clip = 0;
++            }
++        }
++
++        // Consumer (host audio thread, single reader). Drift control: reads with a fractional step
++        // 1 +/- 0.5% steered by the ring fill (target kTarget frames, ~85 ms) and linear
++        // interpolation, so small clock differences between the emulated 48 kHz ADMA stream and the
++        // device are absorbed inaudibly. Safety nets: on underrun it plays silence until the ring has
++        // refilled to kTarget; above kHigh it skips ahead to kTarget.
++        static constexpr uint32_t kTarget = 4096, kHigh = 16384;
++        bool primed = false;
++        double frac = 0.0, stepSm = 1.0;
++        void pull(int16_t *out, uint32_t frames)
++        {
++            uint32_t r = rpos.load(std::memory_order_relaxed);
++            const uint32_t w = wpos.load(std::memory_order_acquire);
++            uint32_t avail = w - r;
++            if (avail > kHigh) { r = w - kTarget; avail = kTarget; frac = 0.0; ++drops; }
++            if (!primed && avail >= kTarget) primed = true;
++            uint32_t n = 0;
++            if (primed)
++            {
++                const double err = ((double)avail - (double)kTarget) / (double)kTarget;
++                const double want = 1.0 + std::clamp(err * 0.01, -0.005, 0.005);
++                stepSm += (want - stepSm) * 0.05;
++                for (; n < frames; ++n)
++                {
++                    const uint32_t i0 = (uint32_t)frac;
++                    if (i0 + 1u >= avail) { primed = false; ++underruns; break; }
++                    const double t = frac - i0;
++                    const uint32_t k0 = (r + i0) & (kRing - 1u), k1 = (r + i0 + 1u) & (kRing - 1u);
++                    out[n * 2] = (int16_t)std::lrint(ring[k0 * 2] + (ring[k1 * 2] - ring[k0 * 2]) * t);
++                    out[n * 2 + 1] = (int16_t)std::lrint(ring[k0 * 2 + 1] + (ring[k1 * 2 + 1] - ring[k0 * 2 + 1]) * t);
++                    frac += stepSm;
++                }
++                const uint32_t used = (uint32_t)frac;
++                frac -= used;
++                rpos.store(r + used, std::memory_order_release);
++            }
++            silent += frames - n;
++            std::memset(out + n * 2, 0, (size_t)(frames - n) * 4);
++        }
++    };
++    Spu2Out &spu2Out() { static Spu2Out s; return s; }
++}
++
++extern "C" void ps2x_spu2_pull(int16_t *out, uint32_t frames) { spu2Out().pull(out, frames); }
++extern "C" bool ps2x_spu2_out_enabled() { return spu2Out().outOn.load() && !spu2Out().sim; }
++
+ namespace ps2x::iop::detail
+ {
+     namespace
+@@ -249,6 +451,29 @@
+         }
+ 
+         m_hardware[address] = value;
++        if (address == 0x1F9001A0u || address == 0x1F9005A0u)
++        {
++            ++spu2Out().konWrites[address == 0x1F9005A0u ? 1 : 0];
++            static const bool s_konLog = []() { const char *e = std::getenv("PS2X_SPU2_KONLOG"); return e && e[0] == '1'; }();
++            static uint32_t s_konN = 0;
++            if (s_konLog && s_konN++ < 80u)
++            {
++                const uint32_t cb = address & ~0x3FFu;
++                const uint32_t kon = value & 0xFFFFFFu;
++                std::fprintf(stderr, "[spu2:kon] core%d val=%08x", address == 0x1F9005A0u ? 1 : 0, value);
++                for (uint32_t v = 0; v < 24; ++v)
++                    if (kon & (1u << v))
++                    {
++                        const uint32_t vb = cb + v * 0x10u;
++                        const uint32_t pitchW = m_hardware.count(vb + 4u) ? m_hardware[vb + 4u] : 0u;
++                        const uint32_t vol = m_hardware.count(vb) ? m_hardware[vb] : 0u;
++                        const uint32_t ssa = cb + 0x1C0u + v * 0xCu;
++                        const uint32_t ssaW = m_hardware.count(ssa) ? m_hardware[ssa] : 0u;
++                        std::fprintf(stderr, " v%u(vol=%08x pitch=%04x ssa=%08x)", v, vol, pitchW & 0xFFFFu, ssaW);
++                    }
++                std::fprintf(stderr, "\n");
++            }
++        }
+         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
+             return;
+ 
+@@ -302,6 +527,28 @@
+             if (it != m_hardware.end() && (it->second & 0xFFFFu) != 0u)
+                 dmaDelay = transferWords * 768u;
+         }
++        if (!secondCore && transferWords == 512u && spu2Out().capture)
++        {
++            const auto it = m_hardware.find(0x1F9001B0u);
++            if (it != m_hardware.end() && (it->second & 0xFFFFu) != 0u)
++            {
++                const uint32_t madr = readHardware32(address - 8u) & 0x1FFFFFu;
++                if (madr + 2048u <= m_ram.size())
++                {
++                    int16_t lr[512 * 2];
++                    const uint8_t *src = m_ram.data() + madr;
++                    for (uint32_t half = 0; half < 2; ++half)
++                        for (uint32_t i = 0; i < 256; ++i)
++                        {
++                            int16_t l, r;
++                            std::memcpy(&l, src + half * 0x400u + i * 2u, 2);
++                            std::memcpy(&r, src + half * 0x400u + 0x200u + i * 2u, 2);
++                            lr[(half * 256 + i) * 2] = l; lr[(half * 256 + i) * 2 + 1] = r;
++                        }
++                    spu2Out().push(lr, 512);
++                }
++            }
++        }
+         m_dmaStart = DmaStart{secondCore ? kDmaSpu1Irq : kDmaSpu0Irq, dmaDelay};
+     }
+ 
+--- a/third_party/PS2Recomp/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/third_party/PS2Recomp/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -30,6 +30,9 @@
+ #include <vector>
+ #include <unordered_map>
+ #include <sstream>
++extern "C" void ps2x_spu2_pull(int16_t *out, uint32_t frames);
++extern "C" bool ps2x_spu2_out_enabled();
++
+ 
+ namespace ps2_stubs
+ {
+@@ -774,6 +777,16 @@
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
++        // PS2X_SPU2_OUT=1: play the captured SPU2 ADMA stream (48 kHz stereo) through the host
++        // audio device (miniaudio -> PipeWire/Pulse). Off by default.
++        if (IsAudioDeviceReady() && ps2x_spu2_out_enabled())
++        {
++            SetAudioStreamBufferSizeDefault(1024);
++            static AudioStream s_spu2Stream = LoadAudioStream(48000, 16, 2);
++            SetAudioStreamCallback(s_spu2Stream, [](void *buffer, unsigned int frames) { ps2x_spu2_pull(static_cast<int16_t *>(buffer), frames); });
++            PlayAudioStream(s_spu2Stream);
++            std::cerr << "[spu2] host audio stream started (48000 Hz stereo)" << std::endl;
++        }
+ #endif
+         SetTargetFPS(60);
+         if (m_debugUiInitCallback)
