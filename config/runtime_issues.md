@@ -1044,3 +1044,28 @@ effects, ~58/s) + their CPU decode, Present conversion (CT16 ReadCT16) on non-re
   IOP: 2.2M instr/s, sndmix/s 94, idleSkips ~1.08M/s; GameThread 78-80% -> 60%, total CPU ~225% -> ~205%.
   Slot-4 scene also fine (in-game screenshots similar to off; GameThread 78 -> 60).
 - Patch: patches/ps2recomp-iop-adma-pace.patch (also contains the PS2X_PROF modules/regions line).
+
+## 2026-11-19 Dashed lines / checkered blocks on the sea: FIXED (patches/ps2recomp-ipu-from-fill.patch)
+- Symptom: white/cyan dashed lines along the sea mesh grid and bright checkered blocks under the hull
+  (GPU and CPU GS alike; not VU1: same with PS2X_VU1_NATIVE=0 PS2X_VU1_ACCURATE=1).
+- Isolation: PS2X_GS_SKIPTEX=33c0 (new debug switch) removes them completely; skipping the reflection
+  pass (2bc0) does not. The sea is drawn twice: reflection (tex 0x2BC0, FIX 0x40) then a detail pass
+  (tex 0x33C0, CT16 256x256, tcc1, MODULATE, STQ tiled -8..+4, REPEAT, bilinear, ALPHA (Cs-Cd)*FIX+Cd,
+  FIX 0x31, ZTST GEQUAL, no Z write).
+- 0x33C0 is uploaded by GIF path3 as 16 strips of 16x256 CT16 from EE 0x872200..0x892200 (REF tags
+  0x7AAE50..). PS2X_GS_DUMPTEX=33c0,N showed it is ~all black with junk columns (white blocks, colour noise).
+- BLACKKAT_WATCH on 0x872200..0x892200: no EE writes after the level loads (only FMV/menu-era code at
+  1.4-7 s). PS2X_DMA_STARTLOG=1: the buffer is the destination of a fromIPU DMA (ch 0x1000B000,
+  madr 0x872200, qwc 8192) fed by toIPU chunks of ~640 qw at 0x8922E0... => the sea detail texture is an
+  IPU-decoded animated (MPEG) texture. There is no IPU emulation, so the buffer kept stale FMV-era data.
+- Fix (ps2_memory.cpp, DMA start): on a fromIPU start, fill the destination with a 16-bit pattern,
+  default 0xB142 (dark sea blue, A=1) so the detail pass becomes a mild uniform tint.
+  PS2X_IPU_FROM_FILL=<hex16> picks the colour, PS2X_IPU_FROM_FILL=off restores the old behaviour.
+  NOTE: an all-zero fill hangs the game at the sea load (ticks stop right after the fromIPU start); 0 is
+  mapped to 0x0001. Real fix = IPU emulation (IDEC/BDEC + CSC), which would also bring back FMVs.
+- Verified: title path sea battle 40 s shot clean (build/shots/wFixB_40s.png vs wGpu_40s.png), vsync/s 60.00
+  vifw/s 29.23; slot-4 scene runs (on-foot shoreline water clean); VU1 BC_CHECK 220,000 runs, 0 mismatches.
+- New debug env (all off by default): PS2X_GS_SKIPTEX=hex,..; PS2X_GS_DUMPTEX=hex,n (texture -> build/shots/
+  tex_<hex>.ppm/_a.pgm); PS2X_GS_WATCHBP=lo,hi (log transfers/draws/uploads into a VRAM block range);
+  PS2X_GS_DUMPRUNS now also dumps the run's texture; PS2X_DMA_GIFQWC=N (GIF tags with N qwords);
+  PS2X_DMA_SPRLOG=1; PS2X_DMA_STARTLOG=1 (distinct non-VIF1/GIF DMA starts).

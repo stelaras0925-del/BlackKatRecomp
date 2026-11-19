@@ -1,0 +1,252 @@
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,3 +1,6 @@
++#include <chrono>
++#include <mutex>
++#include <set>
+ #include <cstdlib>
+ #include <cstdio>
+ #include "runtime/ps2_memory.h"
+@@ -1374,12 +1377,62 @@
+             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
+             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
++            {
++                // PS2X_DMA_STARTLOG=1 (diagnostic): log distinct (channel, MADR) DMA starts (non VIF1/GIF).
++                static const bool s_sl = []() { const char *e = std::getenv("PS2X_DMA_STARTLOG"); return e && e[0] == '1'; }();
++                if (s_sl && channelBase != 0x10009000u && channelBase != 0x1000A000u)
++                {
++                    static std::mutex s_slm; static std::set<uint64_t> s_sls; static uint32_t s_sln = 0;
++                    std::lock_guard<std::mutex> lk(s_slm);
++                    if (s_sls.insert(((uint64_t)channelBase << 32) | madr).second && s_sln++ < 600u)
++                        std::fprintf(stderr, "[dma:start] ch=%08x chcr=%08x madr=%08x qwc=%u tadr=%08x sadr=%08x\n", channelBase, value, madr, qwc & 0xFFFFu,
++                                     m_ioRegisters[channelBase + 0x30u], m_ioRegisters[channelBase + 0x80u]);
++                }
++            }
+ 
+             if (tryProcessScratchpadDma(channelBase, value))
+             {
+                 return true;
+             }
+ 
++            // IPU output (fromIPU, ch 0x1000B000): the IPU is not emulated, so nothing is ever
++            // decoded into the destination and it keeps whatever stale data was there. In Black Kat
++            // the sea's animated 256x256 CT16 detail texture (EE 0x872200 -> GS 0x33C0, blended at
++            // FIX 0x31 over the water) kept FMV-era junk, drawn as dashed white lines and checkered
++            // blocks. Fill the destination with a 16-bit pattern instead: PS2X_IPU_FROM_FILL=<hex16>
++            // (default 0xB142 = dark sea blue, A=1), PS2X_IPU_FROM_FILL=off keeps the old data.
++            // An all-zero fill hangs Black Kat at the sea load (the game polls the output), so 0 is
++            // mapped to 0x0001.
++            if (channelBase == 0x1000B000u && (qwc & 0xFFFFu) != 0u)
++            {
++                static const int s_fill = []() {
++                    const char *e = std::getenv("PS2X_IPU_FROM_FILL");
++                    if (e && (e[0] == 'o' || e[0] == 'O')) return -1;
++                    int v = e ? (int)(std::strtol(e, nullptr, 16) & 0xFFFF) : 0xB142;
++                    return v ? v : 1;
++                }();
++                if (s_fill >= 0)
++                {
++                    try
++                    {
++                        const uint32_t phys = translateAddress(madr & 0x7FFFFFF0u);
++                        const uint32_t bytes = (qwc & 0xFFFFu) * 16u;
++                        if (!isScratchpad(madr) && phys < PS2_RAM_SIZE && bytes <= PS2_RAM_SIZE - phys)
++                        {
++                            for (uint32_t i = 0; i < bytes; i += 2)
++                            {
++                                m_rdram[phys + i] = static_cast<uint8_t>(s_fill & 0xFF);
++                                m_rdram[phys + i + 1] = static_cast<uint8_t>(s_fill >> 8);
++                            }
++                            markModified(phys, bytes);
++                        }
++                    }
++                    catch (...)
++                    {
++                    }
++                }
++            }
++
+             // VIF1 CHCR.DIR=0 (bit 0) is the "from VIF1 to memory" direction: a GS
+             // local->host download (TRXDIR=1) read back through the VIF1 FIFO. The old
+             // code treated it as a normal to-VIF transfer, so the destination buffer
+@@ -1646,6 +1699,16 @@
+                             static uint32_t s_wlo = 0, s_whi = 0;
+                             static const bool s_w = []() { const char *e = std::getenv("PS2X_DMA_WATCH"); if (!e) return false; char *x = nullptr; s_wlo = (uint32_t)std::strtoul(e, &x, 16); if (x && *x == ':') s_whi = (uint32_t)std::strtoul(x + 1, nullptr, 16); return s_whi > s_wlo; }();
+                             static std::atomic<uint32_t> s_wn{0};
++                            // PS2X_DMA_GIFQWC=N (diagnostic): log GIF-channel tags with exactly N qwords.
++                            static const long s_gq = []() { const char *e = std::getenv("PS2X_DMA_GIFQWC"); return e ? std::atol(e) : -1L; }();
++                            static std::atomic<uint32_t> s_gn{0};
++                            if (s_gq >= 0 && channelBase == 0x1000A000u && (long)tagQwc == s_gq)
++                            {
++                                static std::mutex s_gm; static std::set<uint64_t> s_gseen;
++                                std::lock_guard<std::mutex> lk(s_gm);
++                                if (s_gseen.insert(((uint64_t)currentTagAddr << 32) | addr).second && s_gn.fetch_add(1) < 600u)
++                                    std::fprintf(stderr, "[dma:gif] t=%lld tagAt=%08x id=%u qwc=%u addr=%08x n=%d\n", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() % 1000000, currentTagAddr, id, (unsigned)tagQwc, addr, tagsProcessed);
++                            }
+                             if (s_w && addr >= s_wlo && addr < s_whi && s_wn.fetch_add(1) < 20000u)
+                                 std::fprintf(stderr, "[dma:watch] ch=%08x tagAt=%08x id=%u qwc=%u addr=%08x asp=%u n=%d\n", channelBase, currentTagAddr, id, (unsigned)tagQwc, addr, asp, tagsProcessed);
+                         }
+@@ -1752,6 +1815,14 @@
+         return false;
+ 
+     const uint32_t mode = (chcr >> 2u) & 0x3u;
++    {
++        static const bool s_sprLog = []() { const char *e = std::getenv("PS2X_DMA_SPRLOG"); return e && e[0] == '1'; }();
++        static std::atomic<uint32_t> s_sprN{0};
++        if (s_sprLog && s_sprN.fetch_add(1) < 200u)
++            std::fprintf(stderr, "[dma:spr] ch=%08x chcr=%08x mode=%u madr=%08x qwc=%u sadr=%04x tadr=%08x sqwc=%08x\n", channelBase, chcr, mode,
++                         m_ioRegisters[channelBase + 0x10u], m_ioRegisters[channelBase + 0x20u] & 0xFFFFu, m_ioRegisters[channelBase + 0x80u],
++                         m_ioRegisters[channelBase + 0x30u], m_ioRegisters[0x1000E030u]);
++    }
+     if (mode != 0u)
+         return false;
+ 
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -131,6 +131,25 @@
+ #include <mutex>
+ #include <thread>
+ #include <pthread.h>
++#include <chrono>
++#include <cstdio>
++
++extern int g_ps2xGifCurPath;
++namespace
++{
++    // PS2X_GS_WATCHBP="lo,hi" (hex block addresses): debug, log transfers and draws that write
++    // into [lo,hi) (max 400 lines).
++    struct GsWatchBp
++    {
++        long lo = -1, hi = -1; int lines = 0;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++        GsWatchBp() { if (const char *e = std::getenv("PS2X_GS_WATCHBP")) std::sscanf(e, "%lx,%lx", &lo, &hi); }
++        bool on(long bp, long endBp) { return lo >= 0 && lines < 400 && bp < hi && endBp > lo; }
++        double t() const { return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
++    };
++    GsWatchBp g_gsWatch;
++}
++
+ namespace
+ {
+     // Multi-worker banded rasterizer. Worker k owns framebuffer rows y with
+@@ -1895,6 +1914,17 @@
+             command.trxpos = m_trxpos;
+             command.trxreg = m_trxreg;
+             command.direction = m_trxdir;
++            if (m_trxdir != 1u)
++            {
++                const long bp = (long)m_bitbltbuf.dbp;
++                const long bytes = (long)m_trxreg.rrw * (long)m_trxreg.rrh * 4; // upper bound
++                if (g_gsWatch.on(bp, bp + std::max(1L, (bytes + 255) / 256 + (long)m_trxpos.dsay * m_bitbltbuf.dbw * 64 * 4 / 256 + 1)))
++                {
++                    ++g_gsWatch.lines;
++                    std::fprintf(stderr, "[gs:watch] t=%.3f xfer dir=%u dbp=%x dbw=%u dpsm=%x pos=(%u,%u) size=%ux%u sbp=%x spsm=%x path=%d\n", g_gsWatch.t(), m_trxdir,
++                                 m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh, m_bitbltbuf.sbp, m_bitbltbuf.spsm, g_ps2xGifCurPath);
++                }
++            }
+             m_backend->BeginTransfer(command);
+         }
+         recordTransferDebugEventUnlocked();
+@@ -2031,6 +2061,7 @@
+ 
+ extern int g_ps2xGifCurPath;
+ 
++
+ namespace
+ {
+     // PS2X_GS_DRAWLOG=<sec>[,<dur>]: from <sec> for <dur> (default 0.4) seconds,
+@@ -2201,6 +2232,21 @@
+                         std::snprintf(name, sizeof(name), "build/shots/dr_%llu_z.pgm", (unsigned long long)L.seq);
+                         if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P5\n%u %u\n255\n", W, H); std::fwrite(zz.data(), 1, zz.size(), f); std::fclose(f); }
+                         std::fprintf(stderr, "[gs:dump] run#%llu fb=%x z=%x/psm%x zmax=%u\n", (unsigned long long)L.seq, c.frame.fbp, c.zbuf.zbp, zpsm, zmax);
++                        if (m_prim.tme)
++                        {
++                            const uint32_t tw = 1u << std::min<uint32_t>(c.tex0.tw, 10u), th = 1u << std::min<uint32_t>(c.tex0.th, 10u);
++                            std::vector<uint8_t> trgb(tw * th * 3);
++                            for (uint32_t y = 0; y < th; ++y)
++                                for (uint32_t x = 0; x < tw; ++x)
++                                {
++                                    const uint32_t px = m_backend->ReadVram(c.tex0.psm, c.tex0.tbp0, c.tex0.tbw ? c.tex0.tbw : 1u, x, y);
++                                    trgb[(y * tw + x) * 3 + 0] = px & 0xFF;
++                                    trgb[(y * tw + x) * 3 + 1] = (px >> 8) & 0xFF;
++                                    trgb[(y * tw + x) * 3 + 2] = (px >> 16) & 0xFF;
++                                }
++                            std::snprintf(name, sizeof(name), "build/shots/dr_%llu_tex.ppm", (unsigned long long)L.seq);
++                            if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", tw, th); std::fwrite(trgb.data(), 1, trgb.size(), f); std::fclose(f); }
++                        }
+                     }
+                 }
+             }
+@@ -2243,6 +2289,56 @@
+             }
+         }
+         updatePreferredDisplaySourceForDraw(batch);
++        {
++            const auto &c = batch.state.context;
++            const long bp = (long)c.frame.fbp * 32;
++            static uint64_t s_lastKey = ~0ull;
++            const uint64_t key = (uint64_t)c.frame.fbp | ((uint64_t)c.frame.psm << 16) | ((uint64_t)c.tex0.tbp0 << 24) | ((uint64_t)c.frame.fbmsk << 40);
++            if (key != s_lastKey && g_gsWatch.on(bp, bp + (long)(c.frame.fbw ? c.frame.fbw : 1) * 64 * (c.scissor.y1 + 1) * 4 / 256))
++            {
++                ++g_gsWatch.lines;
++                std::fprintf(stderr, "[gs:watch] t=%.3f draw fbp=%x(bp %lx) fbw=%u psm=%x msk=%x prim=%u tme=%u tex=%x/psm%x sc=(%u,%u)-(%u,%u)\n", g_gsWatch.t(), c.frame.fbp, bp, c.frame.fbw,
++                             c.frame.psm, c.frame.fbmsk, (unsigned)batch.state.prim.type, batch.state.prim.tme, c.tex0.tbp0, c.tex0.psm, c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1);
++            }
++            s_lastKey = key;
++        }
++        // PS2X_GS_DUMPTEX="hex,n": debug, on the n-th draw batch using TBP0=hex, dump the texture
++        // (as decoded RGBA via ReadVram, alpha in a second file) to build/shots/tex_<hex>.ppm/.pgm.
++        {
++            static const std::pair<long, long> s_dt = []() { long a = -1, b = 1; if (const char *e = std::getenv("PS2X_GS_DUMPTEX")) std::sscanf(e, "%lx,%ld", &a, &b); return std::make_pair(a, b); }();
++            static long s_dtSeen = 0;
++            const auto &c = batch.state.context;
++            if (s_dt.first >= 0 && batch.state.prim.tme && (long)c.tex0.tbp0 == s_dt.first && ++s_dtSeen == s_dt.second)
++            {
++                const uint32_t tw = 1u << std::min<uint32_t>(c.tex0.tw, 10u), th = 1u << std::min<uint32_t>(c.tex0.th, 10u);
++                std::vector<uint8_t> rgb(tw * th * 3), al(tw * th);
++                for (uint32_t y = 0; y < th; ++y)
++                    for (uint32_t x = 0; x < tw; ++x)
++                    {
++                        const uint32_t px = m_backend->ReadVram(c.tex0.psm, c.tex0.tbp0, c.tex0.tbw ? c.tex0.tbw : 1u, x, y);
++                        uint8_t r, g, b, a;
++                        if (c.tex0.psm == 2u || c.tex0.psm == 0xAu)
++                        { r = (px & 31) << 3; g = ((px >> 5) & 31) << 3; b = ((px >> 10) & 31) << 3; a = (px & 0x8000u) ? 255 : 0; }
++                        else { r = px & 0xFF; g = (px >> 8) & 0xFF; b = (px >> 16) & 0xFF; a = (px >> 24) & 0xFF; }
++                        rgb[(y * tw + x) * 3] = r; rgb[(y * tw + x) * 3 + 1] = g; rgb[(y * tw + x) * 3 + 2] = b; al[y * tw + x] = a;
++                    }
++                char name[128];
++                std::snprintf(name, sizeof(name), "build/shots/tex_%lx.ppm", s_dt.first);
++                if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", tw, th); std::fwrite(rgb.data(), 1, rgb.size(), f); std::fclose(f); }
++                std::snprintf(name, sizeof(name), "build/shots/tex_%lx_a.pgm", s_dt.first);
++                if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P5\n%u %u\n255\n", tw, th); std::fwrite(al.data(), 1, al.size(), f); std::fclose(f); }
++                std::fprintf(stderr, "[gs:dumptex] tbp=%x psm=%x tbw=%u %ux%u tcc=%u tfx=%u ta0=%x aem=%d ta1=%x clamp=%llx tex1=%llx\n", c.tex0.tbp0, c.tex0.psm, c.tex0.tbw, tw, th, c.tex0.tcc, c.tex0.tfx,
++                             m_texa.ta0, (int)m_texa.aem, m_texa.ta1, (unsigned long long)c.clamp, (unsigned long long)c.tex1);
++            }
++        }
++        // PS2X_GS_SKIPTEX="hex,hex": debug, drop textured draws using those TEX0.TBP0 values.
++        static const std::vector<uint32_t> s_skipTex = []() { std::vector<uint32_t> v; if (const char *e = std::getenv("PS2X_GS_SKIPTEX")) { const char *c = e; while (*c) { char *end = nullptr; const unsigned long x = std::strtoul(c, &end, 16); if (end == c) break; v.push_back((uint32_t)x); c = (*end == ',') ? end + 1 : end; } } return v; }();
++        if (!s_skipTex.empty() && batch.state.prim.tme &&
++            std::find(s_skipTex.begin(), s_skipTex.end(), batch.state.context.tex0.tbp0) != s_skipTex.end())
++        {
++            recordDrawDebugEventUnlocked(needed);
++        }
++        else
+         m_backend->Submit(batch);
+         recordDrawDebugEventUnlocked(needed);
+     }
+@@ -2277,6 +2373,14 @@
+ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (m_backend)
++        if (g_gsWatch.lo >= 0 && (long)m_bitbltbuf.dbp >= g_gsWatch.lo && (long)m_bitbltbuf.dbp < g_gsWatch.hi && g_gsWatch.lines < 400)
++        {
++            uint32_t nz = 0; uint64_t sum = 0;
++            for (uint32_t i = 0; i + 1 < sizeBytes; i += 2) { const uint16_t v = (uint16_t)(data[i] | (data[i + 1] << 8)); nz += v != 0; sum += v & 0x7FFF; }
++            ++g_gsWatch.lines;
++            std::fprintf(stderr, "[gs:watch] t=%.3f data dbp=%x pos=(%u,%u) bytes=%u nonzero16=%u first=%02x%02x%02x%02x%02x%02x%02x%02x\n", g_gsWatch.t(), m_bitbltbuf.dbp, m_trxpos.dsax, m_trxpos.dsay,
++                         sizeBytes, nz, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
++        }
+         m_backend->UploadImage(data, sizeBytes);
+ }
+ 
