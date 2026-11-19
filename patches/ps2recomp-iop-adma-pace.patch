@@ -1,0 +1,88 @@
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "iop_memory.h"
+ 
+ #include <algorithm>
+@@ -269,10 +271,38 @@
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
+-        m_dmaStart = DmaStart{
+-            secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+-            std::max<uint64_t>(transferWords * 2u, 64u),
+-        };
++        {
++            static const bool dbg = []() { const char *e = std::getenv("PS2X_IOP_SPUDBG"); return e && e[0] == '1'; }();
++            static uint64_t n = 0;
++            if (dbg && (++n <= 6u || (n % 2000u) == 0u))
++            {
++                std::fprintf(stderr, "[iop:spudma] #%llu core%d bcr=%08x words=%llu madr=%08x chcr=%08x regs:",
++                             (unsigned long long)n, secondCore ? 1 : 0, blockControl, (unsigned long long)transferWords,
++                             readHardware32(address - 8u), value);
++                const uint32_t cb = secondCore ? 0x1F900400u : 0x1F900000u;
++                for (uint32_t r = 0x180u; r < 0x1C0u; r += 4u)
++                    if (const auto it = m_hardware.find(cb + r); it != m_hardware.end())
++                        std::fprintf(stderr, " %03x=%08x", r, it->second);
++                for (uint32_t r = 0x340u; r < 0x348u; r += 4u)
++                    if (const auto it = m_hardware.find(cb + r); it != m_hardware.end())
++                        std::fprintf(stderr, " %03x=%08x", r, it->second);
++                std::fprintf(stderr, "\n");
++            }
++        }
++        // ADMA pacing (PS2X_IOP_ADMA_PACE, default on; =0 reverts): when the core is in AutoDMA
++        // mode (ADMAS at core+0x1B0 nonzero) the SPU2 consumes one 32-bit word (one stereo
++        // 16-bit sample) per 48 kHz tick = 768 IOP cycles. Without this, completion fires
++        // after 2 cycles/word and the sound driver's transfer interrupt keeps the IOP busy
++        // mixing far faster than real time.
++        static const bool admaPace = []() { const char *e = std::getenv("PS2X_IOP_ADMA_PACE"); return !(e && e[0] == '0'); }();
++        uint64_t dmaDelay = std::max<uint64_t>(transferWords * 2u, 64u);
++        if (admaPace)
++        {
++            const auto it = m_hardware.find((secondCore ? 0x1F900400u : 0x1F900000u) + 0x1B0u);
++            if (it != m_hardware.end() && (it->second & 0xFFFFu) != 0u)
++                dmaDelay = transferWords * 768u;
++        }
++        m_dmaStart = DmaStart{secondCore ? kDmaSpu1Irq : kDmaSpu0Irq, dmaDelay};
+     }
+ 
+     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1061,6 +1061,34 @@
+                 std::fprintf(stderr, " %05x(%s+%x)=%.1f%%", pc, mod, off, 100.0 * v[i].first / double(sampled ? sampled : 1));
+             }
+             std::fprintf(stderr, "\n");
++            {
++                // per-module share and hottest 256-byte regions (PS2X_PROF)
++                std::map<std::string, uint64_t> modShare;
++                std::map<uint32_t, uint64_t> region;
++                for (const auto &[cnt, pc] : v)
++                {
++                    const char *mod = "?";
++                    for (const auto &[id, m] : modules)
++                        if (pc >= (m.base & 0x1FFFFFu) && pc < (m.base & 0x1FFFFFu) + m.size)
++                        {
++                            mod = m.name.c_str();
++                            break;
++                        }
++                    modShare[mod] += cnt;
++                    region[pc & ~0xFFu] += cnt;
++                }
++                std::fprintf(stderr, "[iop:prof]   modules:");
++                for (const auto &[n, c] : modShare)
++                    std::fprintf(stderr, " %s=%.1f%%", n.c_str(), 100.0 * c / double(sampled ? sampled : 1));
++                std::vector<std::pair<uint64_t, uint32_t>> rv;
++                for (const auto &[r, c] : region)
++                    rv.push_back({c, r});
++                std::sort(rv.begin(), rv.end(), [](auto &a, auto &b) { return a.first > b.first; });
++                std::fprintf(stderr, " | regions:");
++                for (size_t i = 0; i < rv.size() && i < 12u; ++i)
++                    std::fprintf(stderr, " %05x=%.1f%%", rv[i].second, 100.0 * rv[i].first / double(sampled ? sampled : 1));
++                std::fprintf(stderr, "\n");
++            }
+             lastInstr = totalInstructions;
+             lastCycles = totalCycles;
+             lastSnd = sndMixCalls;

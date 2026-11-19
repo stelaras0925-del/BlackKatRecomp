@@ -1029,3 +1029,18 @@ effects, ~58/s) + their CPU decode, Present conversion (CT16 ReadCT16) on non-re
 - Verification (BC_CHECK compares vf/vi/acc/q/p/i/r/mac/status/clip/pc/cycles/control/xgkick hash/VU data): final code 1,220,000 runs / 200 s title-path scene + 960,000 runs / 200 s slot-4 save scene (keyscript), 0 mismatches. Earlier m3 stages: 1.22M + 0.98M, 0 mismatches.
 - A/B (61 s, GS_GPU=1): NATIVE=0 VU1 ~37.9 Mcyc/busy-s, vifw/s 20.44, vsync/s 51.57 -> default ~60.3 Mcyc/busy-s (+59%), vifw/s 29.78 (+46%), vsync/s 46.03. vsync/s drops because the EE now spends less time waiting on VU1 per game frame (more frames per emulated vsync); VU1 worker busy 84% -> 76%, EE/IOP thread is the next limiter.
 - Remaining VU1 profile (native on): JIT code 54%, commitReadyPipelines 8%, live FMAC flag entries (fmacFlagsFast) 7%, processVIF1Data 7%. Not done yet: CLIP/OPMULA/OPMSUB/DIV/SQD natively, native live-flag entries, VI/cycle register caching, NormPs elision via known-normal dataflow.
+
+## 2026-11-19 game-thread speed: IOP SPU2 ADMA pacing (PS2X_IOP_ADMA_PACE, default on)
+- Profile (native VU1 on, title path): GameThread ~80% CPU, ~48% of it inline IOP; IOP ran 27M instr/s with
+  idleSkips=0, sndmix/s ~1100 (real 48 kHz needs ~94/s for 512-sample blocks). Cause: SPU DMA completion was
+  scheduled after transferWords*2 cycles, so SNDDRV's transfer-interrupt handler (+0x7808, registered via
+  sceSdSetTransIntrHandler at +0x8fcc) woke the sound thread continuously; the LIBSD +0x3550..0x35e0 /
+  SNDDRV +0x8400..0x8700 hot loops were just the per-block voice update running ~12x too often.
+- SNDDRV uses core0 AutoDMA: ADMAS is at core+0x1B0 (0x1F9001B0 = 1), BCR 0x00200010 (512 words, double
+  buffer 0x12c400/0x12cc00). Fix (iop_memory.cpp writeHardware32): when that core's ADMAS is nonzero, the
+  completion delay is transferWords*768 cycles (one stereo sample per 48 kHz tick at 36.864 MHz). Non-ADMA
+  SPU DMAs (core1 voice uploads) unchanged. PS2X_IOP_ADMA_PACE=0 reverts. PS2X_IOP_SPUDBG=1 logs DMA starts.
+- Result (same session, 45 s title path, GPU on): off vsync/s 47.81 vifw/s 30.33; on vsync/s 60.02 vifw/s 29.83.
+  IOP: 2.2M instr/s, sndmix/s 94, idleSkips ~1.08M/s; GameThread 78-80% -> 60%, total CPU ~225% -> ~205%.
+  Slot-4 scene also fine (in-game screenshots similar to off; GameThread 78 -> 60).
+- Patch: patches/ps2recomp-iop-adma-pace.patch (also contains the PS2X_PROF modules/regions line).
