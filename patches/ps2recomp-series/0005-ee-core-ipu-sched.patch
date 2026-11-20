@@ -1054,7 +1054,7 @@ index 37b6a4decc5865c7e51fbe9209ce46eafa6ccb27..d86665dd888c96b1b2126de55f8bf771
 +    uint64_t dispfbWrites() { return g_dispfbWrites.load(std::memory_order_relaxed); }
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..205b5dc2723b31558fbe829ef82425b6caa844f0 100644
+index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..dffd9c281690849a4671aacf2722d12a9e5ccf28 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -7,6 +7,7 @@
@@ -1372,7 +1372,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..205b5dc2723b31558fbe829ef82425b6
      {
          ctx->pc = fallthroughPc;
      }
-@@ -2388,44 +2565,145 @@ void PS2Runtime::run()
+@@ -2388,51 +2565,168 @@ void PS2Runtime::run()
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
@@ -1545,7 +1545,33 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..205b5dc2723b31558fbe829ef82425b6
          const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
          const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
          const float screenWidth = static_cast<float>(GetScreenWidth());
-@@ -2440,6 +2718,18 @@ void PS2Runtime::run()
+         const float screenHeight = static_cast<float>(GetScreenHeight());
+-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+-        const float dstWidth = srcWidth * scale;
+-        const float dstHeight = srcHeight * scale;
++        // PS2X_PRESENT_ASPECT=<w/h> (e.g. 1.777778 for 16:9 widescreen): display aspect of the
++        // picture; default keeps the frame's own pixel aspect (640x448 -> 1.43).
++        static const float s_presentAspect = []() {
++            const char *e = std::getenv("PS2X_PRESENT_ASPECT");
++            const float v = e ? std::strtof(e, nullptr) : 0.0f;
++            return (v > 0.5f && v < 4.0f) ? v : 0.0f;
++        }();
++        float dstWidth, dstHeight;
++        if (s_presentAspect > 0.0f)
++        {
++            dstHeight = std::min(screenHeight, screenWidth / s_presentAspect);
++            dstWidth = dstHeight * s_presentAspect;
++        }
++        else
++        {
++            const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
++            dstWidth = srcWidth * scale;
++            dstHeight = srcHeight * scale;
++        }
+         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+         const Rectangle dstRect{
+             (screenWidth - dstWidth) * 0.5f,
+@@ -2440,6 +2734,18 @@ void PS2Runtime::run()
              dstWidth,
              dstHeight};
          DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);

@@ -500,6 +500,8 @@ int main(int argc, char *argv[])
                 else if (a == "--fullscreen") set.fullscreen = true;
                 else if (a.rfind("--windowed", 0) == 0) { set.fullscreen = false; int w = 0, h = 0; if (std::sscanf(a.c_str(), "--windowed=%dx%d", &w, &h) == 2) { set.winW = w; set.winH = h; } }
                 else if (a == "--monitor") set.monitor = next();
+                else if (a == "--widescreen" || a == "--aspect=16:9") set.widescreen = true;
+                else if (a == "--aspect=4:3") set.widescreen = false;
                 else if (a.rfind("--monitor=", 0) == 0) set.monitor = a.substr(10);
                 else if (a == "--audio") set.audio = true;
                 else if (a == "--no-audio") set.audio = false;
@@ -509,6 +511,7 @@ int main(int argc, char *argv[])
                 {
                     std::cout << "Usage: blackkat [--launcher|--play] [--iso P] [--elf P] [--gpu|--cpu] [--scale 1-4]\n"
                                  "                [--fullscreen|--windowed[=WxH]] [--monitor NAME|INDEX|primary]\n"
+                                 "                [--widescreen|--aspect=4:3|--aspect=16:9]\n"
                                  "                [--audio|--no-audio] [--movies|--no-movies]\n"
                                  "       blackkat [path/to/SLUS_203.65] [path/to/disc.iso]   (classic, no launcher/config)\n"
                                  "Settings: " << bklaunch::configPath() << std::endl;
@@ -539,7 +542,8 @@ int main(int argc, char *argv[])
                 std::cerr << "[blackkat] launcher settings: iso=" << set.iso << " elf=" << set.elf << " gpu=" << set.gpu
                           << " scale=" << set.scale << " audio=" << set.audio << " movies=" << set.movies
                           << " fullscreen=" << set.fullscreen << " window=" << set.winW << "x" << set.winH
-                          << " monitor=" << (set.monitor.empty() ? "primary" : set.monitor) << std::endl;
+                          << " monitor=" << (set.monitor.empty() ? "primary" : set.monitor)
+                          << " aspect=" << (set.widescreen ? "16:9" : "4:3") << std::endl;
             }
         }
         const std::filesystem::path elfPath = cliElf.empty() ? guestElfPath(argc, argv) : cliElf;

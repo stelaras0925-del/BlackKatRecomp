@@ -1408,3 +1408,40 @@ After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, hig
   - F11 / Alt+Enter toggles borderless fullscreen; maximise goes through the window manager.
 - Screenshots: raylib's LoadImageFromScreen() multiplies by the DPI even without HIGHDPI, so the launcher reads the framebuffer with rlReadScreenPixels instead.
 - Test hooks: BLACKKAT_LAUNCHER_RESIZE_TEST=<png prefix> resizes through min / 1280x800 / 1920x1080 / wide / tall / default (logical x DPI), screenshots each, logs sizes, and probes 6 controls with synthetic mouse positions. BLACKKAT_LAUNCHER_RAYLIB_HIDPI=1 brings back the old path for comparison.
+
+## Widescreen 16:9 (hor+) and the 60 fps experiment (2026-11-20)
+
+### Widescreen (shipped, default off)
+- Projection: FUN_001530d8 (0x1530D8) builds the perspective matrix; it is called from the camera code at 0x102B18..0x103378.
+  - Arguments: f12 = FOV in degrees (60, multiplied by pi/360), f13/f14 = 640/448 (multiplied by 1/4096), f15/f16 = near/far. The 4:3 constant is at 0x15314C (lui 0x3FAA / ori 0xAA8F).
+  - Matrix values: m00 = 0.135316, m11 = -0.126295.
+- Override (src/overrides/blackkat_slus_20365.cpp, no regeneration): a wrapper calls the original function, then multiplies m00 (at a0) by 0.75 = (4/3)/(16/9).
+  - This widens the horizontal FOV and leaves the vertical FOV unchanged. With the override, m00 = 0.101487.
+  - The game's culling uses the same matrix, so no pop-in showed at the edges in stills. Turning the camera still needs a hand test.
+- Presenter (ps2_runtime.cpp, patch 0005): PS2X_PRESENT_ASPECT=<w/h> presents the picture at that aspect. Without it, the old pixel-aspect fit is kept (640x448 -> 1.43, which is slightly wider than 4:3; that predates this change).
+- Env and config:
+  - BLACKKAT_WIDESCREEN=1 sets PS2X_PRESENT_ASPECT=1.777778 unless it is already set.
+  - BLACKKAT_WS_XSCALE overrides the 0.75 scale. BLACKKAT_WS_LOG=N logs the first N matrices.
+  - Launcher: "Aspect ratio 4:3 (original) / 16:9 (widescreen)", saved as config aspect=4:3|16:9, default 4:3. When windowed, the window width becomes H*16/9.
+  - CLI: --widescreen, --aspect=4:3|16:9.
+- Known limitation: the HUD and 2D menus/FMVs are stretched horizontally (oval compass, wide hearts and text). A fix would need per-HUD-element patches.
+- Cost: vifw/s at sea 30.2 (16:9) vs 31.4 (4:3); on foot 43.3 vs 45.0. vsync 60 in both modes.
+
+### 60 fps (NOT shipped)
+- Public NTSC pnach (PeterDelta, beta):
+  - 00330D88 = 1 (vsyncs per frame, game uses 2);
+  - 00723308 = 0x3C88888A (frame time 1/30 -> 1/60).
+- FUN_001012d0 (0x10176c..0x101818) and entry 0x1027ec (the same code) compute the frame timing at init from refresh = [0x330D68] (60) and vsyncs = 2:
+  - [0x330D88] = 2; [0x330D94] = 2.0f; [0x330D6C] = 60/2 = 30; [0x330D70] = 30.0f;
+  - [0x7233B4] = 30/[0x723220]; [0x723308] = 1/that (dt = 1/30); [0x72339C] = [0x723220]/60.
+  - [0x330D88] is also subtracted from game timers each frame (0x1dd6b8, 0x1dd6dc), so timers count in vsyncs.
+- Runtime override: BLACKKAT_60FPS=1 (or =count to only measure). It wraps scePadRead 0x2C93F0 and rewrites 0x330D88 (2 -> 1) and 0x723308 (1/30 -> 1/60). Optional values: BLACKKAT_60FPS_VSYNCS, BLACKKAT_60FPS_DT. Not in the launcher.
+- Result: the values were patched, but the drawn rate did not change.
+  - At sea: vifw/s 32.0 vs 32.4. On foot: 45.5 vs 46.6. scePadRead calls/s 64 vs 65 and 96 vs 98.
+  - The game still produces about 30 frames/s, so with dt = 1/60 and timers decremented by 1, game logic would run at about half speed. Not shipped.
+- Why: the runtime paces guest EE cycles to real time (294.9 Mcyc/s, 60 vsync/s), and a frame already takes about 2 vsyncs of guest EE+VU1 work.
+  - The PAL pnach also says "might need EE overclock". Earlier profiling showed VU1 is the host-side limiter.
+- A real fix would need:
+  1. An EE overclock mode: more guest cycles per vsync, i.e. scheduler vsync spacing and cycle pacing in EeScheduler.cpp / ps2_memory.cpp. kEeClockHz is in ee_scheduler.h, which is included by generated code, so it must not change there.
+  2. Roughly 2x VU1 throughput.
+  3. Patching all frame-timing variables consistently (the D6C/D70/D94/7233B4/72339C set above), then checking speed with a timed event.

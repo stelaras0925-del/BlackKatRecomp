@@ -283,6 +283,7 @@ static void parseSettings(std::istream &f, Settings &s)
         else if (k == "movies") s.movies = b();
         else if (k == "fullscreen") s.fullscreen = b();
         else if (k == "monitor") s.monitor = v;
+        else if (k == "aspect") s.widescreen = (v == "16:9");
         else if (k == "window") { int w = 0, h = 0; if (std::sscanf(v.c_str(), "%dx%d", &w, &h) == 2 && w >= 320 && h >= 200) { s.winW = w; s.winH = h; } }
         else if (k == "button_prompts") s.buttons = (v == "xbox") ? 1 : (v == "auto") ? 2 : 0;
         else if (k == "rumble") s.rumble = b();
@@ -304,6 +305,7 @@ static std::string serializeSettings(const Settings &s)
       << "fullscreen=" << (s.fullscreen ? 1 : 0) << "\n"
       << "window=" << s.winW << "x" << s.winH << "\n"
       << "monitor=" << s.monitor << "\n"
+      << "aspect=" << (s.widescreen ? "16:9" : "4:3") << "\n"
       << "button_prompts=" << (s.buttons == 1 ? "xbox" : s.buttons == 2 ? "auto" : "ps2") << "\n"
       << "rumble=" << (s.rumble ? 1 : 0) << "\n"
       << "deadzone=" << s.deadzone << "\n"
@@ -392,7 +394,10 @@ void applyToEnv(const Settings &s)
     if (!s.audio) set("PS2X_HOST_AUDIO", "0");
     set("BLACKKAT_PLAY_FMV", s.movies ? "1" : "0");
     set("PS2X_FULLSCREEN", s.fullscreen ? "1" : "0");
-    set("PS2X_WINDOW", std::to_string(s.winW) + "x" + std::to_string(s.winH));
+    // 16:9: the picture is presented at 16:9, so the window gets a 16:9 width for the chosen height.
+    const int winW = s.widescreen ? ((s.winH * 16 / 9) + 1) / 2 * 2 : s.winW;
+    set("PS2X_WINDOW", std::to_string(winW) + "x" + std::to_string(s.winH));
+    set("BLACKKAT_WIDESCREEN", s.widescreen ? "1" : "0");
     if (!s.monitor.empty()) set("PS2X_MONITOR", s.monitor);
     set("BLACKKAT_BUTTON_STYLE", s.buttons == 1 ? "xbox" : s.buttons == 2 ? "auto" : "ps2");
     set("PS2X_PAD_RUMBLE", s.rumble ? "1" : "0");
@@ -737,7 +742,7 @@ static bool runLauncherUi(Settings &s, const char *argv0)
     else flags |= FLAG_WINDOW_HIDDEN; // shown after it is placed on the chosen monitor
     SetConfigFlags(flags);
     SetTraceLogLevel(LOG_WARNING);
-    constexpr float kDesignW = 920.0f, kDesignH = 760.0f, kMinUi = 0.75f, kMaxUi = 3.0f;
+    constexpr float kDesignW = 920.0f, kDesignH = 802.0f, kMinUi = 0.75f, kMaxUi = 3.0f;
     InitWindow(static_cast<int>(kDesignW), static_cast<int>(kDesignH), "Black Kat - BlackKatRecomp launcher");
     const float dpi = std::clamp(GetWindowScaleDPI().y, 1.0f, 4.0f); // desktop scale (X11: Xft.dpi/96)
     if (!legacyHidpi)
@@ -1087,6 +1092,16 @@ static bool runLauncherUi(Settings &s, const char *argv0)
             ImGui::TextColored(kParchDim, "%d x %d", 640 * s.scale, 448 * s.scale);
         else
             ImGui::TextDisabled("640 x 448 (GPU only)");
+        rowLabel("Aspect ratio", col);
+        {
+            const char *aspectLabels[] = {"4:3  (original)", "16:9  (widescreen)"};
+            int ar = s.widescreen ? 1 : 0;
+            ImGui::BeginGroup();
+            if (segmented("aspect", aspectLabels, 2, &ar, segW)) s.widescreen = (ar == 1);
+            ImGui::EndGroup();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("16:9 widens the 3D view (more on the sides, nothing stretched).\nThe HUD, menus and movies are stretched sideways. Windowed: the window is made 16:9 for the chosen height.");
+        }
         rowLabel("Window", col);
         int mode = s.fullscreen ? 1 : 0;
         if (segmented("mode", modeLabels, 2, &mode, 260.0f)) s.fullscreen = (mode == 1);
