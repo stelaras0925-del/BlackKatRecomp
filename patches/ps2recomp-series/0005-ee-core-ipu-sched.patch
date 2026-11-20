@@ -1540,19 +1540,42 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
          {
              m_debugUiDrawCallback(*this, m_debugUiUserData);
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f1424bd31e23feeb8cd04f6683766043ba8c..89a47b3b8f3c68d6ae1049d667a9626fc06bda71 100644
+index 8590f1424bd31e23feeb8cd04f6683766043ba8c..0a2761ae960a909f198357d98afc0c19fa13e2ce 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
-@@ -1,5 +1,8 @@
+@@ -1,6 +1,31 @@
  #include "runtime/ps2_pad.h"
  #include "ps2_host_backend.h"
 +#include <cmath>
 +#include <cstdio>
 +#include <cstdlib>
  #include <cstring>
++#include <string>
++#include <fstream>
++#include <sstream>
++#include <mutex>
++#include <atomic>
++#include <thread>
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <dirent.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++
++// GLFW (inside raylib): gamepad mapping queries. raylib's gamepad index is the GLFW joystick id.
++extern "C" int glfwJoystickIsGamepad(int jid);
++extern "C" const char *glfwGetJoystickGUID(int jid);
++extern "C" const char *glfwGetGamepadName(int jid);
++extern "C" int glfwUpdateGamepadMappings(const char *string);
++extern "C" const float *glfwGetJoystickAxes(int jid, int *count);
++extern "C" const unsigned char *glfwGetJoystickButtons(int jid, int *count);
++extern "C" const unsigned char *glfwGetJoystickHats(int jid, int *count);
  
  namespace
-@@ -23,9 +26,106 @@ namespace
+ {
+@@ -23,9 +48,515 @@ namespace
      constexpr uint16_t PAD_L1 = 0x0400u;
      constexpr uint16_t PAD_R2 = 0x0200u;
      constexpr uint16_t PAD_L2 = 0x0100u;
@@ -1646,6 +1669,415 @@ index 8590f1424bd31e23feeb8cd04f6683766043ba8c..89a47b3b8f3c68d6ae1049d667a9626f
 +        return p;
 +    }
 +
++    // ---- pad v2 (PS2X_PAD_LEGACY=1 restores the old path) ---------------------------------
++    // Only joysticks with an SDL/GLFW gamepad mapping are used (keyboards and mice that expose
++    // axes are skipped; PS2X_PAD_ALLJOY=1 uses every joystick). Extra mappings: the
++    // SDL_GAMECONTROLLERCONFIG env var, PS2X_GAMEPAD_DB=<file>, or
++    // $XDG_CONFIG_HOME/blackkat/gamecontrollerdb.txt. An unmapped joystick that has the Linux xpad
++    // layout (6 axes, 11 buttons, 1 hat) gets an Xbox 360 mapping (PS2X_PAD_XPAD_GUESS=0: off).
++    // Sticks use a radial deadzone (PS2X_PAD_DEADZONE, default 0.20). L2/R2 come from the analog
++    // triggers and also feed the L2/R2 pressure bytes; other pressed buttons report 0xFF.
++    bool padLegacy()
++    {
++        static const bool on = envFlag("PS2X_PAD_LEGACY");
++        return on;
++    }
++    float padDeadzone()
++    {
++        static const float dz = []() {
++            const char *e = std::getenv("PS2X_PAD_DEADZONE");
++            float v = e ? static_cast<float>(std::atof(e)) : 0.20f;
++            return v < 0.0f ? 0.0f : (v > 0.9f ? 0.9f : v);
++        }();
++        return dz;
++    }
++
++    void loadExtraMappings()
++    {
++        static bool done = false;
++        if (done)
++            return;
++        done = true;
++        int n = 0;
++        if (const char *m = std::getenv("SDL_GAMECONTROLLERCONFIG"); m && *m)
++            n += glfwUpdateGamepadMappings(m) ? 1 : 0;
++        std::string path;
++        if (const char *f = std::getenv("PS2X_GAMEPAD_DB"); f && *f)
++            path = f;
++        else
++        {
++            std::string base;
++            if (const char *x = std::getenv("XDG_CONFIG_HOME"); x && x[0] == '/')
++                base = x;
++            else if (const char *h = std::getenv("HOME"); h && *h)
++                base = std::string(h) + "/.config";
++            if (!base.empty())
++                path = base + "/blackkat/gamecontrollerdb.txt";
++        }
++        if (!path.empty())
++        {
++            std::ifstream in(path);
++            if (in)
++            {
++                std::stringstream ss;
++                ss << in.rdbuf();
++                const bool ok = glfwUpdateGamepadMappings(ss.str().c_str()) != 0;
++                std::fprintf(stderr, "[pad] loaded gamepad mappings from %s (%s)\n", path.c_str(), ok ? "ok" : "parse error");
++                n += ok ? 1 : 0;
++            }
++        }
++        (void)n;
++    }
++
++    // Unmapped xpad-style device (e.g. a pad in XInput mode with a vendor id SDL does not list).
++    bool guessXpadMapping(int jid)
++    {
++        static const bool guessOn = !(std::getenv("PS2X_PAD_XPAD_GUESS") && std::getenv("PS2X_PAD_XPAD_GUESS")[0] == '0');
++        if (!guessOn)
++            return false;
++        int na = 0, nb = 0, nh = 0;
++        glfwGetJoystickAxes(jid, &na);
++        glfwGetJoystickButtons(jid, &nb);
++        glfwGetJoystickHats(jid, &nh);
++        const char *name = GetGamepadName(jid);
++        const std::string nm = name ? name : "";
++        // GLFW appends 4 hat buttons by default (GLFW_JOYSTICK_HAT_BUTTONS), so 11 or 15.
++        if (na != 6 || (nb != 11 && nb != 15) || nh != 1 || nm.find("Keyboard") != std::string::npos || nm.find("Mouse") != std::string::npos)
++            return false;
++        const char *guid = glfwGetJoystickGUID(jid);
++        if (!guid)
++            return false;
++        std::string m = std::string(guid) + "," + (nm.empty() ? "XInput pad" : nm) +
++                        ",a:b0,b:b1,x:b2,y:b3,back:b6,guide:b8,start:b7,leftstick:b9,rightstick:b10,leftshoulder:b4,"
++                        "rightshoulder:b5,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,rightx:a3,"
++                        "righty:a4,lefttrigger:a2,righttrigger:a5,platform:Linux,";
++        const bool ok = glfwUpdateGamepadMappings(m.c_str()) != 0 && glfwJoystickIsGamepad(jid);
++        std::fprintf(stderr, "[pad] joystick %d \"%s\" has no SDL mapping; xpad layout guessed (%s)\n", jid, nm.c_str(), ok ? "ok" : "failed");
++        return ok;
++    }
++
++    struct PadV2
++    {
++        uint16_t pressed = 0;
++        uint8_t sticks[4] = {0x80, 0x80, 0x80, 0x80}; // rx ry lx ly
++        uint8_t l2 = 0, r2 = 0;                       // trigger pressure
++        unsigned mask = 0;
++    };
++
++    void radial(float &x, float &y)
++    {
++        const float dz = padDeadzone();
++        const float m = std::sqrt(x * x + y * y);
++        if (m <= dz || m <= 0.0f)
++        {
++            x = y = 0.0f;
++            return;
++        }
++        const float k = std::min(1.0f, (m - dz) / (1.0f - dz)) / m;
++        x *= k;
++        y *= k;
++        // square-ish gate like a DualShock: allow corners to reach full scale
++        x = std::max(-1.0f, std::min(1.0f, x * 1.12f));
++        y = std::max(-1.0f, std::min(1.0f, y * 1.12f));
++    }
++
++    uint8_t stickByte(float v)
++    {
++        float b = 128.0f + v * 127.5f;
++        b = b < 0.0f ? 0.0f : (b > 255.0f ? 255.0f : b);
++        return static_cast<uint8_t>(b);
++    }
++
++    PadV2 readPadV2()
++    {
++        PadV2 r;
++        loadExtraMappings();
++        static const bool allJoy = envFlag("PS2X_PAD_ALLJOY");
++        static unsigned guessed = 0;
++        static unsigned trigSeen = 0;
++        float best[4] = {0, 0, 0, 0};
++        float l2 = -1.0f, r2 = -1.0f;
++        for (int gp = 0; gp < kMaxGamepads; ++gp)
++        {
++            if (!IsGamepadAvailable(gp))
++            {
++                guessed &= ~(1u << gp);
++                trigSeen &= ~(3u << (gp * 2));
++                continue;
++            }
++            bool mapped = glfwJoystickIsGamepad(gp) != 0;
++            if (!mapped && !(guessed & (1u << gp)))
++            {
++                guessed |= 1u << gp; // try once per connection
++                mapped = guessXpadMapping(gp);
++            }
++            if (!mapped && !allJoy)
++                continue;
++            r.mask |= 1u << gp;
++            r.pressed |= readGamepadPressed(gp) & static_cast<uint16_t>(~(PAD_L2 | PAD_R2));
++            float lx = GetGamepadAxisMovement(gp, GAMEPAD_AXIS_LEFT_X), ly = GetGamepadAxisMovement(gp, GAMEPAD_AXIS_LEFT_Y);
++            float rx = GetGamepadAxisMovement(gp, GAMEPAD_AXIS_RIGHT_X), ry = GetGamepadAxisMovement(gp, GAMEPAD_AXIS_RIGHT_Y);
++            radial(lx, ly);
++            radial(rx, ry);
++            const float ax[4] = {rx, ry, lx, ly};
++            for (int i = 0; i < 4; ++i)
++                if (std::fabs(ax[i]) > std::fabs(best[i]))
++                    best[i] = ax[i];
++            // GLFW triggers: -1 released .. +1 fully pressed.
++            // Linux GLFW reports a trigger as exactly 0.0 (= half pressed) until its first event;
++            // treat it as released until a real value has been seen.
++            float lt = GetGamepadAxisMovement(gp, GAMEPAD_AXIS_LEFT_TRIGGER);
++            float rt = GetGamepadAxisMovement(gp, GAMEPAD_AXIS_RIGHT_TRIGGER);
++            if (lt != 0.0f) trigSeen |= 1u << (gp * 2);
++            if (rt != 0.0f) trigSeen |= 2u << (gp * 2);
++            if (!(trigSeen & (1u << (gp * 2)))) lt = -1.0f;
++            if (!(trigSeen & (2u << (gp * 2)))) rt = -1.0f;
++            l2 = std::max(l2, lt);
++            r2 = std::max(r2, rt);
++            if (IsGamepadButtonDown(gp, GAMEPAD_BUTTON_LEFT_TRIGGER_2)) l2 = std::max(l2, 1.0f);
++            if (IsGamepadButtonDown(gp, GAMEPAD_BUTTON_RIGHT_TRIGGER_2)) r2 = std::max(r2, 1.0f);
++        }
++        for (int i = 0; i < 4; ++i)
++            r.sticks[i] = stickByte(best[i]);
++        auto trig = [](float v) { const float t = (v + 1.0f) * 0.5f; return t < 0.12f ? 0.0f : t; };
++        const float tl = trig(l2), tr = trig(r2);
++        r.l2 = static_cast<uint8_t>(std::min(255.0f, tl * 255.0f));
++        r.r2 = static_cast<uint8_t>(std::min(255.0f, tr * 255.0f));
++        if (tl > 0.0f) r.pressed |= PAD_L2;
++        if (tr > 0.0f) r.pressed |= PAD_R2;
++        return r;
++    }
++
++    // ---- rumble (PS2X_PAD_RUMBLE, default on; =0 off) -----------------------------------------
++    // The game's scePadSetActDirect -> small motor (on/off) and large motor (0..255) -> FF_RUMBLE on
++    // the evdev node whose name matches the active gamepad. PS2X_PAD_RUMBLE_TEST=1: one gentle
++    // 300 ms pulse when the first gamepad is seen.
++} // namespace
++
++// Included here, after the keyboard code: <linux/input.h> #defines KEY_X, KEY_UP, ... which would
++// otherwise silently replace raylib's KeyboardKey values in readKeyboardPressed().
++#include <linux/input.h>
++
++namespace
++{
++    // Rumble model: the game sends scePadSetActDirect every frame (~30/s here). An effect only lasts
++    // kEffectMs and is renewed every kRenewMs while the game keeps sending a nonzero value, so the motor
++    // can never outlive the game's requests by more than ~200 ms. A watchdog thread
++    // (PS2X_PAD_RUMBLE_WATCHDOG_MS, default 150, 0 = off) stops it as soon as the game stops sending
++    // (FMV, loads, pause, a stalled thread). Every stop sends EV_FF 0 and erases the effect.
++    constexpr int kEffectMs = 200;
++    constexpr int kRenewMs = 100;
++
++    struct Rumble
++    {
++        std::mutex m;
++        int fd = -1;
++        int effect = -1;
++        std::string devName;
++        uint8_t small = 0, big = 0; // what is playing
++        bool playing = false;
++        std::chrono::steady_clock::time_point lastPlay{}, lastCall{};
++        bool failed = false;
++    };
++    Rumble &rumble()
++    {
++        static Rumble *r = new Rumble(); // never destroyed: the watchdog thread may outlive static dtors
++        return *r;
++    }
++    bool rumbleOn()
++    {
++        static const bool on = !(std::getenv("PS2X_PAD_RUMBLE") && std::getenv("PS2X_PAD_RUMBLE")[0] == '0');
++        return on;
++    }
++    int rumbleWatchdogMs()
++    {
++        static const int ms = []() {
++            const char *e = std::getenv("PS2X_PAD_RUMBLE_WATCHDOG_MS");
++            return e ? std::max(0, std::atoi(e)) : 150;
++        }();
++        return ms;
++    }
++    std::atomic<bool> g_windowFocused{true};
++    int activeGamepad()
++    {
++        for (int gp = 0; gp < kMaxGamepads; ++gp)
++            if (IsGamepadAvailable(gp) && glfwJoystickIsGamepad(gp))
++                return gp;
++        return -1;
++    }
++    int openRumbleDevice(const std::string &name)
++    {
++        DIR *d = opendir("/sys/class/input");
++        if (!d)
++            return -1;
++        int fd = -1;
++        while (dirent *e = readdir(d))
++        {
++            if (std::strncmp(e->d_name, "event", 5) != 0)
++                continue;
++            std::ifstream nf(std::string("/sys/class/input/") + e->d_name + "/device/name");
++            std::string n;
++            std::getline(nf, n);
++            if (n != name)
++                continue;
++            const std::string dev = std::string("/dev/input/") + e->d_name;
++            fd = open(dev.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
++            if (fd < 0)
++                continue;
++            unsigned long ffbits[(FF_MAX + 8 * sizeof(long)) / (8 * sizeof(long))] = {};
++            if (ioctl(fd, EVIOCGBIT(EV_FF, sizeof(ffbits)), ffbits) < 0 ||
++                !(ffbits[FF_RUMBLE / (8 * sizeof(long))] & (1ul << (FF_RUMBLE % (8 * sizeof(long))))))
++            {
++                close(fd);
++                fd = -1;
++                continue;
++            }
++            std::fprintf(stderr, "[pad] rumble device %s (\"%s\")\n", dev.c_str(), name.c_str());
++            break;
++        }
++        closedir(d);
++        return fd;
++    }
++    // Explicit stop + erase of the uploaded effect (device side only).
++    void rumbleEraseLocked(Rumble &r)
++    {
++        if (r.fd >= 0 && r.effect >= 0)
++        {
++            input_event ev{};
++            ev.type = EV_FF;
++            ev.code = static_cast<uint16_t>(r.effect);
++            ev.value = 0;
++            (void)!write(r.fd, &ev, sizeof(ev));
++            ioctl(r.fd, EVIOCRMFF, r.effect);
++        }
++        r.effect = -1;
++    }
++    void rumbleStopLocked(Rumble &r, const char *why)
++    {
++        if (!r.playing)
++            return;
++        r.playing = false;
++        r.small = r.big = 0;
++        if (padLogEnabled())
++            std::fprintf(stderr, "[pad] rumble stop (%s)%s\n", why, rumbleOn() ? "" : " [not sent: PS2X_PAD_RUMBLE=0]");
++        rumbleEraseLocked(r);
++    }
++    void rumbleStopAtExit()
++    {
++        Rumble &r = rumble();
++        std::lock_guard<std::mutex> lk(r.m);
++        r.playing = true; // force the erase even if we think it is idle
++        rumbleStopLocked(r, "exit");
++        if (r.fd >= 0)
++        {
++            close(r.fd); // the kernel also flushes this fd's effects on close / process death
++            r.fd = -1;
++        }
++    }
++    bool rumbleEnsureLocked(Rumble &r)
++    {
++        const int gp = activeGamepad();
++        if (gp < 0)
++            return false;
++        const char *n = GetGamepadName(gp);
++        const std::string name = n ? n : "";
++        if (r.fd >= 0 && name == r.devName)
++            return true;
++        if (r.fd >= 0)
++        {
++            rumbleEraseLocked(r);
++            close(r.fd);
++            r.fd = -1;
++        }
++        r.devName = name;
++        r.fd = openRumbleDevice(name);
++        if (r.fd >= 0)
++        {
++            static bool reg = false;
++            if (!reg) { reg = true; std::atexit(rumbleStopAtExit); }
++        }
++        return r.fd >= 0;
++    }
++    // Upload (replacing our single effect) and play. On upload failure the old effect is stopped and
++    // erased and one fresh upload is tried, so a failed update can never leave the motor running.
++    bool rumbleUploadPlayLocked(Rumble &r, uint16_t weak, uint16_t strong, uint16_t ms)
++    {
++        if (r.fd < 0)
++            return false;
++        for (int attempt = 0; attempt < 2; ++attempt)
++        {
++            ff_effect fx{};
++            fx.type = FF_RUMBLE;
++            fx.id = static_cast<int16_t>(r.effect);
++            fx.u.rumble.weak_magnitude = weak;
++            fx.u.rumble.strong_magnitude = strong;
++            fx.replay.length = ms;
++            if (ioctl(r.fd, EVIOCSFF, &fx) < 0)
++            {
++                if (!r.failed)
++                    std::fprintf(stderr, "[pad] rumble upload failed (errno %d)\n", errno);
++                r.failed = true;
++                rumbleEraseLocked(r);
++                continue;
++            }
++            r.effect = fx.id;
++            input_event ev{};
++            ev.type = EV_FF;
++            ev.code = static_cast<uint16_t>(r.effect);
++            ev.value = 1;
++            (void)!write(r.fd, &ev, sizeof(ev));
++            return true;
++        }
++        return false;
++    }
++    void rumblePlayLocked(Rumble &r, uint8_t small, uint8_t big, bool changed)
++    {
++        const uint16_t weak = small ? 0xC000 : 0;
++        const uint16_t strong = static_cast<uint16_t>(big * 257u);
++        r.small = small;
++        r.big = big;
++        r.playing = true;
++        r.lastPlay = std::chrono::steady_clock::now();
++        if (changed && padLogEnabled())
++            std::fprintf(stderr, "[pad] rumble play weak=0x%04x strong=0x%04x (%d ms effect, renewed every %d ms while sent)%s\n",
++                         weak, strong, kEffectMs, kRenewMs, rumbleOn() ? "" : " [not sent: PS2X_PAD_RUMBLE=0]");
++        if (!rumbleOn() || !rumbleEnsureLocked(r))
++            return;
++        rumbleUploadPlayLocked(r, weak, strong, kEffectMs);
++    }
++    void rumbleStartWatchdog()
++    {
++        static std::once_flag once;
++        std::call_once(once, []() {
++            if (rumbleWatchdogMs() <= 0)
++                return;
++            std::thread([]() {
++                const auto limit = std::chrono::milliseconds(rumbleWatchdogMs());
++                for (;;)
++                {
++                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
++                    Rumble &r = rumble();
++                    std::lock_guard<std::mutex> lk(r.m);
++                    if (r.playing && std::chrono::steady_clock::now() - r.lastCall > limit)
++                        rumbleStopLocked(r, "watchdog: game stopped sending");
++                }
++            }).detach();
++        });
++    }
++    void rumbleTestOnce()
++    {
++        static bool done = false;
++        if (done || !envFlag("PS2X_PAD_RUMBLE_TEST"))
++            return;
++        Rumble &r = rumble();
++        std::lock_guard<std::mutex> lk(r.m);
++        if (!rumbleEnsureLocked(r))
++            return;
++        done = true;
++        rumbleUploadPlayLocked(r, 0x3000, 0x3000, 300);
++        std::fprintf(stderr, "[pad] rumble test: 300 ms at ~19%%\n");
++    }
++
 +    struct PadLogState
 +    {
 +        bool valid = false;
@@ -1660,7 +2092,7 @@ index 8590f1424bd31e23feeb8cd04f6683766043ba8c..89a47b3b8f3c68d6ae1049d667a9626f
  {
      if (!data || size < 32)
          return false;
-@@ -37,89 +137,68 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -37,89 +568,140 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
      data[3] = 0xFF;
      data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
  
@@ -1715,13 +2147,7 @@ index 8590f1424bd31e23feeb8cd04f6683766043ba8c..89a47b3b8f3c68d6ae1049d667a9626f
 -        data[5] = static_cast<uint8_t>(128 + ry * 127);
 -    }
 -    else
-+    // Gamepads: OR every available raylib gamepad (a wireless receiver can
-+    // occupy slot 0 with no controller behind it). Sticks: the most deflected.
-+    uint16_t gpPressed = 0;
-+    unsigned gpMask = 0;
-+    float best[4] = {0.f, 0.f, 0.f, 0.f}; // rx, ry, lx, ly -> data[4..7]
-+    for (int gp = 0; gp < kMaxGamepads; ++gp)
-     {
+-    {
 -        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
 -            clearBit(PAD_UP);
 -        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
@@ -1750,6 +2176,23 @@ index 8590f1424bd31e23feeb8cd04f6683766043ba8c..89a47b3b8f3c68d6ae1049d667a9626f
 -            clearBit(PAD_START);
 -        if (IsKeyDown(KEY_TAB))
 -            clearBit(PAD_SELECT);
++    // Gamepads: OR every available raylib gamepad (a wireless receiver can
++    // occupy slot 0 with no controller behind it). Sticks: the most deflected.
++    uint16_t gpPressed = 0;
++    unsigned gpMask = 0;
++    float best[4] = {0.f, 0.f, 0.f, 0.f}; // rx, ry, lx, ly -> data[4..7]
++    PadV2 v2;
++    const bool useV2 = !padLegacy();
++    if (useV2)
++    {
++        v2 = readPadV2();
++        gpPressed = v2.pressed;
++        gpMask = v2.mask;
++        rumbleTestOnce();
++        g_windowFocused.store(IsWindowFocused(), std::memory_order_relaxed);
++    }
++    for (int gp = 0; gp < kMaxGamepads && !useV2; ++gp)
++    {
 +        if (!IsGamepadAvailable(gp))
 +            continue;
 +        gpMask |= 1u << gp;
@@ -1764,18 +2207,29 @@ index 8590f1424bd31e23feeb8cd04f6683766043ba8c..89a47b3b8f3c68d6ae1049d667a9626f
 +                best[i] = ax[i];
      }
 +    for (int i = 0; i < 4; ++i)
-+        data[4 + i] = axisToByte(best[i]);
-+
++        data[4 + i] = useV2 ? v2.sticks[i] : axisToByte(best[i]);
+ 
 +    // Keyboard is always merged in (previously it was skipped entirely
 +    // whenever gamepad 0 existed).
 +    uint16_t kbPressed = 0;
 +    if (!(padExclusive() && (gpMask & 1u)))
 +        kbPressed = readKeyboardPressed();
- 
++
 +    const uint16_t pressed = static_cast<uint16_t>(gpPressed | kbPressed);
 +    const uint16_t btns = static_cast<uint16_t>(~pressed);
      data[2] = static_cast<uint8_t>(btns & 0xFF);
      data[3] = static_cast<uint8_t>(btns >> 8);
++    if (useV2)
++    {
++        // DualShock 2 pressure bytes (order: right left up down triangle circle cross square L1 R1 L2 R2).
++        static const uint16_t kPress[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
++                                            PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
++        for (int i = 0; i < 12; ++i)
++            data[8 + i] = (pressed & kPress[i]) ? 0xFF : 0x00;
++        if (gpPressed & PAD_L2) data[18] = std::max<uint8_t>(v2.l2, (kbPressed & PAD_L2) ? 0xFF : 0);
++        if (gpPressed & PAD_R2) data[19] = std::max<uint8_t>(v2.r2, (kbPressed & PAD_R2) ? 0xFF : 0);
++        data[20] = 1; // pressure bytes valid (read by Pad.cpp)
++    }
 +
 +    if (padLogEnabled())
 +    {
@@ -1783,13 +2237,16 @@ index 8590f1424bd31e23feeb8cd04f6683766043ba8c..89a47b3b8f3c68d6ae1049d667a9626f
 +        if (gpMask != lastGpMask)
 +        {
 +            lastGpMask = gpMask;
-+            std::fprintf(stderr, "[pad] gamepads available mask=0x%x%s\n", gpMask,
++            std::fprintf(stderr, "[pad] gamepads in use mask=0x%x%s\n", gpMask,
 +                         padExclusive() ? " (PS2X_PAD_EXCLUSIVE)" : "");
 +            for (int gp = 0; gp < kMaxGamepads; ++gp)
-+                if (gpMask & (1u << gp))
++                if (IsGamepadAvailable(gp))
 +                {
 +                    const char *n = GetGamepadName(gp);
-+                    std::fprintf(stderr, "[pad]   gamepad %d: \"%s\"\n", gp, n ? n : "?");
++                    const char *g = glfwGetJoystickGUID(gp);
++                    const char *mn = glfwJoystickIsGamepad(gp) ? glfwGetGamepadName(gp) : nullptr;
++                    std::fprintf(stderr, "[pad]   gamepad %d: \"%s\" guid=%s mapping=%s\n", gp, n ? n : "?", g ? g : "?",
++                                 mn ? mn : "(none)");
 +                }
 +        }
 +        static PadLogState last[2];
@@ -1802,12 +2259,249 @@ index 8590f1424bd31e23feeb8cd04f6683766043ba8c..89a47b3b8f3c68d6ae1049d667a9626f
 +            ls.gp = gpPressed;
 +            std::memcpy(ls.sticks, data + 4, 4);
 +            std::fprintf(stderr,
-+                         "[pad] port%d kb=0x%04x gp=0x%04x -> data[2..3]=%02x %02x sticks R(%02x,%02x) L(%02x,%02x)\n",
-+                         port, kbPressed, gpPressed, data[2], data[3], data[4], data[5], data[6], data[7]);
++                         "[pad] port%d kb=0x%04x gp=0x%04x -> data[2..3]=%02x %02x sticks R(%02x,%02x) L(%02x,%02x) L2/R2 pressure %02x/%02x\n",
++                         port, kbPressed, gpPressed, data[2], data[3], data[4], data[5], data[6], data[7], data[18], data[19]);
 +        }
 +    }
      return true;
  }
++
++// scePadSetActDirect -> host rumble (called from Kernel/Stubs/Pad.cpp). small is 0/1 (already &1).
++void ps2xPadSetActuators(int port, uint8_t small, uint8_t big)
++{
++    if (port != 0 || padLegacy())
++        return;
++    if (padLogEnabled())
++    {
++        static uint8_t ls = 0xFF, lb = 0xFF;
++        if (small != ls || big != lb)
++        {
++            ls = small;
++            lb = big;
++            std::fprintf(stderr, "[pad] scePadSetActDirect small=%u big=%u%s\n", small, big, rumbleOn() ? "" : " (PS2X_PAD_RUMBLE=0)");
++        }
++    }
++    rumbleStartWatchdog();
++    static const bool unfocusedOk = envFlag("PS2X_PAD_RUMBLE_UNFOCUSED");
++    Rumble &r = rumble();
++    std::lock_guard<std::mutex> lk(r.m);
++    const auto now = std::chrono::steady_clock::now();
++    r.lastCall = now;
++    if (!small && !big)
++    {
++        rumbleStopLocked(r, "game sent 0");
++        return;
++    }
++    // Focus gate only when actually driving the device (hidden test windows are never focused).
++    if (rumbleOn() && !unfocusedOk && !g_windowFocused.load(std::memory_order_relaxed))
++    {
++        rumbleStopLocked(r, "window unfocused");
++        return;
++    }
++    const bool changed = !r.playing || small != r.small || big != r.big;
++    if (!changed && now - r.lastPlay < std::chrono::milliseconds(kRenewMs))
++        return;
++    rumblePlayLocked(r, small, big, changed);
++}
++
++// scePadPortClose / scePadSetMainMode / scePadEnd: a real pad stops its motors.
++void ps2xPadRumbleStop(int port, const char *why)
++{
++    if (port != 0 || padLegacy())
++        return;
++    Rumble &r = rumble();
++    std::lock_guard<std::mutex> lk(r.m);
++    rumbleStopLocked(r, why ? why : "stop");
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index b50a4cf6aa24eb5cdf382a07243ecf4ebbbffa78..990fbacd4ad213dab6098173e08fff0247e1908e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,5 +1,11 @@
+ #include "Common.h"
+ #include "Pad.h"
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++void ps2xPadSetActuators(int port, uint8_t small, uint8_t big); // ps2_pad.cpp
++void ps2xPadRumbleStop(int port, const char *why);              // ps2_pad.cpp
+ 
+ namespace ps2_stubs
+ {
+@@ -40,6 +46,8 @@ namespace ps2_stubs
+             uint8_t ry = kPadAnalogCenter;
+             uint8_t lx = kPadAnalogCenter;
+             uint8_t ly = kPadAnalogCenter;
++            bool hasPressure = false; // backend supplied DualShock 2 pressure bytes
++            uint8_t pressure[12]{};   // right left up down triangle circle cross square L1 R1 L2 R2
+         };
+ 
+         struct PadPortState
+@@ -58,6 +66,7 @@ namespace ps2_stubs
+             uint8_t lastData[32]{};
+             uint32_t readCount = 0u;
+             uint32_t lastReadDataAddr = 0u;
++            uint8_t actAlign[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+         };
+ 
+         std::mutex g_padOverrideMutex;
+@@ -229,7 +238,7 @@ namespace ps2_stubs
+             portState.transientState = static_cast<uint32_t>(kPadStateExecCmd);
+         }
+ 
+-        uint8_t pressureValue(const PadInputState &state, const PadPortState &portState, uint16_t mask)
++        uint8_t pressureValue(const PadInputState &state, const PadPortState &portState, uint16_t mask, int idx = -1)
+         {
+             if (!portState.pressureEnabled)
+             {
+@@ -239,6 +248,8 @@ namespace ps2_stubs
+             {
+                 return 0u;
+             }
++            if (state.hasPressure && idx >= 0)
++                return ((state.buttons & mask) == 0u) ? std::max<uint8_t>(state.pressure[idx], 1u) : 0u;
+             return ((state.buttons & mask) == 0u) ? 0xFFu : 0u;
+         }
+ 
+@@ -252,18 +263,19 @@ namespace ps2_stubs
+             data[5] = state.ry;
+             data[6] = state.lx;
+             data[7] = state.ly;
+-            data[8] = pressureValue(state, portState, kPadBtnRight);
+-            data[9] = pressureValue(state, portState, kPadBtnLeft);
+-            data[10] = pressureValue(state, portState, kPadBtnUp);
+-            data[11] = pressureValue(state, portState, kPadBtnDown);
+-            data[12] = pressureValue(state, portState, kPadBtnTriangle);
+-            data[13] = pressureValue(state, portState, kPadBtnCircle);
+-            data[14] = pressureValue(state, portState, kPadBtnCross);
+-            data[15] = pressureValue(state, portState, kPadBtnSquare);
+-            data[16] = pressureValue(state, portState, kPadBtnL1);
+-            data[17] = pressureValue(state, portState, kPadBtnL2);
+-            data[18] = pressureValue(state, portState, kPadBtnR1);
+-            data[19] = pressureValue(state, portState, kPadBtnR2);
++            data[8] = pressureValue(state, portState, kPadBtnRight, 0);
++            data[9] = pressureValue(state, portState, kPadBtnLeft, 1);
++            data[10] = pressureValue(state, portState, kPadBtnUp, 2);
++            data[11] = pressureValue(state, portState, kPadBtnDown, 3);
++            data[12] = pressureValue(state, portState, kPadBtnTriangle, 4);
++            data[13] = pressureValue(state, portState, kPadBtnCircle, 5);
++            data[14] = pressureValue(state, portState, kPadBtnCross, 6);
++            data[15] = pressureValue(state, portState, kPadBtnSquare, 7);
++            data[16] = pressureValue(state, portState, kPadBtnL1, 8);
++            // PS2SDK padButtonStatus order: ... square_p, l1_p, r1_p, l2_p, r2_p
++            data[17] = pressureValue(state, portState, kPadBtnR1, 9);
++            data[18] = pressureValue(state, portState, kPadBtnL2, 10);
++            data[19] = pressureValue(state, portState, kPadBtnR2, 11);
+         }
+ 
+         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
+@@ -306,6 +318,11 @@ namespace ps2_stubs
+                     state.ry = backendData[5];
+                     state.lx = backendData[6];
+                     state.ly = backendData[7];
++                    if (backendData[20] == 1u)
++                    {
++                        state.hasPressure = true;
++                        std::memcpy(state.pressure, backendData + 8, 12);
++                    }
+                     usedBackend = true;
+                 }
+                 else
+@@ -348,6 +365,7 @@ namespace ps2_stubs
+             std::lock_guard<std::mutex> lock(g_padStateMutex);
+             resetPadStateLocked();
+         }
++        ps2xPadRumbleStop(0, "scePadEnd");
+         setReturnS32(ctx, 1);
+     }
+ 
+@@ -588,6 +606,7 @@ namespace ps2_stubs
+             return;
+         }
+ 
++        ps2xPadRumbleStop(static_cast<int>(getRegU32(ctx, 4)), "scePadPortClose");
+         portState->open = false;
+         portState->pressureEnabled = false;
+         portState->reqState = 0u;
+@@ -687,15 +706,67 @@ namespace ps2_stubs
+ 
+     void scePadSetActAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)rdram;
+         (void)runtime;
++        const int port = static_cast<int>(getRegU32(ctx, 4));
++        {
++            std::lock_guard<std::mutex> lock(g_padStateMutex);
++            PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
++            if (const uint8_t *a = getConstMemPtr(rdram, getRegU32(ctx, 6)); portState && a)
++            {
++                std::memcpy(portState->actAlign, a, 6);
++                if (std::getenv("PS2X_PAD_LOG") && std::getenv("PS2X_PAD_LOG")[0] == '1')
++                    std::fprintf(stderr, "[padact] SetActAlign port=%d slot=%u align=%02x %02x %02x %02x %02x %02x\n", port,
++                                 getRegU32(ctx, 5), a[0], a[1], a[2], a[3], a[4], a[5]);
++            }
++        }
+         setReturnS32(ctx, 1);
+     }
+ 
+     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)rdram;
+         (void)runtime;
++        // Host rumble (ps2_pad.cpp, PS2X_PAD_RUMBLE). actAlign[i] = 0 -> small motor, 1 -> large.
++        const int port = static_cast<int>(getRegU32(ctx, 4));
++        uint8_t align[6] = {0, 1, 0xFF, 0xFF, 0xFF, 0xFF};
++        {
++            std::lock_guard<std::mutex> lock(g_padStateMutex);
++            if (const PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5))))
++                if (portState->actAlign[0] != 0xFFu || portState->actAlign[1] != 0xFFu)
++                    std::memcpy(align, portState->actAlign, 6);
++        }
++        if (const uint8_t *d = getConstMemPtr(rdram, getRegU32(ctx, 6)))
++        {
++            static const bool actLog = std::getenv("PS2X_PAD_LOG") && std::getenv("PS2X_PAD_LOG")[0] == '1';
++            if (actLog)
++            {
++                static uint8_t last[6] = {0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE};
++                static uint32_t calls = 0;
++                static auto t0 = std::chrono::steady_clock::now();
++                static auto tLast = t0;
++                ++calls;
++                const auto now = std::chrono::steady_clock::now();
++                if (std::memcmp(last, d, 6) != 0)
++                {
++                    std::fprintf(stderr, "[padact] t=%.3f port=%d slot=%u data=%02x %02x %02x %02x %02x %02x align=%02x %02x %02x %02x %02x %02x ra=0x%x (prev value held %u calls / %.0f ms)\n",
++                                 std::chrono::duration<double>(now - t0).count(), port, getRegU32(ctx, 5), d[0], d[1], d[2], d[3], d[4], d[5],
++                                 align[0], align[1], align[2], align[3], align[4], align[5], getRegU32(ctx, 31), calls - 1,
++                                 std::chrono::duration<double, std::milli>(now - tLast).count());
++                    std::memcpy(last, d, 6);
++                    calls = 1;
++                    tLast = now;
++                }
++            }
++            static const bool smallAny = std::getenv("PS2X_PAD_SMALL_ANY") && std::getenv("PS2X_PAD_SMALL_ANY")[0] == '1';
++            uint8_t small = 0, big = 0;
++            for (int i = 0; i < 6; ++i)
++            {
++                // DualShock 2: the small motor only looks at bit 0 (PCSX2 does the same);
++                // PS2X_PAD_SMALL_ANY=1 restores "any nonzero = on".
++                if (align[i] == 0u) small = smallAny ? (d[i] ? 1u : 0u) : (d[i] & 1u);
++                else if (align[i] == 1u) big = d[i];
++            }
++            ps2xPadSetActuators(port, small, big);
++        }
+         setReturnS32(ctx, 1);
+     }
+ 
+@@ -728,6 +799,7 @@ namespace ps2_stubs
+             return;
+         }
+ 
++        ps2xPadRumbleStop(static_cast<int>(getRegU32(ctx, 4)), "scePadSetMainMode");
+         portState->analogMode = (getRegU32(ctx, 6) != 0u);
+         portState->reqState = 0u;
+         queueExecCmdStateLocked(*portState);
 diff --git a/ps2xRuntime/src/lib/ps2_ipu.inl b/ps2xRuntime/src/lib/ps2_ipu.inl
 new file mode 100644
 index 0000000000000000000000000000000000000000..de75f130eac302ddcf7f964b82019ec4a5ea7ca6

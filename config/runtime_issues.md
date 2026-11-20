@@ -1333,3 +1333,35 @@ Fix:
 - PS2X_SHOT_WINDOW=1 saves the whole window framebuffer with each PS2X_SHOT.
 
 After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, highdpi=0 (dpi 1.25).
+
+## Controller support (pad v2, 2026-11-20)
+- Path: game libpad -> HLE stubs `Kernel/Stubs/Pad.cpp` -> `PSPadBackend::readState` (`ps2_pad.cpp`).
+  The game uses DualShock mode, pressure mode (scePadEnterPressMode) and vibration (scePadSetActAlign/SetActDirect;
+  in-game it sends big-motor 255 pulses).
+- Only joysticks with an SDL/GLFW gamepad mapping are used (the GameSir dongle's "2.4G XBOX 360 For Windows
+  Keyboard" and the G502 mouse expose joystick nodes and are now skipped). Extra mappings: SDL_GAMECONTROLLERCONFIG,
+  PS2X_GAMEPAD_DB=<file>, or ~/.config/blackkat/gamecontrollerdb.txt. Unmapped xpad-layout pads (6 axes, 11/15
+  buttons, 1 hat) get an Xbox 360 mapping (the GameSir Nova 2 Lite in XInput mode, 3537:100f, is not in GLFW's db).
+- Radial deadzone PS2X_PAD_DEADZONE (default 0.20). Analog L2/R2 from the triggers (feeds pressure bytes). Pressure
+  bytes fixed to the PS2SDK order (..., L1, R1, L2, R2; upstream had L2/R1 swapped).
+- Rumble: evdev FF_RUMBLE on the event node matching the gamepad name; small motor on/off, big motor 0..255,
+  1 s effect refreshed every 400 ms while active.
+- Gotcha: `<linux/input.h>` #defines KEY_X/KEY_UP/...; included at the top it silently remapped raylib keys and broke
+  keyboard input. It is now included after the keyboard code.
+- Flags: PS2X_PAD_LEGACY=1 (old path), PS2X_PAD_ALLJOY=1, PS2X_PAD_XPAD_GUESS=0, PS2X_PAD_RUMBLE=0,
+  PS2X_PAD_RUMBLE_TEST=1 (one 300 ms pulse), PS2X_PAD_DEADZONE=x, PS2X_PAD_EXCLUSIVE=1, PS2X_PAD_LOG=1.
+
+### Rumble fix (2026-11-20): vibration kept going (e.g. after digging up a treasure)
+- The game sends scePadSetActDirect every frame (~30/s): align 00 01 ff.. (byte0 = small motor, byte1 = big motor);
+  byte3 toggles 00/40 but is unaligned (ignored). A hit in the opening = big ff for ~130 ms, then 0.
+- Causes: (1) small motor was "any nonzero = on"; a DualShock 2 only uses bit 0 (PCSX2: `vibrationMotors[0] & 0x01`),
+  so even values the game uses as "off" kept it buzzing; (2) 1 s effects renewed every 400 ms outlived the game's
+  requests when it stopped sending (cutscene/FMV/load/pause); (3) a failed effect update skipped the stop, and port
+  close / mode change / scePadEnd did not stop the motor.
+- Fix: small = value & 1; 200 ms effects renewed every 100 ms only while the game sends nonzero; explicit EV_FF 0 +
+  EVIOCRMFF on every stop; failed upload -> erase + one fresh upload; watchdog thread stops the motor 150 ms after the
+  last request; stop on window focus loss, scePadPortClose, scePadSetMainMode, scePadEnd, device change and exit
+  (the kernel also flushes the fd's effects on process death).
+- Flags: PS2X_PAD_RUMBLE_WATCHDOG_MS (default 150, 0 off), PS2X_PAD_SMALL_ANY=1 (old small-motor rule),
+  PS2X_PAD_RUMBLE_UNFOCUSED=1 (keep rumbling unfocused), PS2X_PAD_RUMBLE=0 (+PS2X_PAD_LOG=1 logs what would be
+  sent: "[pad] rumble play/stop (...)", raw calls as "[padact]").
