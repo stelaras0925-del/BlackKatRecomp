@@ -21,7 +21,8 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "PS2X_BUILD_STUDIO": "OFF",
         "PS2X_BUILD_TEST": "OFF",
-        "BKR_ENABLE_LTO": "OFF"
+        "BKR_ENABLE_LTO": "OFF",
+        "PS2X_ENABLE_AGRESSIVE_LOGS": "OFF"
       },
       "vendor": {
         "blackkat": {

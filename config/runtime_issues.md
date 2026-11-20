@@ -1267,3 +1267,52 @@ Checked with movies on (hidden window, /tmp mc0): intro plays to the end and the
 X / C (Circle, ESC maps to Circle too) skips; menu background movies; New Game -> SEQ_01 movie (skipped) -> sea battle;
 slot-4 load (keyscript needs an extra X at 5 s to skip the intro and +3 s on the old timings).
 Debug additions: PS2X_IPU_TRACE=<file>; [shot] and "[spu2] first ADMA block" lines carry mono= (steady clock) for A/V checks.
+
+## Patch series, launcher, GS internal resolution (2026-11-20)
+
+Patches: the 45 historical `patches/ps2recomp-*.patch` files do not chain. Applied in order on the pin, 32 of 45
+fail, because they were written against intermediate states. `patches/ps2recomp-series/` (0001-0005, split by file,
+no overlaps) is generated from the submodule working tree and is what `tools/apply_patches.sh` applies
+(`--check`, `--reset [-y]`). Configure checks it (`BKR_APPLY_PATCHES`, default ON): pending patches are an error;
+local changes beyond the series are a warning. Refresh 0003 and 0005 whenever gs_gpu_backend.inl,
+gs_frontend.cpp or ps2_runtime.cpp change (see patches/README.md).
+
+Launcher: `blackkat` with no args (or `--launcher`) opens a raylib + Dear ImGui (rlImGui) window.
+It saves to `$XDG_CONFIG_HOME/blackkat/config.ini`. `--play` uses the saved settings with no UI.
+A positional arg selects classic mode (no config).
+The settings are exported as env vars with setenv(overwrite=0), so env > CLI/config.
+Test hooks: BLACKKAT_LAUNCHER_SHOT=<png> (screenshot at frame 60), BLACKKAT_LAUNCHER_AUTO=1 (presses Launch at frame 70).
+Build note: src/launcher.cpp is in its own static lib (blackkat_launcher). Linking rlImGui to `blackkat` directly
+adds include paths to every generated .cpp and rebuilds all ~37.9k of them; this happened once (2,369 rebuilt
+before it was stopped).
+
+PS2X_GS_SCALE=N (1-4, GPU renderer only):
+- GPU targets are allocated at kDim*N, and draws use an N-times viewport and scissor (vertex coords are unchanged).
+- CPU-visible VRAM stays native. Resolves blit the target down to a native scratch FBO (LINEAR by default,
+  PS2X_GS_SCALE_RESOLVE=nearest), and uploads go into native then NEAREST up.
+- Present reads the display rect straight from the scaled target when it is the DISPFB target and is not stale.
+  Otherwise it falls back to native and logs `[gs:gpu:scale] native present (<reason>)`.
+- Effects that read back through VRAM (render-to-texture reflections, FMV) stay at native res.
+- Window: PS2X_WINDOW=WxH and PS2X_FULLSCREEN=1 (borderless). UploadFrame grows its texture for >640-wide frames.
+
+### Overnight 2026-11-20: clean-clone build, RTT at internal resolution, SPU2 reverb
+
+Clean-clone check:
+- Setup: `/tmp/bk-clean` is a clone of the branch plus the working-tree changes. The submodule comes from GitHub at the pin. `tools/apply_patches.sh` applies the series.
+- Result: identical to the dev tree. Configure took 69 s and the build 2h23m at `nice 19 -j8` (38,049 steps, 0 errors, 16 warnings).
+- Problem: the result ran at only 5 vsync/s. Upstream `PS2X_ENABLE_AGRESSIVE_LOGS` defaults to ON, and the dev tree had it OFF in its cache.
+- Fix: `CMakePresets.json` linux-base now sets it OFF.
+
+PS2X_GS_SCALE_RTT (default on when PS2X_GS_SCALE > 1; =0 off; =force also at 1x):
+- What it does: a draw whose TEX0 is a whole render target (TBP0 = FBP*32, TBW = FBW, CT32/CT24 on both sides, not stale, not the target being drawn) samples the scaled GPU target directly. Before, it went through the native resolve plus CPU decode.
+- Shader: rgb = c/255; alpha is A/128 from the target, or TEXA for CT24. Wrap is done in the shader (fract or clamp), and st is scaled by texSize/kDim.
+- Black Kat: the 256x256 effect buffers (fbp 0x17e, and 0x46/0x15e at fbw 4) hit this path. The water reflection is visibly sharper at 2x.
+- Remaining misses:
+  - `stale`: 0x17e lies inside the 0x15e back buffer, so a draw there marks it stale;
+  - `width`: the 1024x512 full-frame sample at tbw 10.
+  These still use the native path.
+- Speed: 2x sea battle 59.99 vsync/s, slot-4 59.99, 4x 60.00.
+
+PS2X_SPU2_REVERB=1 (default off):
+- What it does: psx-spx/SPU2 reverb per core at 24 kHz on the VMIXEL/VMIXER voices.
+- Black Kat: in the sea battle and the slot-4 on-foot scene the game leaves the effect area at ESA=0xFFFF8 EEA=0xFFFFF with all coefficients and EVOL at 0, so the reverb output is silent (peak 0). It stays off. With it on, wet-only voices lose the old "0.5 dry" stand-in, which matches hardware when EVOL=0.

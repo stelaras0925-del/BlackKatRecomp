@@ -1,0 +1,3644 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2421f9ed3a94f66ec6e9550a37f6c31d34346e84..ff9c382aa5d4270a566625556287e2b29cfc034c 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -33,6 +33,15 @@ public:
+     void SnapshotVram(std::vector<uint8_t> &out) const override;
+     GSTransferSnapshot GetTransferSnapshot() const override;
+ 
++    // Helpers for the opt-in GPU backend (PS2X_GS_GPU=1). Not used by the CPU rasterizer.
++    // Decodes the top-left width x height texels of state.context.tex0 to RGBA8 (TEXA/CLUT applied).
++    void DecodeTextureRgba(const GSDrawState &state, uint32_t width, uint32_t height, uint32_t *out);
++    // Hash of the currently loaded CLUT buffer.
++    uint64_t ClutHash() const;
++    // GPU backend (PS2X_GS_PRESENT_LAZY): Present straight from the live VRAM (caller is the only
++    // VRAM user at that moment) instead of snapshotting all 4 MiB first.
++    PresentationFrame PresentInPlace(const GSPresentationRequest &request);
++
+ private:
+     void ResetUnlocked();
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+@@ -48,6 +57,7 @@ private:
+     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+ 
++    void UploadImageImpl(const uint8_t *data, uint32_t sizeBytes, bool fast);
+     void PerformLocalToLocalTransfer();
+     void PerformLocalToHostTransfer();
+     PresentationFrame PresentFromLocalMemory(const GSPresentationRequest &request);
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad5070b42f89c6c697c906e93f59cebf2ba904..1085c7dc95b90055ebd1fd6fe5f111362bf8d768 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,3 +1,5 @@
++#include <chrono>
++#include <cstdlib>
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_psmct16.h"
+@@ -296,7 +298,35 @@ namespace
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        // lround() is a libm call per channel per bilinear texel (hot in
++        // gameplay); for the non-negative range that matters this is the same
++        // round-half-away-from-zero result, negatives clamp to 0 either way.
++        const float x = top + (bottom - top) * fy;
++        static const bool s_noFast = []() { const char *e = std::getenv("PS2X_GS_NOFASTMATH"); return e && e[0] == '1'; }();
++        if (s_noFast)
++            return clampU8(static_cast<int>(std::lround(x)));
++        return clampU8(x <= 0.0f ? 0 : static_cast<int>(x + 0.5f));
++    }
++
++    // PS2X_GS_NOSPAN=1 / PS2X_GS_NOFASTMATH=1: A/B switches for the speed patch.
++    inline bool gsEnvOn(const char *n)
++    {
++        const char *e = std::getenv(n);
++        return e && e[0] == '1';
++    }
++    const bool g_gsNoSpan = gsEnvOn("PS2X_GS_NOSPAN");
++    const bool g_gsNoFastMath = gsEnvOn("PS2X_GS_NOFASTMATH");
++
++    inline int fastFloorToInt(float f)
++    {
++        const int i = static_cast<int>(f);
++        return i - (f < static_cast<float>(i) ? 1 : 0);
++    }
++
++    inline int fastCeilToInt(float f)
++    {
++        const int i = static_cast<int>(f);
++        return i + (f > static_cast<float>(i) ? 1 : 0);
+     }
+ }
+ 
+@@ -670,6 +700,15 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
+     if (!m_vram)
+         return 0u;
+ 
++    // PS2X_GS_TEXCACHE_OFF=1: read texels straight from VRAM. The one-page
++    // cache copies 8 KB on every page change, which bilinear taps and
++    // swizzled access patterns hit constantly (memcpy ~6% of gameplay time).
++    static const bool s_direct = []() {
++        const char *e = std::getenv("PS2X_GS_TEXCACHE_OFF");
++        return e && e[0] == '1';
++    }();
++    if (s_direct)
++        return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
+     return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
+ }
+ 
+@@ -846,9 +885,65 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+     }
+ }
+ 
++namespace
++{
++    // PS2X_GS_PROBE="x,y[;x,y]" + PS2X_GS_PROBE_T=<sec>: for 0.3 s from that
++    // time, log every pixel write attempt at those framebuffer coords.
++    struct GsProbe
++    {
++        int n = 0;
++        int px[4] = {}, py[4] = {};
++        double t0 = 0.0;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++        int lines = 0;
++        GsProbe()
++        {
++            const char *e = std::getenv("PS2X_GS_PROBE");
++            if (!e) return;
++            const char *t = std::getenv("PS2X_GS_PROBE_T");
++            t0 = t ? std::atof(t) : 45.0;
++            const char *c = e;
++            while (*c && n < 4)
++            {
++                int xx = 0, yy = 0;
++                if (std::sscanf(c, "%d,%d", &xx, &yy) != 2) break;
++                px[n] = xx; py[n] = yy; ++n;
++                const char *sc = std::strchr(c, ';');
++                if (!sc) break;
++                c = sc + 1;
++            }
++        }
++        bool hit(int x, int y)
++        {
++            if (n == 0 || lines > 600) return false;
++            bool m = false;
++            for (int i = 0; i < n; ++i) m |= (px[i] == x && py[i] == y);
++            if (!m) return false;
++            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++            return el >= t0 && el < t0 + 0.3;
++        }
++    };
++    GsProbe g_gsProbe;
++}
++
+ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+ {
+     const auto &ctx = state.context;
++    if (g_gsProbe.hit(x, y))
++    {
++        ++g_gsProbe.lines;
++        const auto &t = ctx.tex0;
++        std::fprintf(stderr,
++                     "[gs:probe] (%d,%d) prim=%d iip=%d tme=%d fge=%d abe=%d fst=%d ctxt=%d rgba=%02x%02x%02x%02x z=0x%x fog=%u "
++                     "fb=%x/%u/psm%x msk=%x zb=%x/psm%x zmsk=%d test=%llx alpha=%llx fba=%llx pabe=%d "
++                     "tex0 tbp=%x tbw=%u psm=%x tw=%u th=%u tcc=%u tfx=%u cbp=%x cpsm=%x csm=%u texa? tex1=%llx clamp=%llx\n",
++                     x, y, (int)state.prim.type, state.prim.iip, state.prim.tme, state.prim.fge, state.prim.abe, state.prim.fst,
++                     state.prim.ctxt, r, g, b, a, (unsigned)z, fog,
++                     ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm, ctx.frame.fbmsk, ctx.zbuf.zbp, ctx.zbuf.psm, ctx.zbuf.zmask,
++                     (unsigned long long)ctx.test, (unsigned long long)ctx.alpha, (unsigned long long)ctx.fba, state.pabe,
++                     t.tbp0, t.tbw, t.psm, t.tw, t.th, t.tcc, t.tfx, t.cbp, t.cpsm, t.csm,
++                     (unsigned long long)ctx.tex1, (unsigned long long)ctx.clamp);
++    }
+     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
+         return;
+ 
+@@ -877,6 +972,38 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         return;
+     }
+ 
++    // The GS clamps the interpolated Z to the Z buffer format's range before
++    // the depth test and write (Z24 -> 0xFFFFFF, Z16/Z16S -> 0xFFFF). Without
++    // this a Z16/Z24 buffer compares a full-width Z against a truncated stored
++    // value (wrong draw order) and writes wrapped low bits.
++    // PS2X_GS_ZCLAMP_OFF=1 restores the old behaviour; PS2X_GS_ZSTATS=1 logs.
++    {
++        static const bool s_noClamp = []() { const char *e = std::getenv("PS2X_GS_ZCLAMP_OFF"); return e && e[0] == '1'; }();
++        static const bool s_stats = []() { const char *e = std::getenv("PS2X_GS_ZSTATS"); return e && e[0] == '1'; }();
++        const uint32_t zfmt = zpsm & 0xFu;
++        const uint32_t zmax = (zfmt == 0u) ? 0xFFFFFFFFu : (zfmt == 1u) ? 0x00FFFFFFu : 0x0000FFFFu;
++        const uint32_t uz = static_cast<uint32_t>(z);
++        if (s_stats)
++        {
++            static uint64_t s_tot[16] = {}, s_over[16] = {};
++            static uint32_t s_zmaxSeen[16] = {};
++            static uint64_t s_all = 0;
++            ++s_tot[zfmt];
++            if (uz > zmax) ++s_over[zfmt];
++            if (uz > s_zmaxSeen[zfmt]) s_zmaxSeen[zfmt] = uz;
++            if ((++s_all & ((1ull << 23) - 1ull)) == 0ull)
++            {
++                for (int i = 0; i < 16; ++i)
++                    if (s_tot[i])
++                        std::fprintf(stderr, "[gs:zstats] zpsm=0x%x pixels=%llu overRange=%llu maxZ=0x%08x ztst=%u\n",
++                                     0x30 + i, (unsigned long long)s_tot[i], (unsigned long long)s_over[i], s_zmaxSeen[i],
++                                     static_cast<unsigned>((ctx.test >> 17) & 3u));
++            }
++        }
++        if (!s_noClamp && uz > zmax)
++            z = static_cast<int>(zmax);
++    }
++
+     const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+     const bool alphaBlendEnabled = state.prim.abe;
+     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
+@@ -1120,8 +1247,8 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+ 
+     const float sampleU = texUf - 0.5f;
+     const float sampleV = texVf - 0.5f;
+-    const int u0 = static_cast<int>(std::floor(sampleU));
+-    const int v0 = static_cast<int>(std::floor(sampleV));
++    const int u0 = g_gsNoFastMath ? static_cast<int>(std::floor(sampleU)) : fastFloorToInt(sampleU);
++    const int v0 = g_gsNoFastMath ? static_cast<int>(std::floor(sampleV)) : fastFloorToInt(sampleV);
+     const int u1 = u0 + 1;
+     const int v1 = v0 + 1;
+     const float fx = sampleU - static_cast<float>(u0);
+@@ -1311,10 +1438,56 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
+ 
++    // Per-row span: the three edge tests are linear in px, so compute the x
++    // range where all can pass (widened by one pixel to absorb rounding) and
++    // only run the exact per-pixel test inside it, instead of scanning the
++    // whole bounding box (thin/diagonal triangles wasted most iterations).
++    const float a0 = (fy1 - fy2) * winding * invAbsDenom;
++    const float a1 = (fy2 - fy0) * winding * invAbsDenom;
++    const float a2 = -(a0 + a1);
+     for (int y = minY; y <= maxY; ++y)
+     {
+         float py = static_cast<float>(y) + 0.5f;
+-        for (int x = minX; x <= maxX; ++x)
++        const float b0 = ((fy1 - fy2) * (-fx2) + (fx2 - fx1) * (py - fy2)) * winding * invAbsDenom;
++        const float b1 = ((fy2 - fy0) * (-fx2) + (fx0 - fx2) * (py - fy2)) * winding * invAbsDenom;
++        const float b2 = 1.0f - b0 - b1;
++        float pxLo = static_cast<float>(minX) + 0.5f;
++        float pxHi = static_cast<float>(maxX) + 0.5f;
++        bool empty = false;
++        const float as[3] = {a0, a1, a2};
++        const float bs[3] = {b0, b1, b2};
++        for (int e = 0; e < 3; ++e)
++        {
++            const float a = as[e];
++            const float lim = -kEdgeEpsilon - bs[e];
++            if (std::fabs(a) < 1.0e-12f)
++            {
++                if (0.0f < lim - 1.0e-3f)
++                    empty = true;
++                continue;
++            }
++            const float bound = lim / a;
++            if (a > 0.0f)
++                pxLo = std::max(pxLo, bound);
++            else
++                pxHi = std::min(pxHi, bound);
++        }
++        if (g_gsNoSpan)
++        {
++            empty = false;
++            pxLo = static_cast<float>(minX) + 0.5f;
++            pxHi = static_cast<float>(maxX) + 0.5f;
++        }
++        if (empty || !(pxLo <= pxHi + 2.0f))
++            continue;
++        int spanX0 = minX, spanX1 = maxX;
++        if (pxLo > static_cast<float>(minX) && pxLo < static_cast<float>(maxX) + 1.0f)
++            spanX0 = std::max(minX, fastFloorToInt(pxLo - 0.5f) - 1);
++        if (pxHi < static_cast<float>(maxX) && pxHi > static_cast<float>(minX) - 1.0f)
++            spanX1 = std::min(maxX, fastCeilToInt(pxHi - 0.5f) + 1);
++        if (pxLo >= static_cast<float>(maxX) + 1.0f || pxHi <= static_cast<float>(minX) - 1.0f)
++            continue;
++        for (int x = spanX0; x <= spanX1; ++x)
+         {
+             float px = static_cast<float>(x) + 0.5f;
+ 
+@@ -1480,6 +1653,42 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    // PS2X_GS_UPLOAD_FAST (default on, =0 = old per-pixel div/mod path).
++    static const bool s_uploadFast = []() { const char *e = std::getenv("PS2X_GS_UPLOAD_FAST"); return !(e && e[0] == '0'); }();
++    // PS2X_GS_UPLOAD_CHECK=1: run the fast and the old path on the same input and compare
++    // the resulting VRAM bytes and transfer state (debug; copies 4 MiB twice per call).
++    static const bool s_uploadCheck = []() { const char *e = std::getenv("PS2X_GS_UPLOAD_CHECK"); return e && e[0] == '1'; }();
++    if (!s_uploadCheck || !m_vram)
++    {
++        UploadImageImpl(data, sizeBytes, s_uploadFast);
++        return;
++    }
++    static uint64_t s_calls = 0, s_bad = 0;
++    std::vector<uint8_t> before(m_vram, m_vram + m_vramSize);
++    const GSTransferSnapshot st0 = m_transferState;
++    UploadImageImpl(data, sizeBytes, true);
++    std::vector<uint8_t> fastVram(m_vram, m_vram + m_vramSize);
++    const GSTransferSnapshot stFast = m_transferState;
++    std::memcpy(m_vram, before.data(), m_vramSize);
++    m_transferState = st0;
++    UploadImageImpl(data, sizeBytes, false);
++    ++s_calls;
++    const bool stateSame = stFast.direction == m_transferState.direction && stFast.copiedPixels == m_transferState.copiedPixels &&
++                           stFast.totalPixels == m_transferState.totalPixels &&
++                           (m_transferState.direction == 3u || (stFast.x == m_transferState.x && stFast.y == m_transferState.y));
++    if (!stateSame || std::memcmp(fastVram.data(), m_vram, m_vramSize) != 0)
++    {
++        ++s_bad;
++        if (s_bad <= 20)
++            std::fprintf(stderr, "[gs:uploadcheck] MISMATCH call %llu psm=0x%x size=%u state=%d\n", (unsigned long long)s_calls,
++                         m_transfer.bitbltbuf.dpsm, sizeBytes, stateSame ? 1 : 0);
++    }
++    if ((s_calls & 4095u) == 0u)
++        std::fprintf(stderr, "[gs:uploadcheck] %llu calls, %llu mismatches\n", (unsigned long long)s_calls, (unsigned long long)s_bad);
++}
++
++void GSCpuBackend::UploadImageImpl(const uint8_t *data, uint32_t sizeBytes, bool fast)
++{
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+@@ -1492,6 +1701,94 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+     const uint32_t dsax = m_transfer.trxpos.dsax;
+     uint32_t offset = 0u;
+ 
++    // fast: same writes in the same order, but the destination x/y are stepped instead of
++    // re-derived (div/mod) per pixel.
++    if (fast)
++    {
++        const WriteVramFunc wr = m_writeVramFuncs[dpsm & 0x3Fu];
++        const uint32_t total = m_transferState.totalPixels;
++        const uint32_t dsay = m_transfer.trxpos.dsay;
++        uint32_t cp = m_transferState.copiedPixels;
++        uint32_t col = cp % rrw, row = cp / rrw;
++        auto step = [&]() { ++cp; if (++col == rrw) { col = 0u; ++row; } };
++        switch (dpsm)
++        {
++        case GS_PSM_CT32:
++        case GS_PSM_Z32:
++            while (cp < total && sizeBytes - offset >= 4u)
++            {
++                uint32_t value;
++                std::memcpy(&value, data + offset, 4u);
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, value);
++                offset += 4u;
++                step();
++            }
++            break;
++        case GS_PSM_CT24:
++        case GS_PSM_Z24:
++            while (cp < total && sizeBytes - offset >= 3u)
++            {
++                const uint32_t value = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
++                                       (static_cast<uint32_t>(data[offset + 2u]) << 16u);
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, value);
++                offset += 3u;
++                step();
++            }
++            break;
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++        case GS_PSM_Z16:
++        case GS_PSM_Z16S:
++            while (cp < total && sizeBytes - offset >= 2u)
++            {
++                uint16_t value;
++                std::memcpy(&value, data + offset, 2u);
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, value);
++                offset += 2u;
++                step();
++            }
++            break;
++        case GS_PSM_T8:
++        case GS_PSM_T8H:
++            while (cp < total && offset < sizeBytes)
++            {
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, data[offset++]);
++                step();
++            }
++            break;
++        case GS_PSM_T4:
++        case GS_PSM_T4HL:
++        case GS_PSM_T4HH:
++            while (cp < total && offset < sizeBytes)
++            {
++                const uint8_t packed = data[offset++];
++                wr(m_vram, dbp, dbw, dsax + col, dsay + row, packed & 0x0Fu);
++                step();
++                if (cp < total)
++                {
++                    wr(m_vram, dbp, dbw, dsax + col, dsay + row, (packed >> 4u) & 0x0Fu);
++                    step();
++                }
++            }
++            break;
++        default:
++            return;
++        }
++        if (cp >= total)
++        {
++            m_transferState.copiedPixels = total;
++            m_transferState.direction = 3u;
++            m_transferState.totalPixels = 0u;
++        }
++        else if (cp != m_transferState.copiedPixels)
++        {
++            m_transferState.copiedPixels = cp;
++            m_transferState.x = dsax + col;
++            m_transferState.y = dsay + row;
++        }
++        return;
++    }
++
+     auto advancePixel = [&](uint32_t count)
+     {
+         const uint32_t totalPixels = m_transferState.totalPixels;
+@@ -1857,6 +2154,12 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+     return snapshotBackend.PresentFromLocalMemory(request);
+ }
+ 
++PresentationFrame GSCpuBackend::PresentInPlace(const GSPresentationRequest &request)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    return PresentFromLocalMemory(request);
++}
++
+ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
+ {
+     PresentationFrame result{};
+@@ -1978,3 +2281,55 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     result.sourceFbp = selected.fbp;
+     return result;
+ }
++
++void GSCpuBackend::DecodeTextureRgba(const GSDrawState &state, uint32_t width, uint32_t height, uint32_t *out)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    m_texturePageCache.Invalidate();
++    const auto &tex = state.context.tex0;
++    for (uint32_t y = 0; y < height; ++y)
++    {
++        for (uint32_t x = 0; x < width; ++x)
++        {
++            const u32 raw = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, x, y);
++            uint32_t c = 0xFFFF00FFu;
++            switch (tex.psm)
++            {
++            case GS_PSM_CT32:
++            case GS_PSM_Z32:
++            case GS_PSM_CT24:
++            case GS_PSM_Z24:
++                c = applyTexa(state.texa, tex.psm, raw);
++                break;
++            case GS_PSM_CT16:
++            case GS_PSM_CT16S:
++            case GS_PSM_Z16:
++            case GS_PSM_Z16S:
++                c = applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(static_cast<u16>(raw)));
++                break;
++            case GS_PSM_T8:
++            case GS_PSM_T8H:
++            case GS_PSM_T4:
++            case GS_PSM_T4HL:
++            case GS_PSM_T4HH:
++                c = LookupCLUT(state, static_cast<u8>(raw), tex.cpsm, tex.csm, tex.csa, tex.psm);
++                break;
++            default:
++                break;
++            }
++            out[y * width + x] = c;
++        }
++    }
++}
++
++uint64_t GSCpuBackend::ClutHash() const
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    uint64_t h = 1469598103934665603ull;
++    for (uint16_t v : m_clut)
++    {
++        h ^= v;
++        h *= 1099511628211ull;
++    }
++    return h;
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f51b809c4f755837ccf45e47604d539bf7..1215addadd51420efcea7fca0bc29792409201e7 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,6 +1,8 @@
++#include <cstdlib>
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
++#include "../ps2_vu1_async.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+ #include <algorithm>
+@@ -111,6 +113,522 @@ GS::GS()
+     reset();
+ }
+ 
++// ---------------------------------------------------------------------------
++// Threaded raster backend (default; PS2X_GS_SYNC=1 disables it).
++// All VRAM-mutating backend calls (Submit, LoadClut, BeginTransfer,
++// UploadImage, TextureFlush, WriteVram) are queued in order and executed on
++// one worker thread. Every call that reads GS memory or needs completed work
++// (Flush, Sync, Present, ClearFramebuffer, ConsumeLocalToHostBytes, ReadVram,
++// SnapshotVram, Reset, Initialize) first waits until everything queued before
++// it has been executed. GetTransferSnapshot (debug only) does not wait.
++// ---------------------------------------------------------------------------
++#include <chrono>
++#include <condition_variable>
++#include <memory>
++#include <vector>
++#include <string>
++#include <deque>
++#include <mutex>
++#include <thread>
++#include <pthread.h>
++#include <chrono>
++#include <cstdio>
++
++extern int g_ps2xGifCurPath;
++namespace
++{
++    // PS2X_GS_WATCHBP="lo,hi" (hex block addresses): debug, log transfers and draws that write
++    // into [lo,hi) (max 400 lines).
++    struct GsWatchBp
++    {
++        long lo = -1, hi = -1; int lines = 0;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++        GsWatchBp() { if (const char *e = std::getenv("PS2X_GS_WATCHBP")) std::sscanf(e, "%lx,%lx", &lo, &hi); }
++        bool on(long bp, long endBp) { return lo >= 0 && lines < 400 && bp < hi && endBp > lo; }
++        double t() const { return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
++    };
++    GsWatchBp g_gsWatch;
++}
++
++namespace
++{
++    // Multi-worker banded rasterizer. Worker k owns framebuffer rows y with
++    // (y / kBandRows) % N == k and draws each primitive only inside its bands
++    // (by narrowing the scissor; interpolation uses unclipped vertex data, so
++    // pixels are identical). Every worker has its own GSCpuBackend (texture
++    // page cache, CLUT) on the shared VRAM and sees the same ordered command
++    // stream. VRAM-mutating non-draw ops (transfers, uploads, WriteVram) are
++    // barriers: all workers arrive, the last executes on worker 0's backend
++    // and flushes every texture cache. A draw that samples (or a CLUT load
++    // that reads) memory written by draws since the last barrier also gets a
++    // barrier first, so cross-band render-to-texture stays ordered.
++    class GSThreadedBackend final : public GSRasterBackend
++    {
++    public:
++        static constexpr int kBandRows = 16;
++
++        GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner, int threads)
++        {
++            m_n = std::max(1, std::min(threads, 16));
++            m_workers.resize(static_cast<size_t>(m_n));
++            m_workers[0].be = std::move(inner);
++            for (int i = 1; i < m_n; ++i)
++                m_workers[i].be = std::make_unique<GSCpuBackend>();
++            for (int i = 0; i < m_n; ++i)
++                m_workers[i].th = std::thread([this, i]() { workerLoop(i); });
++        }
++        ~GSThreadedBackend() override
++        {
++            drain(0);
++            {
++                std::lock_guard<std::mutex> lk(m_mutex);
++                m_quit = true;
++            }
++            for (auto &w : m_workers)
++                w.cv.notify_all();
++            for (auto &w : m_workers)
++                if (w.th.joinable())
++                    w.th.join();
++        }
++
++        void Initialize(uint8_t *vram, uint32_t vramSize) override
++        {
++            drain(0);
++            for (auto &w : m_workers)
++                w.be->Initialize(vram, vramSize);
++        }
++        void Reset() override
++        {
++            drain(0);
++            for (auto &w : m_workers)
++                w.be->Reset();
++            m_written.clear();
++        }
++
++        void Submit(const GSPrimitiveBatch &batch) override
++        {
++            if (m_n > 1)
++                trackDraw(batch);
++            Cmd c;
++            c.type = Cmd::SubmitT;
++            c.batch = batch;
++            pushAll(std::move(c));
++        }
++        void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
++        {
++            if (m_n > 1 && overlapsWritten(static_cast<uint64_t>(tex0.cbp) * 256u, 1024u))
++                pushBarrier(BarrierKind::Hazard);
++            Cmd c;
++            c.type = Cmd::ClutT;
++            c.tex0 = tex0;
++            c.clut = texclut;
++            pushAll(std::move(c));
++        }
++        void BeginTransfer(const GSTransferCommand &command) override
++        {
++            auto op = std::make_shared<Barrier>();
++            op->kind = BarrierKind::Transfer;
++            op->transfer = command;
++            pushBarrierOp(std::move(op));
++        }
++        void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
++        {
++            if (!data || sizeBytes == 0u)
++                return;
++            auto op = std::make_shared<Barrier>();
++            op->kind = BarrierKind::Upload;
++            op->data.assign(data, data + sizeBytes);
++            pushBarrierOp(std::move(op));
++        }
++        void Flush() override { drain(1); m_workers[0].be->Flush(); }
++        void Sync(GSSyncReason reason) override { drain(2); m_workers[0].be->Sync(reason); }
++        void TextureFlush() override
++        {
++            Cmd c;
++            c.type = Cmd::TexFlushT;
++            pushAll(std::move(c));
++        }
++        PresentationFrame Present(const GSPresentationRequest &request) override { drain(3); return m_workers[0].be->Present(request); }
++        bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
++        {
++            drain(4);
++            const bool r = m_workers[0].be->ClearFramebuffer(context, rgba);
++            flushAllCaches();
++            m_written.clear();
++            return r;
++        }
++        uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override { drain(5); return m_workers[0].be->ConsumeLocalToHostBytes(dst, maxBytes); }
++        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
++        {
++            drain(6);
++            return m_workers[0].be->ReadVram(psm, base, bw, x, y);
++        }
++        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
++        {
++            auto op = std::make_shared<Barrier>();
++            op->kind = BarrierKind::Write;
++            op->w[0] = psm; op->w[1] = base; op->w[2] = bw; op->w[3] = x; op->w[4] = y; op->w[5] = value;
++            pushBarrierOp(std::move(op));
++        }
++        void SnapshotVram(std::vector<uint8_t> &out) const override { drain(7); m_workers[0].be->SnapshotVram(out); }
++        GSTransferSnapshot GetTransferSnapshot() const override { return m_workers[0].be->GetTransferSnapshot(); }
++
++    private:
++        enum class BarrierKind : uint8_t { Hazard, Transfer, Upload, Write };
++        struct Barrier
++        {
++            BarrierKind kind = BarrierKind::Hazard;
++            GSTransferCommand transfer{};
++            std::vector<uint8_t> data;
++            uint32_t w[6] = {};
++            int arrived = 0;
++            bool done = false;
++        };
++        struct Cmd
++        {
++            enum Type : uint8_t { SubmitT, ClutT, TexFlushT, BarrierT } type = SubmitT;
++            GSPrimitiveBatch batch{};
++            GSTex0Reg tex0{};
++            GSTexClutReg clut{};
++            std::shared_ptr<Barrier> barrier;
++        };
++        struct Worker
++        {
++            std::unique_ptr<GSRasterBackend> be;
++            std::deque<Cmd> q;
++            uint64_t submitted = 0;
++            uint64_t completed = 0;
++            bool idle = false;
++            std::condition_variable cv;
++            std::thread th;
++        };
++
++        static uint32_t psmBits(uint32_t psm)
++        {
++            switch (psm & 0x3Fu)
++            {
++            case 0x02: case 0x0A: case 0x32: case 0x3A: return 16u;
++            case 0x13: return 8u;
++            case 0x14: return 4u;
++            default: return 32u;
++            }
++        }
++        // Conservative byte range of a buffer: base bytes + width x height at
++        // psm depth, rounded up to whole 8 KiB pages plus one page of slack.
++        static void bufRange(uint64_t baseBytes, uint32_t widthPx, uint32_t heightPx, uint32_t psm, uint64_t &lo, uint64_t &hi)
++        {
++            const uint64_t bytes = (static_cast<uint64_t>(widthPx) * heightPx * psmBits(psm) + 7u) / 8u;
++            lo = baseBytes;
++            hi = baseBytes + ((bytes + 8191u) / 8192u + 1u) * 8192u;
++        }
++        bool overlapsWritten(uint64_t lo, uint64_t len) const
++        {
++            const uint64_t hi = lo + len;
++            for (const auto &r : m_written)
++                if (lo < r.second && r.first < hi)
++                    return true;
++            return false;
++        }
++        void addWritten(uint64_t lo, uint64_t hi)
++        {
++            for (auto &r : m_written)
++                if (r.first == lo)
++                {
++                    r.second = std::max(r.second, hi);
++                    return;
++                }
++            m_written.emplace_back(lo, hi);
++        }
++        void trackDraw(const GSPrimitiveBatch &batch)
++        {
++            const GSDrawState &st = batch.state;
++            const GSContext &ctx = st.context;
++            if (st.prim.tme)
++            {
++                const GSTex0Reg &t = ctx.tex0;
++                uint64_t lo, hi;
++                const uint32_t tw = 1u << std::min<uint32_t>(t.tw, 10u);
++                const uint32_t th = 1u << std::min<uint32_t>(t.th, 10u);
++                bufRange(static_cast<uint64_t>(t.tbp0) * 256u, std::max<uint32_t>(t.tbw, 1u) * 64u > tw ? std::max<uint32_t>(t.tbw, 1u) * 64u : tw,
++                         th, t.psm, lo, hi);
++                if (overlapsWritten(lo, hi - lo))
++                    pushBarrier(BarrierKind::Hazard);
++            }
++            const uint32_t h = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
++            const uint32_t w = std::max<uint32_t>(ctx.frame.fbw, 1u) * 64u;
++            uint64_t lo, hi;
++            bufRange(static_cast<uint64_t>(ctx.frame.fbp) * 8192u, w, h, ctx.frame.psm, lo, hi);
++            addWritten(lo, hi);
++            if (((ctx.test >> 16) & 1u) && !ctx.zbuf.zmask)
++            {
++                bufRange(static_cast<uint64_t>(ctx.zbuf.zbp) * 8192u, w, h, ctx.zbuf.psm, lo, hi);
++                addWritten(lo, hi);
++            }
++        }
++
++        void pushAll(Cmd &&c)
++        {
++            std::unique_lock<std::mutex> lk(m_mutex);
++            // Backpressure: a producer that outruns the raster threads (e.g. the EE with
++            // PS2X_VU1_THREAD=1) must not grow the queues without bound, or Present()'s
++            // drain never catches up. PS2X_GS_QUEUE_MAX=<cmds> (default 8192, 0 = unbounded; 1024 cost ~15% in sync mode).
++            static const uint64_t s_queueMax = []() -> uint64_t {
++                const char *e = std::getenv("PS2X_GS_QUEUE_MAX");
++                return e ? static_cast<uint64_t>(std::strtoull(e, nullptr, 0)) : 8192u;
++            }();
++            if (s_queueMax != 0u)
++            {
++                m_doneCv.wait(lk, [&]() {
++                    for (const auto &w : m_workers)
++                        if (w.submitted - w.completed >= s_queueMax)
++                            return false;
++                    return true;
++                });
++            }
++            for (int i = 0; i < m_n; ++i)
++            {
++                Worker &w = m_workers[i];
++                if (i + 1 < m_n)
++                    w.q.push_back(c);
++                else
++                    w.q.push_back(std::move(c));
++                ++w.submitted;
++                if (w.idle)
++                    w.cv.notify_one();
++            }
++        }
++        void pushBarrier(BarrierKind kind)
++        {
++            auto op = std::make_shared<Barrier>();
++            op->kind = kind;
++            pushBarrierOp(std::move(op));
++        }
++        void pushBarrierOp(std::shared_ptr<Barrier> op)
++        {
++            m_written.clear();
++            ++m_barriers;
++            Cmd c;
++            c.type = Cmd::BarrierT;
++            c.barrier = std::move(op);
++            pushAll(std::move(c));
++        }
++        void flushAllCaches()
++        {
++            for (auto &w : m_workers)
++                w.be->TextureFlush();
++        }
++        void executeBarrier(Barrier &b)
++        {
++            GSRasterBackend &be0 = *m_workers[0].be;
++            switch (b.kind)
++            {
++            case BarrierKind::Hazard: break;
++            case BarrierKind::Transfer: be0.BeginTransfer(b.transfer); break;
++            case BarrierKind::Upload: be0.UploadImage(b.data.data(), static_cast<uint32_t>(b.data.size())); break;
++            case BarrierKind::Write: be0.WriteVram(b.w[0], b.w[1], b.w[2], b.w[3], b.w[4], b.w[5]); break;
++            }
++            if (m_n > 1)
++                flushAllCaches();
++        }
++
++        void drawBanded(int k, GSPrimitiveBatch &batch)
++        {
++            GSRasterBackend &be = *m_workers[k].be;
++            if (m_n == 1)
++            {
++                be.Submit(batch);
++                return;
++            }
++            GSScissorReg &sc = batch.state.context.scissor;
++            const int ofy = batch.state.context.xyoffset.ofy >> 4;
++            const int cnt = std::max<int>(1, std::min<int>(batch.vertexCount, 3));
++            float ymin = batch.vertices[0].y, ymax = ymin;
++            for (int i = 1; i < cnt; ++i)
++            {
++                ymin = std::min(ymin, batch.vertices[i].y);
++                ymax = std::max(ymax, batch.vertices[i].y);
++            }
++            int y0 = static_cast<int>(std::floor(ymin)) - ofy - 1;
++            int y1 = static_cast<int>(std::ceil(ymax)) - ofy + 1;
++            const int s0 = sc.y0, s1 = sc.y1;
++            y0 = std::max(y0, s0);
++            y1 = std::min(y1, s1);
++            if (y0 > y1)
++                return;
++            for (int band = y0 / kBandRows; band * kBandRows <= y1; ++band)
++            {
++                if (band % m_n != k)
++                    continue;
++                const int b0 = std::max(s0, band * kBandRows);
++                const int b1 = std::min(s1, band * kBandRows + kBandRows - 1);
++                if (b0 > b1)
++                    continue;
++                sc.y0 = static_cast<uint16_t>(b0);
++                sc.y1 = static_cast<uint16_t>(b1);
++                be.Submit(batch);
++            }
++        }
++
++        void workerLoop(int k)
++        {
++            Worker &self = m_workers[k];
++            {
++                char nm[16];
++                std::snprintf(nm, sizeof(nm), "GSRast%d", k);
++                pthread_setname_np(pthread_self(), nm); // thread CPU% in PS2X_PROF
++            }
++            std::deque<Cmd> local;
++            std::unique_lock<std::mutex> lk(m_mutex);
++            for (;;)
++            {
++                self.idle = true;
++                self.cv.wait(lk, [&]() { return m_quit || !self.q.empty(); });
++                self.idle = false;
++                if (self.q.empty() && m_quit)
++                    return;
++                local.swap(self.q);
++                lk.unlock();
++                uint64_t n = 0;
++                for (Cmd &c : local)
++                {
++                    switch (c.type)
++                    {
++                    case Cmd::SubmitT: drawBanded(k, c.batch); break;
++                    case Cmd::ClutT: self.be->LoadClut(c.tex0, c.clut); break;
++                    case Cmd::TexFlushT: self.be->TextureFlush(); break;
++                    case Cmd::BarrierT:
++                    {
++                        Barrier &b = *c.barrier;
++                        std::unique_lock<std::mutex> bl(m_mutex);
++                        if (++b.arrived == m_n)
++                        {
++                            bl.unlock();
++                            executeBarrier(b);
++                            bl.lock();
++                            b.done = true;
++                            m_barrierCv.notify_all();
++                        }
++                        else
++                        {
++                            m_barrierCv.wait(bl, [&]() { return b.done; });
++                        }
++                        break;
++                    }
++                    }
++                    ++n;
++                }
++                local.clear();
++                lk.lock();
++                self.completed += n;
++                m_doneCv.notify_all();
++            }
++        }
++
++        bool allDone() const
++        {
++            for (const auto &w : m_workers)
++                if (w.completed < w.submitted)
++                    return false;
++            return true;
++        }
++
++        // PS2X_GS_THREAD_STATS=1: every ~5 s log drains per reason, how many
++        // had to wait, the total wait time, and barriers queued.
++        void drain(int why) const
++        {
++            const auto me = std::this_thread::get_id();
++            for (const auto &w : m_workers)
++                if (w.th.get_id() == me)
++                    return;
++            static const bool s_stats = []() { const char *e = std::getenv("PS2X_GS_THREAD_STATS"); return e && e[0] == '1'; }();
++            std::unique_lock<std::mutex> lk(m_mutex);
++            std::vector<uint64_t> target(m_workers.size());
++            for (size_t i = 0; i < m_workers.size(); ++i)
++                target[i] = m_workers[i].submitted;
++            auto reached = [&]() {
++                for (size_t i = 0; i < m_workers.size(); ++i)
++                    if (m_workers[i].completed < target[i])
++                        return false;
++                return true;
++            };
++            if (s_stats)
++                ++m_drainCalls[why & 7];
++            if (reached())
++                return;
++            const auto t0 = std::chrono::steady_clock::now();
++            m_doneCv.wait(lk, reached);
++            if (s_stats)
++            {
++                const auto t1 = std::chrono::steady_clock::now();
++                ++m_drainWaits[why & 7];
++                m_drainWaitNs[why & 7] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
++                if (t1 - m_lastStats > std::chrono::seconds(5))
++                {
++                    m_lastStats = t1;
++                    static const char *names[8] = {"init/reset", "flush", "sync", "present", "clear", "l2h", "readvram", "snapshot"};
++                    std::string line = "[gs:thread] workers=" + std::to_string(m_n);
++                    for (int i = 0; i < 8; ++i)
++                        if (m_drainCalls[i])
++                            line += std::string(" ") + names[i] + "=" + std::to_string(m_drainCalls[i]) + "/" +
++                                    std::to_string(m_drainWaits[i]) + "w/" + std::to_string(m_drainWaitNs[i] / 1000000ull) + "ms";
++                    line += " cmds=" + std::to_string(m_workers[0].submitted) + " barriers=" + std::to_string(m_barriers);
++                    std::fprintf(stderr, "%s\n", line.c_str());
++                }
++            }
++        }
++
++        int m_n = 1;
++        std::deque<Worker> m_workers;
++        mutable std::mutex m_mutex;
++        mutable std::condition_variable m_doneCv;
++        std::condition_variable m_barrierCv;
++        bool m_quit = false;
++        std::vector<std::pair<uint64_t, uint64_t>> m_written;
++        uint64_t m_barriers = 0;
++        mutable uint64_t m_drainCalls[8] = {};
++        mutable uint64_t m_drainWaits[8] = {};
++        mutable uint64_t m_drainWaitNs[8] = {};
++        mutable std::chrono::steady_clock::time_point m_lastStats{};
++    };
++
++    int gsThreadCount()
++    {
++        if (const char *e = std::getenv("PS2X_GS_THREADS"); e && e[0])
++            return std::max(1, std::atoi(e));
++        const unsigned hw = std::thread::hardware_concurrency();
++        return std::max(1, std::min(4, static_cast<int>(hw / 2u)));
++    }
++
++    bool gsSyncMode()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_GS_SYNC"); return e && e[0] == '1'; }();
++        return on;
++    }
++
++    // Opt-in OpenGL GS renderer (PS2X_GS_GPU=1), defined in gs_gpu_backend.inl (included at the end of this file).
++    std::unique_ptr<GSRasterBackend> createGsGpuBackend();
++    bool isGsGpuBackend(const GSRasterBackend *backend);
++
++    std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend(std::unique_ptr<GSRasterBackend> inner)
++    {
++        if (const char *g = std::getenv("PS2X_GS_GPU"); g && g[0] == '1')
++        {
++            if (auto gpu = createGsGpuBackend())
++            {
++                std::fprintf(stderr, "[gs] GPU (OpenGL) GS renderer enabled (PS2X_GS_GPU=1); unset it for the CPU rasterizer\n");
++                return gpu;
++            }
++            std::fprintf(stderr, "[gs] PS2X_GS_GPU=1 but GPU init failed; falling back to the CPU rasterizer\n");
++        }
++        if (gsSyncMode())
++            return inner;
++        const int n = gsThreadCount();
++        std::fprintf(stderr, "[gs] rasterizer on %d worker thread(s), %d-row bands (PS2X_GS_THREADS=N, PS2X_GS_SYNC=1 for none)\n",
++                     n, GSThreadedBackend::kBandRows);
++        return std::make_unique<GSThreadedBackend>(std::move(inner), n);
++    }
++}
++
+ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+ {
+     m_localMemoryStorage = vram;
+@@ -118,6 +636,8 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+     m_privRegs = privRegs;
+     if (!m_backend)
+         m_backend = std::make_unique<GSCpuBackend>();
++    if (!dynamic_cast<GSThreadedBackend *>(m_backend.get()) && !isGsGpuBackend(m_backend.get()))
++        m_backend = makeDefaultRasterBackend(std::move(m_backend));
+     m_backend->Initialize(vram, vramSize);
+     reset();
+ }
+@@ -610,7 +1130,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
+     if (outWidth != 0u && outHeight != 0u)
+     {
+-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
++        // Native frames use a kHostFrameWidth stride; upscaled GPU frames (PS2X_GS_SCALE) are packed.
++        const size_t sourceRowBytes = static_cast<size_t>(std::max<uint32_t>(kHostFrameWidth, outWidth)) * 4u;
+         for (uint32_t y = 0; y < outHeight; ++y)
+         {
+             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
+@@ -640,6 +1161,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+ 
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    ps2x_vu1async::drainIfOffWorker("gs-direct"); // PS2X_VU1_THREAD=1: keep GS input ordered
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+@@ -930,7 +1452,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(x) / 16.0f;
+         vtx.y = static_cast<float>(y) / 16.0f;
+-        vtx.z = static_cast<float>(z);
++        vtx.z = static_cast<double>(z);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -967,7 +1489,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(x) / 16.0f;
+         vtx.y = static_cast<float>(y) / 16.0f;
+-        vtx.z = static_cast<float>(z);
++        vtx.z = static_cast<double>(z);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1001,7 +1523,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
+         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
+-        vtx.z = static_cast<float>((hi >> 4) & 0xFFFFFF);
++        vtx.z = static_cast<double>((hi >> 4) & 0xFFFFFF);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1032,7 +1554,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
+         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
+-        vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
++        vtx.z = static_cast<double>(hi & 0xFFFFFFFF);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1062,6 +1584,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+ 
+ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
++    ps2x_vu1async::drainIfOffWorker("gs-direct"); // PS2X_VU1_THREAD=1: keep GS input ordered
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     writeRegisterUnlocked(regAddr, value);
+ }
+@@ -1392,6 +1915,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+             command.trxpos = m_trxpos;
+             command.trxreg = m_trxreg;
+             command.direction = m_trxdir;
++            if (m_trxdir != 1u)
++            {
++                const long bp = (long)m_bitbltbuf.dbp;
++                const long bytes = (long)m_trxreg.rrw * (long)m_trxreg.rrh * 4; // upper bound
++                if (g_gsWatch.on(bp, bp + std::max(1L, (bytes + 255) / 256 + (long)m_trxpos.dsay * m_bitbltbuf.dbw * 64 * 4 / 256 + 1)))
++                {
++                    ++g_gsWatch.lines;
++                    std::fprintf(stderr, "[gs:watch] t=%.3f xfer dir=%u dbp=%x dbw=%u dpsm=%x pos=(%u,%u) size=%ux%u sbp=%x spsm=%x path=%d\n", g_gsWatch.t(), m_trxdir,
++                                 m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh, m_bitbltbuf.sbp, m_bitbltbuf.spsm, g_ps2xGifCurPath);
++                }
++            }
+             m_backend->BeginTransfer(command);
+         }
+         recordTransferDebugEventUnlocked();
+@@ -1525,10 +2059,73 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     recordRegisterDebugEventUnlocked(regAddr, value);
+ }
+ 
++
++extern int g_ps2xGifCurPath;
++
++
++namespace
++{
++    // PS2X_GS_DRAWLOG=<sec>[,<dur>]: from <sec> for <dur> (default 0.4) seconds,
++    // log draw runs (consecutive prims sharing frame/zbuf/tex/test/alpha/prim)
++    // in submission order: count, screen bbox, z range, max |coord| outside
++    // the scissor, first vertex rgba.
++    struct GsDrawLog
++    {
++        bool enabled = false;
++        double t0 = 0.0, dur = 0.4;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++        bool open = false;
++        uint64_t key[6] = {};
++        uint32_t count = 0;
++        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
++        double z0 = 1e18, z1 = -1e18;
++        float maxArea = 0.f;
++        uint32_t rgba = 0;
++        int ofx = 0, ofy = 0;
++        uint32_t lines = 0;
++        uint64_t seq = 0;
++        uint32_t adc = 0;
++        float s0 = 1e30f, s1 = -1e30f, t0s = 1e30f, t1s = -1e30f, q0 = 1e30f, q1 = -1e30f;
++        std::string desc;
++        GsDrawLog()
++        {
++            const char *e = std::getenv("PS2X_GS_DRAWLOG");
++            if (!e) return;
++            enabled = true;
++            std::sscanf(e, "%lf,%lf", &t0, &dur);
++        }
++        bool active()
++        {
++            if (!enabled || lines > 6000) return false;
++            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++            static const bool s_dumping = std::getenv("PS2X_GS_DUMPRUNS") != nullptr;
++            if (s_dumping ? (el >= t0 && seq >= 110) : (el >= t0 + dur)) { if (open) flush(); enabled = false; return false; }
++            return el >= t0;
++        }
++        void flush()
++        {
++            if (!open) return;
++            std::fprintf(stderr, "[gs:draw] #%llu n=%u adc=%u %s bbox=(%.0f,%.0f)-(%.0f,%.0f) z=%.0f..%.0f maxArea=%.0f rgba0=%08x st=(%g..%g,%g..%g) q=%g..%g\n",
++                         (unsigned long long)seq, count, adc, desc.c_str(), x0, y0, x1, y1, z0, z1, maxArea, rgba, s0, s1, t0s, t1s, q0, q1);
++            ++lines;
++            open = false;
++        }
++    };
++    GsDrawLog g_gsDrawLog;
++}
++
+ void GS::vertexKick(bool drawing)
+ {
+     ++m_vtxCount;
+     ++m_vtxIndex;
++    if (g_gsDrawLog.enabled && !drawing && g_gsDrawLog.active())
++    {
++        static uint32_t s_adcLogged = 0;
++        const GSVertex &v = m_vtxQueue[(m_vtxCount - 1) % kMaxVerts];
++        ++g_gsDrawLog.adc;
++        if (s_adcLogged++ < 0)
++            std::fprintf(stderr, "[gs:adc] prim=%u vtx#%d x=%.1f y=%.1f z=%.0f\n", (unsigned)m_prim.type, m_vtxCount, v.x, v.y, v.z);
++    }
+ 
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);
+@@ -1576,7 +2173,173 @@ void GS::vertexKick(bool drawing)
+     if (drawing && m_backend)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
++        if (g_gsDrawLog.enabled && g_gsDrawLog.active())
++        {
++            auto &L = g_gsDrawLog;
++            const GSContext &c = batch.state.context;
++            const auto &pr = batch.state.prim;
++            uint64_t k[6] = {
++                (uint64_t)c.frame.fbp | ((uint64_t)c.frame.psm << 16) | ((uint64_t)c.frame.fbmsk << 24),
++                (uint64_t)c.zbuf.zbp | ((uint64_t)c.zbuf.psm << 16) | ((uint64_t)c.zbuf.zmask << 24),
++                (uint64_t)c.tex0.tbp0 | ((uint64_t)c.tex0.psm << 16) | ((uint64_t)c.tex0.cbp << 24) | ((uint64_t)c.tex0.tw << 40) | ((uint64_t)c.tex0.th << 44) | ((uint64_t)c.tex0.tcc << 48) | ((uint64_t)c.tex0.tfx << 49),
++                c.test, c.alpha,
++                (uint64_t)pr.type | ((uint64_t)pr.iip << 3) | ((uint64_t)pr.tme << 4) | ((uint64_t)pr.fge << 5) | ((uint64_t)pr.abe << 6) | ((uint64_t)pr.aa1 << 7) | ((uint64_t)pr.fst << 8) | ((uint64_t)pr.ctxt << 9)};
++            if (!L.open || std::memcmp(k, L.key, sizeof(k)) != 0)
++            {
++                L.flush();
++                std::memcpy(L.key, k, sizeof(k));
++                L.open = true; L.count = 0; L.adc = 0; ++L.seq;
++                L.x0 = L.y0 = 1e9f; L.x1 = L.y1 = -1e9f; L.z0 = 1e18; L.z1 = -1e18; L.maxArea = 0.f;
++                L.s0 = L.t0s = L.q0 = 1e30f; L.s1 = L.t1s = L.q1 = -1e30f;
++                L.ofx = c.xyoffset.ofx >> 4; L.ofy = c.xyoffset.ofy >> 4;
++                const auto &v = batch.vertices[0];
++                L.rgba = ((uint32_t)v.r << 24) | ((uint32_t)v.g << 16) | ((uint32_t)v.b << 8) | v.a;
++                char buf[640];
++                std::snprintf(buf, sizeof(buf), "path=%d prim=%u tme=%u abe=%u fst=%u ctxt=%u fb=%x/psm%x/msk%x zb=%x/psm%x/zm%u tex=%x/psm%x/%ux%u/tcc%u/tfx%u/cbp%x test=%llx alpha=%llx sc=(%u,%u)-(%u,%u) clamp=%llx tex1=%llx",
++                              g_ps2xGifCurPath, (unsigned)pr.type, pr.tme, pr.abe, pr.fst, pr.ctxt, c.frame.fbp, c.frame.psm, c.frame.fbmsk, c.zbuf.zbp, c.zbuf.psm, (unsigned)c.zbuf.zmask,
++                              c.tex0.tbp0, c.tex0.psm, 1u << c.tex0.tw, 1u << c.tex0.th, c.tex0.tcc, c.tex0.tfx, c.tex0.cbp,
++                              (unsigned long long)c.test, (unsigned long long)c.alpha, c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1, (unsigned long long)c.clamp, (unsigned long long)c.tex1);
++                L.desc = buf;
++                // PS2X_GS_DUMPRUNS="a,b,..": dump fb + zbuf (640x448) before run a, b...
++                static const std::string s_dumpRuns = []() { const char *e = std::getenv("PS2X_GS_DUMPRUNS"); return std::string(e ? e : ""); }();
++                if (!s_dumpRuns.empty() && m_backend)
++                {
++                    const std::string tok = "," + std::to_string(L.seq) + ",";
++                    if (("," + s_dumpRuns + ",").find(tok) != std::string::npos)
++                    {
++                        const uint32_t W = 640, H = 448;
++                        std::vector<uint8_t> rgb(W * H * 3), zz(W * H);
++                        const uint32_t fbBase = c.frame.fbp * 32u, zBase = c.zbuf.zbp * 32u;
++                        const uint32_t bw = c.frame.fbw ? c.frame.fbw : 10u;
++                        const uint32_t zpsm = 0x30u | (c.zbuf.psm & 0xFu);
++                        uint32_t zmax = 1;
++                        std::vector<uint32_t> zraw(W * H);
++                        for (uint32_t y = 0; y < H; ++y)
++                            for (uint32_t x = 0; x < W; ++x)
++                            {
++                                const uint32_t px = m_backend->ReadVram(c.frame.psm, fbBase, bw, x, y);
++                                rgb[(y * W + x) * 3 + 0] = px & 0xFF;
++                                rgb[(y * W + x) * 3 + 1] = (px >> 8) & 0xFF;
++                                rgb[(y * W + x) * 3 + 2] = (px >> 16) & 0xFF;
++                                const uint32_t z = m_backend->ReadVram(zpsm, zBase, bw, x, y);
++                                zraw[y * W + x] = z;
++                                zmax = std::max(zmax, z);
++                            }
++                        for (uint32_t i = 0; i < W * H; ++i)
++                            zz[i] = static_cast<uint8_t>(std::min<uint64_t>(255u, (uint64_t)zraw[i] * 255u / zmax));
++                        char name[256];
++                        std::snprintf(name, sizeof(name), "build/shots/dr_%llu_fb.ppm", (unsigned long long)L.seq);
++                        if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", W, H); std::fwrite(rgb.data(), 1, rgb.size(), f); std::fclose(f); }
++                        std::snprintf(name, sizeof(name), "build/shots/dr_%llu_z.pgm", (unsigned long long)L.seq);
++                        if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P5\n%u %u\n255\n", W, H); std::fwrite(zz.data(), 1, zz.size(), f); std::fclose(f); }
++                        std::fprintf(stderr, "[gs:dump] run#%llu fb=%x z=%x/psm%x zmax=%u\n", (unsigned long long)L.seq, c.frame.fbp, c.zbuf.zbp, zpsm, zmax);
++                        if (m_prim.tme)
++                        {
++                            const uint32_t tw = 1u << std::min<uint32_t>(c.tex0.tw, 10u), th = 1u << std::min<uint32_t>(c.tex0.th, 10u);
++                            std::vector<uint8_t> trgb(tw * th * 3);
++                            for (uint32_t y = 0; y < th; ++y)
++                                for (uint32_t x = 0; x < tw; ++x)
++                                {
++                                    const uint32_t px = m_backend->ReadVram(c.tex0.psm, c.tex0.tbp0, c.tex0.tbw ? c.tex0.tbw : 1u, x, y);
++                                    trgb[(y * tw + x) * 3 + 0] = px & 0xFF;
++                                    trgb[(y * tw + x) * 3 + 1] = (px >> 8) & 0xFF;
++                                    trgb[(y * tw + x) * 3 + 2] = (px >> 16) & 0xFF;
++                                }
++                            std::snprintf(name, sizeof(name), "build/shots/dr_%llu_tex.ppm", (unsigned long long)L.seq);
++                            if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", tw, th); std::fwrite(trgb.data(), 1, trgb.size(), f); std::fclose(f); }
++                        }
++                    }
++                }
++            }
++            ++L.count;
++            {
++                // PS2X_GS_DUMPVTX=a,b: print every vertex of draw runs a..b (diagnostic).
++                // PS2X_GS_DUMPVTX=t<hex tbp0>: every vertex of runs using that texture (max 4000 prims).
++                static const std::pair<long long, long long> s_dv = []() { long long a = -1, b = -1; if (const char *e = std::getenv("PS2X_GS_DUMPVTX")) { if (e[0] == 't') { a = -2; b = std::strtoll(e + 1, nullptr, 16); } else if (std::sscanf(e, "%lld,%lld", &a, &b) < 2) b = a; } return std::make_pair(a, b); }();
++                static uint32_t s_dvPrims = 0;
++                if (s_dv.first == -2 ? ((long long)c.tex0.tbp0 == s_dv.second && s_dvPrims++ < 4000) : ((long long)L.seq >= s_dv.first && (long long)L.seq <= s_dv.second))
++                    for (int i = 0; i < batch.vertexCount; ++i)
++                    {
++                        const auto &v = batch.vertices[i];
++                        std::fprintf(stderr, "[gs:vtx] run#%llu p%u.%d x=%.2f y=%.2f z=%.0f s=%g t=%g q=%g u=%u v=%u rgba=%02x%02x%02x%02x\n", (unsigned long long)L.seq, L.count, i,
++                                     v.x - L.ofx, v.y - L.ofy, v.z, v.s, v.t, v.q, v.u, v.v, v.r, v.g, v.b, v.a);
++                    }
++            }
++            for (int i = 0; i < batch.vertexCount; ++i)
++            {
++                const auto &v = batch.vertices[i];
++                const float sx = v.x - L.ofx, sy = v.y - L.ofy;
++                L.x0 = std::min(L.x0, sx); L.x1 = std::max(L.x1, sx);
++                L.y0 = std::min(L.y0, sy); L.y1 = std::max(L.y1, sy);
++                L.z0 = std::min(L.z0, v.z); L.z1 = std::max(L.z1, v.z);
++                { const float ss = pr.fst ? (float)v.u / 16.f : (v.q != 0.f ? v.s / v.q : 0.f), tt = pr.fst ? (float)v.v / 16.f : (v.q != 0.f ? v.t / v.q : 0.f);
++                  L.s0 = std::min(L.s0, ss); L.s1 = std::max(L.s1, ss); L.t0s = std::min(L.t0s, tt); L.t1s = std::max(L.t1s, tt); L.q0 = std::min(L.q0, v.q); L.q1 = std::max(L.q1, v.q); }
++            }
++            if (batch.vertexCount == 3)
++            {
++                const auto &a = batch.vertices[0], &b = batch.vertices[1], &d = batch.vertices[2];
++                const float area = std::fabs((b.x - a.x) * (d.y - a.y) - (d.x - a.x) * (b.y - a.y)) * 0.5f;
++                L.maxArea = std::max(L.maxArea, area);
++                static uint32_t s_hugeLogged = 0;
++                if ((a.z > 65535.0 || b.z > 65535.0 || d.z > 65535.0) && s_hugeLogged < 60)
++                {
++                    ++s_hugeLogged;
++                    std::fprintf(stderr, "[gs:huge] run#%llu area=%.0f v0=(%.1f,%.1f,%.0f) v1=(%.1f,%.1f,%.0f) v2=(%.1f,%.1f,%.0f) raw0=(%.1f,%.1f) q=%g,%g,%g\n",
++                                 (unsigned long long)L.seq, area, a.x - L.ofx, a.y - L.ofy, a.z, b.x - L.ofx, b.y - L.ofy, b.z, d.x - L.ofx, d.y - L.ofy, d.z, a.x, a.y, a.q, b.q, d.q);
++                }
++            }
++        }
+         updatePreferredDisplaySourceForDraw(batch);
++        {
++            const auto &c = batch.state.context;
++            const long bp = (long)c.frame.fbp * 32;
++            static uint64_t s_lastKey = ~0ull;
++            const uint64_t key = (uint64_t)c.frame.fbp | ((uint64_t)c.frame.psm << 16) | ((uint64_t)c.tex0.tbp0 << 24) | ((uint64_t)c.frame.fbmsk << 40);
++            if (key != s_lastKey && g_gsWatch.on(bp, bp + (long)(c.frame.fbw ? c.frame.fbw : 1) * 64 * (c.scissor.y1 + 1) * 4 / 256))
++            {
++                ++g_gsWatch.lines;
++                std::fprintf(stderr, "[gs:watch] t=%.3f draw fbp=%x(bp %lx) fbw=%u psm=%x msk=%x prim=%u tme=%u tex=%x/psm%x sc=(%u,%u)-(%u,%u)\n", g_gsWatch.t(), c.frame.fbp, bp, c.frame.fbw,
++                             c.frame.psm, c.frame.fbmsk, (unsigned)batch.state.prim.type, batch.state.prim.tme, c.tex0.tbp0, c.tex0.psm, c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1);
++            }
++            s_lastKey = key;
++        }
++        // PS2X_GS_DUMPTEX="hex,n": debug, on the n-th draw batch using TBP0=hex, dump the texture
++        // (as decoded RGBA via ReadVram, alpha in a second file) to build/shots/tex_<hex>.ppm/.pgm.
++        {
++            static const std::pair<long, long> s_dt = []() { long a = -1, b = 1; if (const char *e = std::getenv("PS2X_GS_DUMPTEX")) std::sscanf(e, "%lx,%ld", &a, &b); return std::make_pair(a, b); }();
++            static long s_dtSeen = 0;
++            const auto &c = batch.state.context;
++            if (s_dt.first >= 0 && batch.state.prim.tme && (long)c.tex0.tbp0 == s_dt.first && ++s_dtSeen == s_dt.second)
++            {
++                const uint32_t tw = 1u << std::min<uint32_t>(c.tex0.tw, 10u), th = 1u << std::min<uint32_t>(c.tex0.th, 10u);
++                std::vector<uint8_t> rgb(tw * th * 3), al(tw * th);
++                for (uint32_t y = 0; y < th; ++y)
++                    for (uint32_t x = 0; x < tw; ++x)
++                    {
++                        const uint32_t px = m_backend->ReadVram(c.tex0.psm, c.tex0.tbp0, c.tex0.tbw ? c.tex0.tbw : 1u, x, y);
++                        uint8_t r, g, b, a;
++                        if (c.tex0.psm == 2u || c.tex0.psm == 0xAu)
++                        { r = (px & 31) << 3; g = ((px >> 5) & 31) << 3; b = ((px >> 10) & 31) << 3; a = (px & 0x8000u) ? 255 : 0; }
++                        else { r = px & 0xFF; g = (px >> 8) & 0xFF; b = (px >> 16) & 0xFF; a = (px >> 24) & 0xFF; }
++                        rgb[(y * tw + x) * 3] = r; rgb[(y * tw + x) * 3 + 1] = g; rgb[(y * tw + x) * 3 + 2] = b; al[y * tw + x] = a;
++                    }
++                char name[128];
++                std::snprintf(name, sizeof(name), "build/shots/tex_%lx.ppm", s_dt.first);
++                if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", tw, th); std::fwrite(rgb.data(), 1, rgb.size(), f); std::fclose(f); }
++                std::snprintf(name, sizeof(name), "build/shots/tex_%lx_a.pgm", s_dt.first);
++                if (FILE *f = std::fopen(name, "wb")) { std::fprintf(f, "P5\n%u %u\n255\n", tw, th); std::fwrite(al.data(), 1, al.size(), f); std::fclose(f); }
++                std::fprintf(stderr, "[gs:dumptex] tbp=%x psm=%x tbw=%u %ux%u tcc=%u tfx=%u ta0=%x aem=%d ta1=%x clamp=%llx tex1=%llx\n", c.tex0.tbp0, c.tex0.psm, c.tex0.tbw, tw, th, c.tex0.tcc, c.tex0.tfx,
++                             m_texa.ta0, (int)m_texa.aem, m_texa.ta1, (unsigned long long)c.clamp, (unsigned long long)c.tex1);
++            }
++        }
++        // PS2X_GS_SKIPTEX="hex,hex": debug, drop textured draws using those TEX0.TBP0 values.
++        static const std::vector<uint32_t> s_skipTex = []() { std::vector<uint32_t> v; if (const char *e = std::getenv("PS2X_GS_SKIPTEX")) { const char *c = e; while (*c) { char *end = nullptr; const unsigned long x = std::strtoul(c, &end, 16); if (end == c) break; v.push_back((uint32_t)x); c = (*end == ',') ? end + 1 : end; } } return v; }();
++        if (!s_skipTex.empty() && batch.state.prim.tme &&
++            std::find(s_skipTex.begin(), s_skipTex.end(), batch.state.context.tex0.tbp0) != s_skipTex.end())
++        {
++            recordDrawDebugEventUnlocked(needed);
++        }
++        else
+         m_backend->Submit(batch);
+         recordDrawDebugEventUnlocked(needed);
+     }
+@@ -1611,6 +2374,14 @@ void GS::vertexKick(bool drawing)
+ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (m_backend)
++        if (g_gsWatch.lo >= 0 && (long)m_bitbltbuf.dbp >= g_gsWatch.lo && (long)m_bitbltbuf.dbp < g_gsWatch.hi && g_gsWatch.lines < 400)
++        {
++            uint32_t nz = 0; uint64_t sum = 0;
++            for (uint32_t i = 0; i + 1 < sizeBytes; i += 2) { const uint16_t v = (uint16_t)(data[i] | (data[i + 1] << 8)); nz += v != 0; sum += v & 0x7FFF; }
++            ++g_gsWatch.lines;
++            std::fprintf(stderr, "[gs:watch] t=%.3f data dbp=%x pos=(%u,%u) bytes=%u nonzero16=%u first=%02x%02x%02x%02x%02x%02x%02x%02x\n", g_gsWatch.t(), m_bitbltbuf.dbp, m_trxpos.dsax, m_trxpos.dsay,
++                         sizeBytes, nz, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
++        }
+         m_backend->UploadImage(data, sizeBytes);
+ }
+ 
+@@ -1629,6 +2400,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ 
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
++    ps2x_vu1async::drainIfOffWorker("gs-readback");
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+@@ -1698,7 +2470,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+     const uint64_t tex1 = batch.state.context.tex1;
+     const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
+     const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
+-    batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
++    // PS2X_GS_NEAREST=1: force point sampling (bilinear = 4 swizzled texel
++    // reads + CLUT lookups per pixel in the CPU rasterizer). Speed over looks.
++    static const bool s_forceNearest = []() {
++        const char *e = std::getenv("PS2X_GS_NEAREST");
++        return e && e[0] == '1';
++    }();
++    batch.state.linearFilter = !s_forceNearest && (mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u);
+     return batch;
+ }
+ 
+@@ -1734,3 +2512,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
+         m_hasPreferredDisplaySource = true;
+     }
+ }
++
++// Opt-in GPU GS backend (PS2X_GS_GPU=1). Kept in this translation unit so no CMake change is needed.
++#include "gs_gpu_backend.inl"
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c0507c73c38a188543d30109ab2506ac4dbc83e6..eae9ad2b1d4801ade6d7df27b7c46027f080af86 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -2,6 +2,9 @@
+ #include <algorithm>
+ #include <cstring>
+ 
++// Diagnostic: GIF path of the packet being processed by drain() (-1 outside drain).
++int g_ps2xGifCurPath = -1;
++
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+     : m_processFn(std::move(processFn))
+ {
+@@ -57,7 +60,9 @@ void GifArbiter::drain()
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+         {
++            g_ps2xGifCurPath = static_cast<int>(pkt.pathId);
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            g_ps2xGifCurPath = -1;
+         }
+     }
+     m_queue.clear();
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_backend.inl b/ps2xRuntime/src/lib/gs/gs_gpu_backend.inl
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8f05f2d9445f90f61352115eed25935a40613bf
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_backend.inl
+@@ -0,0 +1,2224 @@
++// gs_gpu_backend.inl - opt-in OpenGL 3.3 GS renderer (PS2X_GS_GPU=1), stage one.
++//
++// Included at the end of gs_frontend.cpp (instead of being its own translation unit) so
++// that enabling it needs no CMake change / reconfigure. It is only instantiated when the
++// env var PS2X_GS_GPU=1 is set; the CPU rasterizer stays the default and the fallback.
++//
++// Design:
++//  * All GL work runs on one dedicated thread with an offscreen (surfaceless) EGL
++//    context. libEGL is dlopen'ed and every GL entry point comes from eglGetProcAddress,
++//    so nothing new is linked.
++//  * The public GSRasterBackend methods enqueue commands in order; methods whose result
++//    is observable (Present, ReadVram, Snapshot, ClearFramebuffer, local->host) wait.
++//  * An internal GSCpuBackend on the same VRAM handles transfers, CLUT loads, texture
++//    decode, Present (display conversion) and local->host readback.
++//  * Render targets: one 1024x1024 RGBA16F texture per FRAME.fbp (alpha stored as A/128
++//    so DST_ALPHA / FIX / As can be used as GS blend factors). Depth: DEPTH32F per ZBUF.zbp,
++//    storing z / 2^32 (clamped to the Z format max).
++//  * Coherency: targets are uploaded from VRAM when created or stale, and resolved
++//    GPU->VRAM (glReadPixels + swizzled write) before anything reads that memory on the
++//    CPU side: Present, ReadVram/Snapshot, transfers touching it, textures/CLUTs read from
++//    it (render-to-texture), local->local copies. CPU writes mark overlapping targets stale.
++//  * PS2X_GS_SCALE=N (1..4, default 1): internal resolution. Colour targets, depth and the
++//    destination-copy scratch are N*kDim square; draws use an N-times viewport/scissor (vertex
++//    positions stay in GS pixels, so nothing else changes). Resolves to VRAM downsample through
++//    a native-size texture (linear 2x2 average; PS2X_GS_SCALE_RESOLVE=nearest picks one sample),
++//    uploads from VRAM are drawn back up with nearest. Present reads the displayed rectangle
++//    straight from the scaled target when it is current (single CRT, no preferred source);
++//    anything else (FMVs uploaded by transfers, merge circuit, ...) falls back to the native
++//    CPU conversion. Render-to-texture effects sample the native resolve (as on hardware).
++//  * Textures are decoded on the CPU (GSCpuBackend::DecodeTextureRgba) into RGBA8 GL
++//    textures cached by TEX0/TEXA/CLUT hash and validated by per-8KB-page generations.
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GL/glcorearb.h>
++#include <dlfcn.h>
++#include <functional>
++#include <future>
++#include <unordered_map>
++#include "runtime/gs/ps2_gs_memory.h"
++
++namespace
++{
++namespace gsgpu
++{
++#define GSGPU_GL_FUNCS(X)                                              \
++    X(PFNGLGETERRORPROC, glGetError)                                   \
++    X(PFNGLGETSTRINGPROC, glGetString)                                 \
++    X(PFNGLGENTEXTURESPROC, glGenTextures)                             \
++    X(PFNGLDELETETEXTURESPROC, glDeleteTextures)                       \
++    X(PFNGLBINDTEXTUREPROC, glBindTexture)                             \
++    X(PFNGLTEXIMAGE2DPROC, glTexImage2D)                               \
++    X(PFNGLTEXSUBIMAGE2DPROC, glTexSubImage2D)                         \
++    X(PFNGLTEXPARAMETERIPROC, glTexParameteri)                         \
++    X(PFNGLACTIVETEXTUREPROC, glActiveTexture)                         \
++    X(PFNGLGENFRAMEBUFFERSPROC, glGenFramebuffers)                     \
++    X(PFNGLDELETEFRAMEBUFFERSPROC, glDeleteFramebuffers)               \
++    X(PFNGLBINDFRAMEBUFFERPROC, glBindFramebuffer)                     \
++    X(PFNGLFRAMEBUFFERTEXTURE2DPROC, glFramebufferTexture2D)           \
++    X(PFNGLCHECKFRAMEBUFFERSTATUSPROC, glCheckFramebufferStatus)       \
++    X(PFNGLBLITFRAMEBUFFERPROC, glBlitFramebuffer)                     \
++    X(PFNGLREADPIXELSPROC, glReadPixels)                               \
++    X(PFNGLREADBUFFERPROC, glReadBuffer)                               \
++    X(PFNGLDRAWBUFFERPROC, glDrawBuffer)                               \
++    X(PFNGLPIXELSTOREIPROC, glPixelStorei)                             \
++    X(PFNGLVIEWPORTPROC, glViewport)                                   \
++    X(PFNGLSCISSORPROC, glScissor)                                     \
++    X(PFNGLENABLEPROC, glEnable)                                       \
++    X(PFNGLDISABLEPROC, glDisable)                                     \
++    X(PFNGLCLEARPROC, glClear)                                         \
++    X(PFNGLCLEARDEPTHPROC, glClearDepth)                               \
++    X(PFNGLCOLORMASKPROC, glColorMask)                                 \
++    X(PFNGLDEPTHMASKPROC, glDepthMask)                                 \
++    X(PFNGLDEPTHFUNCPROC, glDepthFunc)                                 \
++    X(PFNGLBLENDFUNCSEPARATEPROC, glBlendFuncSeparate)                 \
++    X(PFNGLBLENDEQUATIONSEPARATEPROC, glBlendEquationSeparate)         \
++    X(PFNGLBLENDCOLORPROC, glBlendColor)                               \
++    X(PFNGLCREATESHADERPROC, glCreateShader)                           \
++    X(PFNGLSHADERSOURCEPROC, glShaderSource)                           \
++    X(PFNGLCOMPILESHADERPROC, glCompileShader)                         \
++    X(PFNGLGETSHADERIVPROC, glGetShaderiv)                             \
++    X(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog)                   \
++    X(PFNGLCREATEPROGRAMPROC, glCreateProgram)                         \
++    X(PFNGLATTACHSHADERPROC, glAttachShader)                           \
++    X(PFNGLLINKPROGRAMPROC, glLinkProgram)                             \
++    X(PFNGLGETPROGRAMIVPROC, glGetProgramiv)                           \
++    X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog)                 \
++    X(PFNGLUSEPROGRAMPROC, glUseProgram)                               \
++    X(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation)               \
++    X(PFNGLUNIFORM1IPROC, glUniform1i)                                 \
++    X(PFNGLUNIFORM1FPROC, glUniform1f)                                 \
++    X(PFNGLUNIFORM2FPROC, glUniform2f)                                 \
++    X(PFNGLUNIFORM2IPROC, glUniform2i)                                 \
++    X(PFNGLUNIFORM3FPROC, glUniform3f)                                 \
++    X(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays)                     \
++    X(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray)                     \
++    X(PFNGLGENBUFFERSPROC, glGenBuffers)                               \
++    X(PFNGLBINDBUFFERPROC, glBindBuffer)                               \
++    X(PFNGLBUFFERDATAPROC, glBufferData)                               \
++    X(PFNGLVERTEXATTRIBPOINTERPROC, glVertexAttribPointer)             \
++    X(PFNGLENABLEVERTEXATTRIBARRAYPROC, glEnableVertexAttribArray)     \
++    X(PFNGLDRAWARRAYSPROC, glDrawArrays)                               \
++    X(PFNGLBINDFRAGDATALOCATIONINDEXEDPROC, glBindFragDataLocationIndexed) \
++    X(PFNGLPROVOKINGVERTEXPROC, glProvokingVertex)                     \
++    X(PFNGLFINISHPROC, glFinish)
++
++struct GLApi
++{
++#define GSGPU_DECL(t, n) t n = nullptr;
++    GSGPU_GL_FUNCS(GSGPU_DECL)
++#undef GSGPU_DECL
++};
++
++constexpr int kDim = 1024;     // render target / depth texture size
++constexpr uint32_t kPages = 512; // 4 MiB / 8 KiB
++constexpr int kFloatsPerVertex = 12;
++
++struct PageRange
++{
++    uint32_t first = 0;
++    uint32_t last = 0; // exclusive
++    bool empty() const { return last <= first; }
++    bool overlaps(const PageRange &o) const { return first < o.last && o.first < last; }
++};
++
++inline void pageDims(uint32_t psm, uint32_t &pw, uint32_t &ph)
++{
++    switch (psm)
++    {
++    case GS_PSM_CT16:
++    case GS_PSM_CT16S:
++    case GS_PSM_Z16:
++    case GS_PSM_Z16S:
++        pw = 64; ph = 64; break;
++    case GS_PSM_T8:
++        pw = 128; ph = 64; break;
++    case GS_PSM_T4:
++        pw = 128; ph = 128; break;
++    default: // 32-bit layouts, incl. T8H/T4HL/T4HH
++        pw = 64; ph = 32; break;
++    }
++}
++
++// Conservative set of 8KB pages touched by a rectangle [0,width) x [0,rows) of a buffer.
++inline PageRange pageSpan(uint32_t bpBlocks, uint32_t bw, uint32_t psm, uint32_t width, uint32_t rows)
++{
++    uint32_t pw, ph;
++    pageDims(psm, pw, ph);
++    uint32_t wpx = std::max<uint32_t>(bw * 64u, width);
++    if (wpx == 0)
++        wpx = 64;
++    const uint32_t pagesWide = (wpx + pw - 1u) / pw;
++    const uint32_t pagesHigh = (std::max<uint32_t>(rows, 1u) + ph - 1u) / ph;
++    PageRange r;
++    r.first = (bpBlocks >> 5u) & (kPages - 1u);
++    r.last = r.first + std::min<uint32_t>(kPages, pagesWide * pagesHigh + ((bpBlocks & 31u) ? 1u : 0u));
++    return r;
++}
++
++inline bool envFlag(const char *name)
++{
++    const char *e = std::getenv(name);
++    return e && e[0] == '1';
++}
++
++struct Rect
++{
++    int x0 = 0, y0 = 0, x1 = -1, y1 = -1; // inclusive
++    bool empty() const { return x1 < x0 || y1 < y0; }
++    void add(const Rect &o)
++    {
++        if (o.empty()) return;
++        if (empty()) { *this = o; return; }
++        x0 = std::min(x0, o.x0); y0 = std::min(y0, o.y0);
++        x1 = std::max(x1, o.x1); y1 = std::max(y1, o.y1);
++    }
++};
++
++struct Target
++{
++    uint32_t fbp = 0;
++    uint32_t fbw = 1;
++    uint8_t psm = 0;
++    GLuint tex = 0;
++    uint32_t rows = 0;     // rows [0,rows) are valid on the GPU
++    bool stale = true;     // VRAM is newer than the GPU copy
++    bool gpuDirty = false; // GPU is newer than VRAM inside 'dirty'
++    Rect dirty;
++    PageRange range() const { return pageSpan(fbp << 5u, fbw, psm, 0, std::max<uint32_t>(rows, 1u)); }
++};
++
++struct TexKey
++{
++    uint32_t tbp0 = 0;
++    uint8_t tbw = 0, psm = 0, cpsm = 0, csm = 0, csa = 0, ta0 = 0, ta1 = 0, aem = 0;
++    uint16_t w = 0, h = 0;
++    uint64_t clutHash = 0;
++    uint64_t content = 0; // PS2X_GS_TEXCACHE2: hash of the source VRAM pages (0 when off)
++    bool operator==(const TexKey &o) const
++    {
++        return content == o.content && tbp0 == o.tbp0 && tbw == o.tbw && psm == o.psm && cpsm == o.cpsm && csm == o.csm && csa == o.csa &&
++               ta0 == o.ta0 && ta1 == o.ta1 && aem == o.aem && w == o.w && h == o.h && clutHash == o.clutHash;
++    }
++};
++struct TexKeyHash
++{
++    size_t operator()(const TexKey &k) const
++    {
++        uint64_t h = k.clutHash * 0x9E3779B97F4A7C15ull;
++        auto mix = [&](uint64_t v) { h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); };
++        mix(k.tbp0); mix((uint64_t(k.tbw) << 8) | k.psm); mix((uint64_t(k.cpsm) << 16) | (uint64_t(k.csm) << 8) | k.csa);
++        mix((uint64_t(k.ta0) << 16) | (uint64_t(k.ta1) << 8) | k.aem); mix((uint64_t(k.w) << 16) | k.h); mix(k.content);
++        return static_cast<size_t>(h);
++    }
++};
++struct TexEntry
++{
++    GLuint tex = 0;
++    uint64_t genSum = ~0ull;
++    GLint wrapS = -1, wrapT = -1, filter = -1;
++    std::vector<uint32_t> dbg; // PS2X_GS_TEXCACHE2_CHECK=1 only: decoded texels for compare
++    uint64_t lastUse = 0;      // Present() count when last bound (TEXCACHE2 eviction)
++    uint32_t bytes = 0;
++};
++struct TexFront
++{
++    uint64_t genSum = ~0ull; // page generations when 'content' was hashed
++    uint64_t content = 0;
++};
++
++// Default-on env toggle: unset or anything but '0' = on.
++inline bool envOn(const char *name)
++{
++    const char *e = std::getenv(name);
++    return !(e && e[0] == '0');
++}
++
++inline uint64_t tcMum(uint64_t a, uint64_t b)
++{
++    const __uint128_t r = static_cast<__uint128_t>(a) * b;
++    return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
++}
++
++// 64-bit content hash of one 8 KiB GS page (4 independent lanes, wyhash-style mixing).
++inline uint64_t tcHashPage(const uint8_t *d)
++{
++    uint64_t l0 = 0xa0761d6478bd642full, l1 = 0xe7037ed1a0b428dbull, l2 = 0x8ebc6af09c88c6e3ull, l3 = 0x589965cc75374cc3ull;
++    for (uint32_t i = 0; i < 8192u; i += 64u)
++    {
++        uint64_t w[8];
++        std::memcpy(w, d + i, 64);
++        l0 = tcMum(l0 ^ w[0], w[1] ^ 0x1d8e4e27c47d124full) + w[0];
++        l1 = tcMum(l1 ^ w[2], w[3] ^ 0x9E3779B97F4A7C15ull) + w[2];
++        l2 = tcMum(l2 ^ w[4], w[5] ^ 0xbf58476d1ce4e5b9ull) + w[4];
++        l3 = tcMum(l3 ^ w[6], w[7] ^ 0x94d049bb133111ebull) + w[6];
++    }
++    return tcMum(tcMum(l0, 0x9E3779B97F4A7C15ull) ^ l1, tcMum(l2, 0xbf58476d1ce4e5b9ull) ^ l3);
++}
++
++struct DrawKey
++{
++    GSFrameReg frame{};
++    GSScissorReg scissor{};
++    GSZbufReg zbuf{};
++    GSTex0Reg tex0{};
++    uint64_t clamp = 0, alpha = 0, test = 0, fba = 0, colclamp = 0;
++    uint8_t cls = 0, tme = 0, abe = 0, fge = 0, iip = 0, linear = 0, pabe = 0;
++    GSTexaReg texa{};
++    uint8_t fogR = 0, fogG = 0, fogB = 0;
++    uint16_t tw = 0, th = 0;
++};
++
++inline bool sameKey(const DrawKey &a, const DrawKey &b)
++{
++    return a.frame.fbp == b.frame.fbp && a.frame.fbw == b.frame.fbw && a.frame.psm == b.frame.psm && a.frame.fbmsk == b.frame.fbmsk &&
++           a.scissor.x0 == b.scissor.x0 && a.scissor.x1 == b.scissor.x1 && a.scissor.y0 == b.scissor.y0 && a.scissor.y1 == b.scissor.y1 &&
++           a.zbuf.zbp == b.zbuf.zbp && a.zbuf.psm == b.zbuf.psm && a.zbuf.zmask == b.zbuf.zmask &&
++           a.tex0.tbp0 == b.tex0.tbp0 && a.tex0.tbw == b.tex0.tbw && a.tex0.psm == b.tex0.psm && a.tex0.tw == b.tex0.tw &&
++           a.tex0.th == b.tex0.th && a.tex0.tcc == b.tex0.tcc && a.tex0.tfx == b.tex0.tfx && a.tex0.cbp == b.tex0.cbp &&
++           a.tex0.cpsm == b.tex0.cpsm && a.tex0.csm == b.tex0.csm && a.tex0.csa == b.tex0.csa &&
++           a.clamp == b.clamp && a.alpha == b.alpha && a.test == b.test && a.fba == b.fba && a.colclamp == b.colclamp &&
++           a.cls == b.cls && a.tme == b.tme && a.abe == b.abe && a.fge == b.fge && a.iip == b.iip && a.linear == b.linear &&
++           a.pabe == b.pabe && a.texa.ta0 == b.texa.ta0 && a.texa.aem == b.texa.aem && a.texa.ta1 == b.texa.ta1 &&
++           a.fogR == b.fogR && a.fogG == b.fogG && a.fogB == b.fogB && a.tw == b.tw && a.th == b.th;
++}
++
++const char *kVertexShader = R"(#version 330 core
++layout(location = 0) in vec4 aPos;   // window x, window y, z, fog
++layout(location = 1) in vec4 aColor; // 0..255
++layout(location = 2) in vec4 aStq;
++uniform vec2 uInvSize;
++noperspective out vec4 vColor;
++flat out vec4 vFlatColor;
++noperspective out vec3 vStq;
++noperspective out float vZ;
++noperspective out float vFog;
++void main()
++{
++    gl_Position = vec4(aPos.xy * uInvSize * 2.0 - 1.0, 0.0, 1.0);
++    vColor = aColor;
++    vFlatColor = aColor;
++    vStq = aStq.xyz;
++    vZ = aPos.z;
++    vFog = aPos.w;
++}
++)";
++
++const char *kFragmentShader = R"(#version 330 core
++noperspective in vec4 vColor;
++flat in vec4 vFlatColor;
++noperspective in vec3 vStq;
++noperspective in float vZ;
++noperspective in float vFog;
++uniform sampler2D uTex;
++uniform sampler2D uDst;
++uniform int uIip;
++uniform int uTme;
++uniform int uTfx;
++uniform int uTcc;
++uniform int uFge;
++uniform vec3 uFogCol;
++uniform int uAte;
++uniform int uAtst;
++uniform int uAref;
++uniform int uAtInv;
++uniform int uDate;
++uniform int uDatm;
++uniform int uFba;
++uniform int uAMsb;
++uniform int uCt16;
++uniform float uZmax;
++uniform int uRtt;       // PS2X_GS_SCALE_RTT: uTex is a GS render target (rgb = c/255, a = A/128)
++uniform vec2 uRttScale; // texture size / target texture size
++uniform vec2 uRttEdge;  // half a (scaled) texel in st units, for CLAMP
++uniform ivec2 uRttWrap; // 0 = repeat, 1 = clamp
++uniform int uRttCt24;   // sampled as CT24: alpha from TEXA
++uniform float uRttTa0;
++uniform int uRttAem;
++layout(location = 0, index = 0) out vec4 oColor;
++layout(location = 0, index = 1) out vec4 oFactor;
++void main()
++{
++    vec4 c = (uIip != 0) ? vColor : vFlatColor;
++    c = floor(c + 0.001);
++    if (uTme != 0)
++    {
++        vec2 st = vStq.xy / max(abs(vStq.z), 1e-20);
++        vec4 t;
++        if (uRtt != 0)
++        {
++            st.x = (uRttWrap.x == 0) ? fract(st.x) : clamp(st.x, uRttEdge.x, 1.0 - uRttEdge.x);
++            st.y = (uRttWrap.y == 0) ? fract(st.y) : clamp(st.y, uRttEdge.y, 1.0 - uRttEdge.y);
++            vec4 r = texture(uTex, st * uRttScale);
++            t.rgb = floor(clamp(r.rgb, 0.0, 1.0) * 255.0 + 0.5);
++            if (uRttCt24 != 0)
++                t.a = (uRttAem != 0 && t.r + t.g + t.b == 0.0) ? 0.0 : uRttTa0;
++            else
++                t.a = floor(clamp(r.a, 0.0, 2.0) * 128.0 + 0.5);
++            t.a = min(t.a, 255.0);
++        }
++        else
++            t = floor(texture(uTex, st) * 255.0 + 0.5);
++        if (uTfx == 0) {
++            c.rgb = floor(t.rgb * c.rgb / 128.0);
++            c.a = (uTcc != 0) ? floor(t.a * c.a / 128.0) : c.a;
++        } else if (uTfx == 1) {
++            c.rgb = t.rgb;
++            c.a = (uTcc != 0) ? t.a : c.a;
++        } else if (uTfx == 2) {
++            c.rgb = floor(t.rgb * c.rgb / 128.0) + c.a;
++            c.a = (uTcc != 0) ? t.a + c.a : c.a;
++        } else {
++            c.rgb = floor(t.rgb * c.rgb / 128.0) + c.a;
++            c.a = (uTcc != 0) ? t.a : c.a;
++        }
++        c = clamp(c, 0.0, 255.0);
++    }
++    if (uFge != 0)
++        c.rgb = floor((vFog * c.rgb + (255.0 - vFog) * uFogCol) / 256.0);
++
++    if (uAte != 0)
++    {
++        int a = int(c.a);
++        bool pass = true;
++        if (uAtst == 0) pass = false;
++        else if (uAtst == 2) pass = a < uAref;
++        else if (uAtst == 3) pass = a <= uAref;
++        else if (uAtst == 4) pass = a == uAref;
++        else if (uAtst == 5) pass = a >= uAref;
++        else if (uAtst == 6) pass = a > uAref;
++        else if (uAtst == 7) pass = a != uAref;
++        if (uAtInv != 0) pass = !pass;
++        if (!pass) discard;
++    }
++
++    float dstA = 0.0;
++    if (uDate != 0 || uAMsb != 0)
++        dstA = texelFetch(uDst, ivec2(gl_FragCoord.xy), 0).a * 128.0;
++    if (uDate != 0)
++    {
++        bool msb = dstA >= 127.5;
++        if (msb != (uDatm != 0)) discard;
++    }
++
++    gl_FragDepth = min(max(vZ, 0.0), uZmax) * (1.0 / 4294967296.0);
++
++    float sa = c.a;
++    if (uFba != 0 && sa < 128.0) sa += 128.0;
++    if (uAMsb != 0) sa = mod(sa, 128.0) + (dstA >= 127.5 ? 128.0 : 0.0);
++    if (uCt16 != 0) sa = (sa >= 128.0) ? 128.0 : 0.0;
++    oColor = vec4(c.rgb / 255.0, sa / 128.0);
++    oFactor = vec4(0.0, 0.0, 0.0, c.a / 128.0);
++}
++)";
++
++class GSGpuBackend final : public GSRasterBackend
++{
++public:
++    GSGpuBackend() = default;
++    ~GSGpuBackend() override { stop(); }
++
++    bool start()
++    {
++        std::promise<bool> ready;
++        std::future<bool> fut = ready.get_future();
++        m_thread = std::thread([this, &ready]() { threadMain(ready); });
++        const bool ok = fut.get();
++        if (!ok)
++        {
++            if (m_thread.joinable())
++                m_thread.join();
++        }
++        return ok;
++    }
++
++    // ---- GSRasterBackend -------------------------------------------------
++    void Initialize(uint8_t *vram, uint32_t vramSize) override
++    {
++        runSync([this, vram, vramSize]() {
++            m_vram = vram;
++            m_vramSize = vramSize;
++            m_cpu.Initialize(vram, vramSize);
++            dropAll();
++        });
++    }
++
++    void Reset() override
++    {
++        runSync([this]() {
++            m_cpu.Reset();
++            dropAll();
++            m_clutHash = m_cpu.ClutHash();
++        });
++    }
++
++    void Submit(const GSPrimitiveBatch &batch) override
++    {
++        Cmd c;
++        c.isDraw = true;
++        c.batch = batch;
++        push(std::move(c));
++    }
++
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
++    {
++        post([this, tex0, texclut]() {
++            const uint32_t cbw = (tex0.csm != 0u) ? std::max<uint32_t>(texclut.cbw, 1u) : 1u;
++            const uint32_t rows = (tex0.csm != 0u) ? static_cast<uint32_t>(texclut.cov) + 1u : 16u;
++            resolveOverlapping(pageSpan(tex0.cbp, cbw, tex0.cpsm, 64u, rows), nullptr);
++            m_cpu.LoadClut(tex0, texclut);
++            m_clutHash = m_cpu.ClutHash();
++        });
++    }
++
++    void BeginTransfer(const GSTransferCommand &command) override
++    {
++        post([this, command]() {
++            const auto &b = command.bitbltbuf;
++            const auto &p = command.trxpos;
++            const auto &r = command.trxreg;
++            const PageRange src = pageSpan(b.sbp, b.sbw, b.spsm, uint32_t(p.ssax) + r.rrw, uint32_t(p.ssay) + r.rrh);
++            const PageRange dst = pageSpan(b.dbp, b.dbw, b.dpsm, uint32_t(p.dsax) + r.rrw, uint32_t(p.dsay) + r.rrh);
++            m_xferActive = false;
++            switch (command.direction)
++            {
++            case 0: // host -> local
++                resolveOverlapping(dst, nullptr);
++                m_cpu.BeginTransfer(command);
++                m_xferDst = dst;
++                m_xferActive = true;
++                m_bumpTag = 1; vramWritten(dst);
++                break;
++            case 1: // local -> host
++                resolveOverlapping(src, nullptr);
++                m_cpu.BeginTransfer(command);
++                break;
++            case 2: // local -> local
++                resolveOverlapping(src, nullptr);
++                resolveOverlapping(dst, nullptr);
++                m_cpu.BeginTransfer(command);
++                m_bumpTag = 3; vramWritten(dst);
++                ++m_stats.localCopies;
++                break;
++            default:
++                m_cpu.BeginTransfer(command);
++                break;
++            }
++        });
++    }
++
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
++    {
++        auto buf = std::make_shared<std::vector<uint8_t>>(data, data + sizeBytes);
++        post([this, buf]() {
++            if (m_xferActive)
++                resolveOverlapping(m_xferDst, nullptr);
++            m_cpu.UploadImage(buf->data(), static_cast<uint32_t>(buf->size()));
++            if (m_xferActive)
++                m_bumpTag = 2; vramWritten(m_xferDst);
++        });
++    }
++
++    void Flush() override {}
++
++    void TextureFlush() override
++    {
++        post([this]() { m_cpu.TextureFlush(); });
++    }
++
++    void Sync(GSSyncReason reason) override
++    {
++        // Every observable result already goes through an ordered, waiting command.
++        if (reason == GSSyncReason::Reset)
++            runSync([]() {});
++    }
++
++    PresentationFrame Present(const GSPresentationRequest &request) override
++    {
++        PresentationFrame out;
++        runSync([this, &request, &out]() {
++            ++m_presents;
++            if (!m_presentLazy)
++            {
++                resolveAll();
++                out = m_cpu.Present(request);
++                if (m_scale > 1)
++                    scalePresent(request, out, false, 0);
++                maybePrintStats();
++                return;
++            }
++            // PS2X_GS_PRESENT_LAZY: only make the memory Present can read current (display
++            // buffers, preferred source, context frames when a display is at fbp 0), and reuse
++            // the last converted frame when neither those pages nor the request changed.
++            PageRange rs[6];
++            int ctxN = 0;
++            int n = presentReadSet(request, rs, &ctxN);
++            // The context frames are only read when a single enabled display at fbp 0 comes out
++            // all black; resolve them up front only when both CRTs are on (merge path).
++            const bool bothCrt = (request.pmode & 3u) == 3u;
++            bool ctxDeferred = ctxN > 0 && !bothCrt && m_presentCtxLazy;
++            if (!ctxDeferred)
++                n += ctxN;
++            const bool fieldMode = (request.smode2 & 1u) != 0u && (request.smode2 & 2u) == 0u;
++            const int slot = fieldMode ? static_cast<int>(request.vsyncTick & 1u) : 0;
++            uint64_t gs = 0x51ed270b27a3c1f5ull;
++            m_rctx = 1;
++            for (int i = 0; i < n; ++i)
++                resolveOverlapping(rs[i], nullptr);
++            m_rctx = 0;
++            for (int i = 0; i < n; ++i)
++                gs = tcMum(gs ^ pageGenSum(rs[i]), 0x9E3779B97F4A7C15ull + static_cast<uint64_t>(i) * 0x1000193ull + rs[i].first);
++            if (m_statsOn && m_pcValid[slot] && gs != m_pcGen[slot] && m_presentDiag < 60 && m_presents > 2000)
++            {
++                ++m_presentDiag;
++                std::string tagsSeen;
++                for (int i = 0; i < n; ++i)
++                    for (uint32_t pg = rs[i].first; pg < rs[i].last; ++pg)
++                    {
++                        const uint32_t ix = pg & (kPages - 1u);
++                        if (m_pageGen[ix] != m_lastPageGenSnap[ix])
++                        {
++                            char b[48];
++                            std::snprintf(b, sizeof b, " p%u:t%u", ix, m_pageBumpTag[ix]);
++                            if (tagsSeen.size() < 400) tagsSeen += b;
++                        }
++                    }
++                std::fprintf(stderr, "[gs:gpu:presentdiag] present#%llu changed:%s\n", (unsigned long long)m_presents, tagsSeen.c_str());
++            }
++            if (m_statsOn && m_pcValid[slot] && gs == m_pcGen[slot] && !samePresentRequest(request, m_pcReq[slot], ctxDeferred) && m_presentDiag < 120)
++            {
++                ++m_presentDiag;
++                const auto &a = request; const auto &b = m_pcReq[slot];
++                std::fprintf(stderr, "[gs:gpu:presentdiag] reqdiff pmode=%d smode2=%llx/%llx disp=%d%d%d%d bg=%d tick=%llu/%llu pref=%d/%d dest=%u/%u prefFbp=%u/%u ctxDeferred=%d\n",
++                             a.pmode != b.pmode, (unsigned long long)a.smode2, (unsigned long long)b.smode2, a.dispfb1 != b.dispfb1,
++                             a.display1 != b.display1, a.dispfb2 != b.dispfb2, a.display2 != b.display2, a.bgcolor != b.bgcolor,
++                             (unsigned long long)a.vsyncTick, (unsigned long long)b.vsyncTick, a.hasPreferredSource, b.hasPreferredSource,
++                             a.preferredDestFbp, b.preferredDestFbp, a.preferredSource.fbp, b.preferredSource.fbp, ctxDeferred ? 1 : 0);
++            }
++            if (m_statsOn)
++                m_lastPageGenSnap = m_pageGen;
++            bool reused = false;
++            if (m_pcValid[slot] && gs == m_pcGen[slot] && samePresentRequest(request, m_pcReq[slot], ctxDeferred))
++            {
++                out = m_pcFrame[slot];
++                ++m_stats.presentReuse;
++                reused = true;
++            }
++            else
++            {
++                out = m_cpu.PresentInPlace(request);
++                bool cacheable = true;
++                if (ctxDeferred && (out.pixels.empty() || out.sourceFbp != out.displayFbp || presentAllBlack(out)))
++                {
++                    // Fallback may have looked at the (unresolved) context frames: redo it with
++                    // them current, and don't reuse this frame later.
++                    m_rctx = 1;
++                    for (int i = 0; i < ctxN; ++i)
++                        resolveOverlapping(rs[n + i], nullptr);
++                    m_rctx = 0;
++                    out = m_cpu.PresentInPlace(request);
++                    cacheable = false;
++                    ++m_stats.presentCtxRedo;
++                }
++                m_pcFrame[slot] = out;
++                m_pcReq[slot] = request;
++                m_pcGen[slot] = gs;
++                m_pcValid[slot] = cacheable;
++                ++m_stats.presentConvert;
++            }
++            if (m_presentCheck)
++            {
++                // Debug: full resolve + the original snapshot Present, compared with what we return.
++                resolveAll();
++                const PresentationFrame ref = m_cpu.Present(request);
++                ++m_stats.presentChecks;
++                if (ref.width != out.width || ref.height != out.height || ref.pixels != out.pixels ||
++                    ref.displayFbp != out.displayFbp || ref.sourceFbp != out.sourceFbp || ref.usedPreferred != out.usedPreferred)
++                {
++                    ++m_stats.presentMismatches;
++                    size_t diff = 0;
++                    for (size_t i = 0; i < ref.pixels.size() && i < out.pixels.size(); ++i)
++                        diff += ref.pixels[i] != out.pixels[i];
++                    if (++m_presentMismatchTotal <= 30)
++                        std::fprintf(stderr, "[gs:gpu:presentcheck] MISMATCH reuse=%d %ux%u vs %ux%u bytes-differ=%zu dispfb1=%llx dispfb2=%llx\n",
++                                     (m_stats.presentReuse && gs == m_pcGen[slot]) ? 1 : 0, out.width, out.height, ref.width, ref.height, diff,
++                                     (unsigned long long)request.dispfb1, (unsigned long long)request.dispfb2);
++                    out = ref;
++                    m_pcValid[slot] = false;
++                }
++            }
++            if (m_scale > 1)
++                scalePresent(request, out, reused, slot);
++            maybePrintStats();
++        });
++        return out;
++    }
++
++    // PS2X_GS_SCALE > 1: replace the native frame by the displayed rectangle read straight from
++    // the scaled render target, when that target holds the displayed picture. Otherwise the
++    // native frame is kept (the host scales it to the window).
++    void scalePresent(const GSPresentationRequest &request, PresentationFrame &out, bool reused, int slot)
++    {
++        if (!out || out.usedPreferred)
++        {
++            m_scaledValid[slot] = false;
++            ++m_scaledFallbacks;
++            return;
++        }
++        if (reused && m_scaledValid[slot])
++        {
++            out = m_scaledFrame[slot];
++            return;
++        }
++        m_scaledValid[slot] = false;
++        const bool crt1 = (request.pmode & 1u) != 0u, crt2 = (request.pmode & 2u) != 0u;
++        const uint64_t dispfb = crt1 ? request.dispfb1 : request.dispfb2;
++        const uint32_t fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
++        const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
++        const uint8_t psm = static_cast<uint8_t>((dispfb >> 15) & 0x1Fu);
++        const int dbx = static_cast<int>((dispfb >> 32) & 0x7FFu), dby = static_cast<int>((dispfb >> 43) & 0x7FFu);
++        auto it = m_targets.find(fbp);
++        const char *why = nullptr;
++        if (crt1 && crt2) why = "both CRTs";
++        else if (out.sourceFbp != fbp) why = "source is not the display buffer";
++        else if (it == m_targets.end()) why = "no GPU target";
++        else if (it->second.stale) why = "target stale (CPU wrote it)";
++        else if (it->second.psm != psm || it->second.fbw != std::max<uint32_t>(fbw, 1u)) why = "format differs";
++        else if (static_cast<uint32_t>(dby) + out.height > it->second.rows || dbx + static_cast<int>(out.width) > kDim) why = "outside target";
++        if (why)
++        {
++            ++m_scaledFallbacks;
++            if (m_scaleLog < 12 && std::strcmp(why, m_lastScaleWhy ? m_lastScaleWhy : "") != 0)
++            {
++                ++m_scaleLog;
++                std::fprintf(stderr, "[gs:gpu:scale] native present (%s) fbp=%u psm=%u present#%llu\n", why, fbp, psm,
++                             (unsigned long long)m_presents);
++            }
++            m_lastScaleWhy = why;
++            return;
++        }
++        m_lastScaleWhy = nullptr;
++        const int S = m_scale;
++        const int w = static_cast<int>(out.width) * S, h = static_cast<int>(out.height) * S;
++        PresentationFrame f;
++        f.width = static_cast<uint32_t>(w);
++        f.height = static_cast<uint32_t>(h);
++        f.displayFbp = out.displayFbp;
++        f.sourceFbp = out.sourceFbp;
++        f.pixels.resize(static_cast<size_t>(w) * h * 4u);
++        gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, m_readFbo);
++        gl.glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, it->second.tex, 0);
++        gl.glReadBuffer(GL_COLOR_ATTACHMENT0);
++        gl.glReadPixels(dbx * S, dby * S, w, h, GL_RGBA, GL_UNSIGNED_BYTE, f.pixels.data());
++        for (size_t i = 3; i < f.pixels.size(); i += 4)
++            f.pixels[i] = 255u;
++        out = std::move(f);
++        m_scaledFrame[slot] = out;
++        m_scaledValid[slot] = true;
++        ++m_scaledPresents;
++    }
++    int m_scaleLog = 0;
++    const char *m_lastScaleWhy = nullptr;
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
++    {
++        bool result = false;
++        runSync([this, &context, rgba, &result]() {
++            const PageRange r = pageSpan(context.frame.fbp << 5u, std::max<uint32_t>(context.frame.fbw, 1u), context.frame.psm,
++                                         0u, static_cast<uint32_t>(context.scissor.y1) + 1u);
++            resolveOverlapping(r, nullptr);
++            result = m_cpu.ClearFramebuffer(context, rgba);
++            m_bumpTag = 4; vramWritten(r);
++        });
++        return result;
++    }
++
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override
++    {
++        uint32_t n = 0;
++        runSync([this, dst, maxBytes, &n]() { n = m_cpu.ConsumeLocalToHostBytes(dst, maxBytes); });
++        return n;
++    }
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
++    {
++        auto *self = const_cast<GSGpuBackend *>(this);
++        uint32_t v = 0;
++        self->runSync([self, psm, base, bw, x, y, &v]() {
++            self->resolveOverlapping(pageSpan(base, bw, psm, x + 1u, y + 1u), nullptr);
++            v = self->m_cpu.ReadVram(psm, base, bw, x, y);
++        });
++        return v;
++    }
++
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
++    {
++        post([this, psm, base, bw, x, y, value]() {
++            const PageRange r = pageSpan(base, bw, psm, x + 1u, y + 1u);
++            resolveOverlapping(r, nullptr);
++            m_cpu.WriteVram(psm, base, bw, x, y, value);
++            m_bumpTag = 5; vramWritten(r);
++        });
++    }
++
++    void SnapshotVram(std::vector<uint8_t> &out) const override
++    {
++        auto *self = const_cast<GSGpuBackend *>(this);
++        self->runSync([self, &out]() {
++            self->resolveAll();
++            self->m_cpu.SnapshotVram(out);
++        });
++    }
++
++    GSTransferSnapshot GetTransferSnapshot() const override
++    {
++        // Debug/progress info only; GSCpuBackend guards it with its own mutex.
++        return m_cpu.GetTransferSnapshot();
++    }
++
++private:
++    struct Cmd
++    {
++        bool isDraw = false;
++        GSPrimitiveBatch batch{};
++        std::function<void()> fn;
++    };
++
++    struct Stats
++    {
++        uint64_t prims = 0, batches = 0, resolves = 0, resolvedPixels = 0, uploads = 0, texDecodes = 0, texHits = 0,
++                 localCopies = 0, dstCopies = 0, texHashes = 0, pageHashes = 0, texChecks = 0, texMismatches = 0, texEvicts = 0, presentReuse = 0, presentConvert = 0, presentChecks = 0, presentMismatches = 0, presentCtxRedo = 0;
++        uint64_t resolveBy[4] = {0, 0, 0, 0};
++    };
++
++    // ---- queue -------------------------------------------------------------
++    uint64_t push(Cmd &&c)
++    {
++        std::unique_lock<std::mutex> lk(m_qm);
++        if (m_queue.size() >= kMaxQueue)
++        {
++            const auto t0 = std::chrono::steady_clock::now();
++            m_spaceCv.wait(lk, [&]() { return m_queue.size() < kMaxQueue || m_stop; });
++            m_fullWaitNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
++        }
++        m_queue.push_back(std::move(c));
++        const uint64_t seq = ++m_pushed;
++        lk.unlock();
++        m_qcv.notify_one();
++        return seq;
++    }
++
++    template <typename F>
++    uint64_t post(F &&f)
++    {
++        Cmd c;
++        c.isDraw = false;
++        c.fn = std::forward<F>(f);
++        return push(std::move(c));
++    }
++
++    template <typename F>
++    void runSync(F &&f)
++    {
++        if (std::this_thread::get_id() == m_threadId)
++        {
++            flushDraws();
++            f();
++            return;
++        }
++        const uint64_t seq = post(std::forward<F>(f));
++        const auto t0 = std::chrono::steady_clock::now();
++        std::unique_lock<std::mutex> lk(m_qm);
++        m_doneCv.wait(lk, [&]() { return m_done >= seq || m_stop; });
++        m_syncWaitNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
++    }
++
++    void stop()
++    {
++        {
++            std::lock_guard<std::mutex> lk(m_qm);
++            m_stop = true;
++        }
++        m_qcv.notify_all();
++        m_spaceCv.notify_all();
++        m_doneCv.notify_all();
++        if (m_thread.joinable())
++            m_thread.join();
++    }
++
++    void threadMain(std::promise<bool> &ready)
++    {
++        m_threadId = std::this_thread::get_id();
++        pthread_setname_np(pthread_self(), "GSGpu"); // thread CPU% in PS2X_PROF
++        const bool ok = initGL();
++        ready.set_value(ok);
++        if (!ok)
++            return;
++        std::vector<Cmd> local;
++        local.reserve(kMaxQueue);
++        for (;;)
++        {
++            {
++                std::unique_lock<std::mutex> lk(m_qm);
++                m_qcv.wait(lk, [&]() { return !m_queue.empty() || m_stop; });
++                if (m_stop && m_queue.empty())
++                    break;
++                local.swap(m_queue);
++            }
++            m_spaceCv.notify_all();
++            const auto busy0 = std::chrono::steady_clock::now();
++            for (Cmd &c : local)
++            {
++                if (c.isDraw)
++                    appendDraw(c.batch);
++                else
++                {
++                    flushDraws();
++                    c.fn();
++                }
++            }
++            const uint64_t n = local.size();
++            local.clear();
++            m_busyNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busy0).count());
++            {
++                std::lock_guard<std::mutex> lk(m_qm);
++                m_done += n;
++            }
++            m_doneCv.notify_all();
++        }
++        shutdownGL();
++    }
++
++    // ---- GL setup ------------------------------------------------------------
++    bool initGL()
++    {
++        m_eglLib = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
++        if (!m_eglLib)
++        {
++            std::fprintf(stderr, "[gs:gpu] dlopen libEGL.so.1 failed: %s\n", dlerror());
++            return false;
++        }
++#define GSGPU_EGL(n) auto n##_p = reinterpret_cast<decltype(&::n)>(dlsym(m_eglLib, #n))
++        GSGPU_EGL(eglGetProcAddress);
++        GSGPU_EGL(eglGetDisplay);
++        GSGPU_EGL(eglInitialize);
++        GSGPU_EGL(eglBindAPI);
++        GSGPU_EGL(eglChooseConfig);
++        GSGPU_EGL(eglCreateContext);
++        GSGPU_EGL(eglMakeCurrent);
++        GSGPU_EGL(eglGetError);
++#undef GSGPU_EGL
++        m_eglDestroyContext = reinterpret_cast<decltype(&::eglDestroyContext)>(dlsym(m_eglLib, "eglDestroyContext"));
++        m_eglTerminate = reinterpret_cast<decltype(&::eglTerminate)>(dlsym(m_eglLib, "eglTerminate"));
++        m_eglMakeCurrent = eglMakeCurrent_p;
++        if (!eglGetProcAddress_p || !eglGetDisplay_p || !eglInitialize_p || !eglBindAPI_p || !eglChooseConfig_p ||
++            !eglCreateContext_p || !eglMakeCurrent_p || !eglGetError_p)
++        {
++            std::fprintf(stderr, "[gs:gpu] libEGL is missing core entry points\n");
++            return false;
++        }
++
++        auto getPlatformDisplay = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(eglGetProcAddress_p("eglGetPlatformDisplayEXT"));
++        EGLint major = 0, minor = 0;
++        m_dpy = EGL_NO_DISPLAY;
++        if (getPlatformDisplay && !envFlag("PS2X_GS_GPU_DEFAULT_DISPLAY"))
++        {
++            m_dpy = getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
++            if (m_dpy != EGL_NO_DISPLAY && !eglInitialize_p(m_dpy, &major, &minor))
++                m_dpy = EGL_NO_DISPLAY;
++        }
++        if (m_dpy == EGL_NO_DISPLAY)
++        {
++            m_dpy = eglGetDisplay_p(EGL_DEFAULT_DISPLAY);
++            if (m_dpy == EGL_NO_DISPLAY || !eglInitialize_p(m_dpy, &major, &minor))
++            {
++                std::fprintf(stderr, "[gs:gpu] eglInitialize failed (0x%x)\n", eglGetError_p());
++                m_dpy = EGL_NO_DISPLAY;
++                return false;
++            }
++        }
++        if (!eglBindAPI_p(EGL_OPENGL_API))
++        {
++            std::fprintf(stderr, "[gs:gpu] eglBindAPI(OpenGL) failed\n");
++            return false;
++        }
++        EGLConfig config = nullptr;
++        EGLint numConfigs = 0;
++        const EGLint cfgAttribs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE};
++        if (!eglChooseConfig_p(m_dpy, cfgAttribs, &config, 1, &numConfigs) || numConfigs < 1)
++        {
++            const EGLint cfgAttribs2[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE};
++            numConfigs = 0;
++            if (!eglChooseConfig_p(m_dpy, cfgAttribs2, &config, 1, &numConfigs) || numConfigs < 1)
++                config = nullptr; // EGL_KHR_no_config_context
++        }
++        const EGLint ctxAttribs[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
++                                     EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE};
++        m_ctx = eglCreateContext_p(m_dpy, config, EGL_NO_CONTEXT, ctxAttribs);
++        if (m_ctx == EGL_NO_CONTEXT)
++        {
++            std::fprintf(stderr, "[gs:gpu] eglCreateContext(GL 3.3 core) failed (0x%x)\n", eglGetError_p());
++            return false;
++        }
++        if (!eglMakeCurrent_p(m_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, m_ctx))
++        {
++            std::fprintf(stderr, "[gs:gpu] eglMakeCurrent(surfaceless) failed (0x%x)\n", eglGetError_p());
++            return false;
++        }
++        bool missing = false;
++#define GSGPU_LOAD(t, n)                                                         \
++    gl.n = reinterpret_cast<t>(eglGetProcAddress_p(#n));                          \
++    if (!gl.n) { std::fprintf(stderr, "[gs:gpu] missing GL entry point %s\n", #n); missing = true; }
++        GSGPU_GL_FUNCS(GSGPU_LOAD)
++#undef GSGPU_LOAD
++        if (missing)
++            return false;
++
++        std::fprintf(stderr, "[gs:gpu] OpenGL renderer: %s | %s (EGL %d.%d)\n",
++                     reinterpret_cast<const char *>(gl.glGetString(GL_RENDERER)),
++                     reinterpret_cast<const char *>(gl.glGetString(GL_VERSION)), major, minor);
++
++        if (!buildProgram())
++            return false;
++
++        gl.glGenVertexArrays(1, &m_vao);
++        gl.glBindVertexArray(m_vao);
++        gl.glGenBuffers(1, &m_vbo);
++        gl.glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
++        const GLsizei stride = kFloatsPerVertex * sizeof(float);
++        gl.glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void *>(0));
++        gl.glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void *>(4 * sizeof(float)));
++        gl.glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void *>(8 * sizeof(float)));
++        gl.glEnableVertexAttribArray(0);
++        gl.glEnableVertexAttribArray(1);
++        gl.glEnableVertexAttribArray(2);
++        gl.glProvokingVertex(GL_LAST_VERTEX_CONVENTION);
++
++        gl.glGenFramebuffers(1, &m_drawFbo);
++        gl.glGenFramebuffers(1, &m_readFbo);
++        gl.glGenFramebuffers(1, &m_scratchFbo);
++        m_scratchTex = makeColorTexture();
++        gl.glBindFramebuffer(GL_FRAMEBUFFER, m_scratchFbo);
++        gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_scratchTex, 0);
++        if (m_scale > 1)
++        {
++            gl.glGenFramebuffers(1, &m_nativeFbo);
++            m_nativeTex = makeColorTexture(kDim);
++            gl.glBindFramebuffer(GL_FRAMEBUFFER, m_nativeFbo);
++            gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_nativeTex, 0);
++            std::fprintf(stderr, "[gs:gpu] internal resolution %dx (targets %dx%d, resolve %s)\n", m_scale, kDim * m_scale,
++                         kDim * m_scale, m_resolveNearest ? "nearest" : "linear");
++        }
++        gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        gl.glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        gl.glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++        if (const GLenum err = gl.glGetError(); err != GL_NO_ERROR)
++            std::fprintf(stderr, "[gs:gpu] GL error after init: 0x%x\n", err);
++        m_statsOn = envFlag("PS2X_GS_GPU_STATS");
++        m_lastStats = std::chrono::steady_clock::now();
++        return true;
++    }
++
++    void shutdownGL()
++    {
++        dropAll();
++        if (m_dpy != EGL_NO_DISPLAY)
++        {
++            if (m_eglMakeCurrent)
++                m_eglMakeCurrent(m_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++            if (m_ctx != EGL_NO_CONTEXT && m_eglDestroyContext)
++                m_eglDestroyContext(m_dpy, m_ctx);
++        }
++        m_ctx = EGL_NO_CONTEXT;
++        m_dpy = EGL_NO_DISPLAY;
++    }
++
++    GLuint compile(GLenum type, const char *src)
++    {
++        GLuint sh = gl.glCreateShader(type);
++        gl.glShaderSource(sh, 1, &src, nullptr);
++        gl.glCompileShader(sh);
++        GLint ok = 0;
++        gl.glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
++        if (!ok)
++        {
++            char log[4096] = {};
++            gl.glGetShaderInfoLog(sh, sizeof(log), nullptr, log);
++            std::fprintf(stderr, "[gs:gpu] shader compile failed:\n%s\n", log);
++            return 0;
++        }
++        return sh;
++    }
++
++    bool buildProgram()
++    {
++        GLuint vs = compile(GL_VERTEX_SHADER, kVertexShader);
++        GLuint fs = compile(GL_FRAGMENT_SHADER, kFragmentShader);
++        if (!vs || !fs)
++            return false;
++        m_prog = gl.glCreateProgram();
++        gl.glAttachShader(m_prog, vs);
++        gl.glAttachShader(m_prog, fs);
++        gl.glLinkProgram(m_prog);
++        GLint ok = 0;
++        gl.glGetProgramiv(m_prog, GL_LINK_STATUS, &ok);
++        if (!ok)
++        {
++            char log[4096] = {};
++            gl.glGetProgramInfoLog(m_prog, sizeof(log), nullptr, log);
++            std::fprintf(stderr, "[gs:gpu] program link failed:\n%s\n", log);
++            return false;
++        }
++        gl.glUseProgram(m_prog);
++#define GSGPU_U(n) u.n = gl.glGetUniformLocation(m_prog, #n)
++        GSGPU_U(uInvSize); GSGPU_U(uTex); GSGPU_U(uDst); GSGPU_U(uIip); GSGPU_U(uTme); GSGPU_U(uTfx); GSGPU_U(uTcc);
++        GSGPU_U(uFge); GSGPU_U(uFogCol); GSGPU_U(uAte); GSGPU_U(uAtst); GSGPU_U(uAref); GSGPU_U(uAtInv); GSGPU_U(uDate);
++        GSGPU_U(uDatm); GSGPU_U(uFba); GSGPU_U(uAMsb); GSGPU_U(uCt16); GSGPU_U(uZmax);
++        GSGPU_U(uRtt); GSGPU_U(uRttScale); GSGPU_U(uRttEdge); GSGPU_U(uRttWrap); GSGPU_U(uRttCt24); GSGPU_U(uRttTa0);
++        GSGPU_U(uRttAem);
++#undef GSGPU_U
++        gl.glUniform1i(u.uTex, 0);
++        gl.glUniform1i(u.uDst, 1);
++        gl.glUniform2f(u.uInvSize, 1.0f / kDim, 1.0f / kDim);
++        return true;
++    }
++
++    GLuint makeColorTexture(int dim = 0)
++    {
++        if (dim <= 0)
++            dim = kDim * m_scale;
++        GLuint t = 0;
++        gl.glGenTextures(1, &t);
++        gl.glBindTexture(GL_TEXTURE_2D, t);
++        gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, dim, dim, 0, GL_RGBA, GL_FLOAT, nullptr);
++        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        return t;
++    }
++
++    void dropAll()
++    {
++        if (!gl.glDeleteTextures)
++            return;
++        for (auto &kv : m_targets)
++            gl.glDeleteTextures(1, &kv.second.tex);
++        m_targets.clear();
++        for (auto &kv : m_depth)
++            gl.glDeleteTextures(1, &kv.second);
++        m_depth.clear();
++        for (auto &kv : m_texCache)
++            gl.glDeleteTextures(1, &kv.second.tex);
++        m_texCache.clear();
++        m_verts.clear();
++        m_haveKey = false;
++        m_attachedColor = m_attachedDepth = 0;
++        m_pageGen.fill(0);
++        m_pageHashGen.fill(0);
++        m_texFront.clear();
++        m_texBytes = 0;
++        ++m_globalGen;
++    }
++
++    // ---- VRAM coherency -------------------------------------------------------
++    void bumpPages(const PageRange &r)
++    {
++        for (uint32_t p = r.first; p < r.last; ++p)
++        {
++            ++m_pageGen[p & (kPages - 1u)];
++            m_pageBumpTag[p & (kPages - 1u)] = m_bumpTag;
++        }
++        m_bumpTag = 0;
++    }
++
++    uint64_t pageGenSum(const PageRange &r) const
++    {
++        uint64_t s = m_globalGen << 40;
++        for (uint32_t p = r.first; p < r.last; ++p)
++            s += m_pageGen[p & (kPages - 1u)] * (p + 1u);
++        return s;
++    }
++
++    // CPU side just wrote 'r' in VRAM: GPU copies of it are stale, textures from it too.
++    void vramWritten(const PageRange &r)
++    {
++        bumpPages(r);
++        for (auto &kv : m_targets)
++        {
++            Target &t = kv.second;
++            if (t.range().overlaps(r))
++            {
++                if (t.gpuDirty) // should have been resolved by the caller; never drop GPU data
++                    resolve(t);
++                t.stale = true;
++            }
++        }
++    }
++
++    void resolveOverlapping(const PageRange &r, const Target *except)
++    {
++        for (auto &kv : m_targets)
++        {
++            Target &t = kv.second;
++            if (&t != except && t.gpuDirty && t.range().overlaps(r))
++                resolve(t);
++        }
++    }
++
++    void resolveAll()
++    {
++        for (auto &kv : m_targets)
++            if (kv.second.gpuDirty)
++                resolve(kv.second);
++    }
++
++    void resolve(Target &t)
++    {
++        if (!t.gpuDirty)
++            return;
++        t.gpuDirty = false;
++        const int w = std::min<int>(kDim, static_cast<int>(t.fbw) * 64);
++        Rect rc = t.dirty;
++        rc.x0 = std::max(rc.x0, 0);
++        rc.y0 = std::max(rc.y0, 0);
++        rc.x1 = std::min(rc.x1, w - 1);
++        rc.y1 = std::min(rc.y1, static_cast<int>(t.rows) - 1);
++        t.dirty = Rect{};
++        if (rc.empty() || !m_vram)
++            return;
++        const int rw = rc.x1 - rc.x0 + 1;
++        const int rh = rc.y1 - rc.y0 + 1;
++        m_readback.resize(static_cast<size_t>(rw) * rh * 4u);
++        gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, m_readFbo);
++        gl.glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
++        gl.glReadBuffer(GL_COLOR_ATTACHMENT0);
++        if (m_scale > 1)
++        {
++            // Downsample the scaled rectangle into the native scratch, then read that.
++            const int S = m_scale;
++            gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_nativeFbo);
++            gl.glDisable(GL_SCISSOR_TEST);
++            gl.glBlitFramebuffer(rc.x0 * S, rc.y0 * S, (rc.x1 + 1) * S, (rc.y1 + 1) * S, rc.x0, rc.y0, rc.x1 + 1, rc.y1 + 1,
++                                 GL_COLOR_BUFFER_BIT, m_resolveNearest ? GL_NEAREST : GL_LINEAR);
++            gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_drawFbo);
++            gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, m_nativeFbo);
++            gl.glReadBuffer(GL_COLOR_ATTACHMENT0);
++        }
++        gl.glReadPixels(rc.x0, rc.y0, rw, rh, GL_RGBA, GL_FLOAT, m_readback.data());
++        const uint32_t bp = t.fbp << 5u;
++        const uint32_t bw = t.fbw;
++        const float *src = m_readback.data();
++        auto to8 = [](float v, float scale) -> uint32_t {
++            float f = v * scale + 0.5f;
++            f = f < 0.0f ? 0.0f : (f > 255.0f ? 255.0f : f);
++            return static_cast<uint32_t>(f);
++        };
++        for (int y = 0; y < rh; ++y)
++        {
++            const uint32_t gy = static_cast<uint32_t>(rc.y0 + y);
++            for (int x = 0; x < rw; ++x, src += 4)
++            {
++                const uint32_t gx = static_cast<uint32_t>(rc.x0 + x);
++                const uint32_t r = to8(src[0], 255.0f), g = to8(src[1], 255.0f), b = to8(src[2], 255.0f);
++                const uint32_t a = to8(src[3], 128.0f);
++                switch (t.psm)
++                {
++                case GS_PSM_CT32:
++                    GSMem::WriteCT32(m_vram, bp, bw, gx, gy, r | (g << 8) | (b << 16) | (a << 24));
++                    break;
++                case GS_PSM_CT24:
++                    GSMem::WriteCT24(m_vram, bp, bw, gx, gy, r | (g << 8) | (b << 16));
++                    break;
++                case GS_PSM_CT16:
++                case GS_PSM_CT16S:
++                {
++                    const uint32_t v = (r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >= 0x80u ? 1u : 0u) << 15);
++                    if (t.psm == GS_PSM_CT16)
++                        GSMem::WriteCT16(m_vram, bp, bw, gx, gy, v);
++                    else
++                        GSMem::WriteCT16S(m_vram, bp, bw, gx, gy, v);
++                    break;
++                }
++                default:
++                    m_cpu.WriteVram(t.psm, bp, bw, gx, gy, r | (g << 8) | (b << 16) | (a << 24));
++                    break;
++                }
++            }
++        }
++        m_bumpTag = 16 + (t.fbp & 0xFFF) * 32; bumpPages(pageSpan(bp, bw, t.psm, 0, static_cast<uint32_t>(rc.y1) + 1u));
++        ++m_stats.resolves;
++        ++m_stats.resolveBy[m_rctx & 3];
++        if (m_statsOn && m_resolveLog < 40 && m_presents > 2000)
++        {
++            ++m_resolveLog;
++            std::fprintf(stderr, "[gs:gpu:resolve] ctx=%d fbp=%u fbw=%u psm=%u rect=%d,%d-%d,%d present#%llu\n", m_rctx, t.fbp, t.fbw, t.psm,
++                         rc.x0, rc.y0, rc.x1, rc.y1, (unsigned long long)m_presents);
++        }
++        m_stats.resolvedPixels += static_cast<uint64_t>(rw) * rh;
++    }
++
++    void uploadRows(Target &t, uint32_t from, uint32_t to)
++    {
++        if (to <= from || !m_vram)
++            return;
++        const int w = std::min<int>(kDim, static_cast<int>(t.fbw) * 64);
++        const int rows = static_cast<int>(to - from);
++        m_upload.resize(static_cast<size_t>(w) * rows * 4u);
++        float *dst = m_upload.data();
++        const uint32_t bp = t.fbp << 5u;
++        const uint32_t bw = t.fbw;
++        for (int y = 0; y < rows; ++y)
++        {
++            const uint32_t gy = from + static_cast<uint32_t>(y);
++            for (int x = 0; x < w; ++x, dst += 4)
++            {
++                uint32_t r, g, b, a;
++                switch (t.psm)
++                {
++                case GS_PSM_CT32:
++                {
++                    const uint32_t v = GSMem::ReadCT32(m_vram, bp, bw, static_cast<uint32_t>(x), gy);
++                    r = v & 0xFF; g = (v >> 8) & 0xFF; b = (v >> 16) & 0xFF; a = v >> 24;
++                    break;
++                }
++                case GS_PSM_CT24:
++                {
++                    const uint32_t v = GSMem::ReadCT24(m_vram, bp, bw, static_cast<uint32_t>(x), gy);
++                    r = v & 0xFF; g = (v >> 8) & 0xFF; b = (v >> 16) & 0xFF; a = 0x80;
++                    break;
++                }
++                case GS_PSM_CT16:
++                case GS_PSM_CT16S:
++                case GS_PSM_Z16:
++                case GS_PSM_Z16S:
++                {
++                    const uint32_t v = m_cpu.ReadVram(t.psm, bp, bw, static_cast<uint32_t>(x), gy);
++                    r = (v & 0x1F) << 3; g = ((v >> 5) & 0x1F) << 3; b = ((v >> 10) & 0x1F) << 3; a = (v & 0x8000) ? 0x80 : 0;
++                    break;
++                }
++                default:
++                {
++                    const uint32_t v = m_cpu.ReadVram(t.psm, bp, bw, static_cast<uint32_t>(x), gy);
++                    r = v & 0xFF; g = (v >> 8) & 0xFF; b = (v >> 16) & 0xFF; a = v >> 24;
++                    break;
++                }
++                }
++                dst[0] = r / 255.0f;
++                dst[1] = g / 255.0f;
++                dst[2] = b / 255.0f;
++                dst[3] = a / 128.0f;
++            }
++        }
++        if (m_scale > 1)
++        {
++            const int S = m_scale;
++            gl.glBindTexture(GL_TEXTURE_2D, m_nativeTex);
++            gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(from), w, rows, GL_RGBA, GL_FLOAT, m_upload.data());
++            gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, m_nativeFbo);
++            gl.glReadBuffer(GL_COLOR_ATTACHMENT0);
++            gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_readFbo);
++            gl.glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
++            gl.glDisable(GL_SCISSOR_TEST);
++            gl.glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++            gl.glBlitFramebuffer(0, static_cast<GLint>(from), w, static_cast<GLint>(to), 0, static_cast<GLint>(from) * S, w * S,
++                                 static_cast<GLint>(to) * S, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++            gl.glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
++            gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_drawFbo);
++        }
++        else
++        {
++            gl.glBindTexture(GL_TEXTURE_2D, t.tex);
++            gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(from), w, rows, GL_RGBA, GL_FLOAT, m_upload.data());
++        }
++        ++m_stats.uploads;
++    }
++
++    Target &prepareTarget(const GSFrameReg &frame, uint32_t rowsNeeded)
++    {
++        const uint32_t fbw = std::max<uint32_t>(frame.fbw, 1u);
++        auto it = m_targets.find(frame.fbp);
++        if (it == m_targets.end())
++        {
++            Target t;
++            t.fbp = frame.fbp;
++            t.fbw = fbw;
++            t.psm = frame.psm;
++            t.tex = makeColorTexture();
++            it = m_targets.emplace(frame.fbp, t).first;
++        }
++        Target &t = it->second;
++        if (t.fbw != fbw || t.psm != frame.psm)
++        {
++            resolve(t);
++            t.fbw = fbw;
++            t.psm = frame.psm;
++            t.stale = true;
++        }
++        rowsNeeded = std::min<uint32_t>(std::max<uint32_t>(rowsNeeded, 1u), kDim);
++        if (t.stale || rowsNeeded > t.rows)
++        {
++            const uint32_t from = t.stale ? 0u : t.rows;
++            const uint32_t to = std::max(t.rows, rowsNeeded);
++            // Make VRAM current for that range before pulling it in.
++            resolveOverlapping(pageSpan(t.fbp << 5u, t.fbw, t.psm, 0, to), &t);
++            uploadRows(t, from, to);
++            t.rows = to;
++            t.stale = false;
++        }
++        return t;
++    }
++
++    void markDirty(Target &t, const Rect &rc)
++    {
++        if (!t.gpuDirty)
++        {
++            // Other targets aliasing this memory become stale once we draw here.
++            const PageRange mine = t.range();
++            for (auto &kv : m_targets)
++            {
++                Target &o = kv.second;
++                if (&o == &t || !o.range().overlaps(mine))
++                    continue;
++                m_rctx = 3;
++                resolve(o);
++                m_rctx = 0;
++                o.stale = true;
++            }
++            t.gpuDirty = true;
++            t.dirty = rc;
++        }
++        else
++            t.dirty.add(rc);
++    }
++
++    GLuint prepareDepth(uint32_t zbp, bool &created)
++    {
++        created = false;
++        auto it = m_depth.find(zbp);
++        if (it != m_depth.end())
++            return it->second;
++        GLuint t = 0;
++        gl.glGenTextures(1, &t);
++        gl.glBindTexture(GL_TEXTURE_2D, t);
++        gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, kDim * m_scale, kDim * m_scale, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
++        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        m_depth.emplace(zbp, t);
++        created = true;
++        return t;
++    }
++
++    // PS2X_GS_SCALE_RTT: a draw that samples a whole render target (same base, width and a 32/24-bit
++    // format) reads the GPU target itself, so render-to-texture effects keep the internal resolution.
++    // Anything else (offsets, CLUT formats, CPU-newer data, sampling the target being drawn) falls back
++    // to the native resolve + CPU decode path.
++    Target *rttSource(const GSDrawState &st, const Target &dst)
++    {
++        const auto &tx = st.context.tex0;
++        int why = 0;
++        Target *t = nullptr;
++        const uint32_t w = std::min<uint32_t>(std::max<uint32_t>(st.textureWidth, 1u), kDim);
++        const uint32_t h = std::min<uint32_t>(std::max<uint32_t>(st.textureHeight, 1u), kDim);
++        auto it = ((tx.tbp0 & 31u) == 0u) ? m_targets.find(tx.tbp0 >> 5u) : m_targets.end();
++        if (it == m_targets.end())
++            why = 2; // not a render target base (ordinary texture)
++        else
++        {
++            t = &it->second;
++            if ((tx.psm != GS_PSM_CT32 && tx.psm != GS_PSM_CT24) || (t->psm != GS_PSM_CT32 && t->psm != GS_PSM_CT24))
++                why = 1;
++            else if (t->fbw != tx.tbw || w > t->fbw * 64u)
++                why = 3;
++            else if (t == &dst)
++                why = 4;
++            else if (t->stale)
++                why = 5;
++            else if (h > t->rows && !m_rttRowsLoose)
++                why = 6;
++        }
++        ++m_rttCount[why];
++        if (why != 0 && why != 2 && m_rttLog < 24 && m_presents > 1500)
++        {
++            ++m_rttLog;
++            std::fprintf(stderr, "[gs:gpu:rtt] fallback why=%d tbp=0x%x tbw=%u psm=0x%x %ux%u target fbw=%u psm=0x%x rows=%u\n", why,
++                         tx.tbp0, tx.tbw, tx.psm, w, h, t ? t->fbw : 0u, t ? t->psm : 0u, t ? t->rows : 0u);
++        }
++        if (m_presents >= m_rttNextLog)
++        {
++            m_rttNextLog = m_presents + 1200;
++            std::fprintf(stderr, "[gs:gpu:rtt] hits=%llu fmt=%llu nontarget=%llu width=%llu self=%llu stale=%llu rows=%llu\n",
++                         (unsigned long long)m_rttCount[0], (unsigned long long)m_rttCount[1], (unsigned long long)m_rttCount[2],
++                         (unsigned long long)m_rttCount[3], (unsigned long long)m_rttCount[4], (unsigned long long)m_rttCount[5],
++                         (unsigned long long)m_rttCount[6]);
++        }
++        if (why == 0 && m_rttHitLog < 8 && m_presents > 1500)
++        {
++            ++m_rttHitLog;
++            std::fprintf(stderr, "[gs:gpu:rtt] hit tbp=0x%x tbw=%u psm=0x%x %ux%u -> fbp=0x%x (target psm=0x%x rows=%u, drawing to fbp=0x%x)\n",
++                         tx.tbp0, tx.tbw, tx.psm, w, h, t->fbp, t->psm, t->rows, dst.fbp);
++        }
++        return why == 0 ? t : nullptr;
++    }
++
++    TexEntry *prepareTexture(const GSDrawState &st)
++    {
++        const auto &tx = st.context.tex0;
++        const uint32_t w = std::min<uint32_t>(std::max<uint32_t>(st.textureWidth, 1u), kDim);
++        const uint32_t h = std::min<uint32_t>(std::max<uint32_t>(st.textureHeight, 1u), kDim);
++        const PageRange r = pageSpan(tx.tbp0, tx.tbw, tx.psm, w, h);
++        m_rctx = 2;
++        resolveOverlapping(r, nullptr); // render-to-texture: make VRAM current first
++        m_rctx = 0;
++
++        TexKey k;
++        k.tbp0 = tx.tbp0;
++        k.tbw = tx.tbw;
++        k.psm = tx.psm;
++        k.w = static_cast<uint16_t>(w);
++        k.h = static_cast<uint16_t>(h);
++        const bool indexed = tx.psm == GS_PSM_T8 || tx.psm == GS_PSM_T8H || tx.psm == GS_PSM_T4 ||
++                             tx.psm == GS_PSM_T4HL || tx.psm == GS_PSM_T4HH;
++        const bool usesTexa = indexed ? (tx.cpsm != GS_PSM_CT32) : (tx.psm != GS_PSM_CT32);
++        if (indexed)
++        {
++            k.cpsm = tx.cpsm;
++            k.csm = tx.csm;
++            k.csa = tx.csa;
++            k.clutHash = m_clutHash;
++        }
++        if (usesTexa)
++        {
++            k.ta0 = st.texa.ta0;
++            k.ta1 = st.texa.ta1;
++            k.aem = st.texa.aem ? 1 : 0;
++        }
++        if (m_tc2 && (m_texCache.size() > 4096 || m_texBytes > (256ull << 20)))
++            evictTextures();
++        if (m_texCache.size() > 4096 || m_texBytes > (768ull << 20))
++        {
++            for (auto &kv : m_texCache)
++                gl.glDeleteTextures(1, &kv.second.tex);
++            m_texCache.clear();
++            m_texFront.clear();
++            m_texBytes = 0;
++        }
++        const uint64_t gen = pageGenSum(r);
++        if (m_tc2)
++        {
++            // Content-addressed: page generations only say "maybe changed"; the hash of the
++            // source pages decides. Re-uploads of identical data and A/B textures sharing one
++            // VRAM slot then hit instead of re-decoding.
++            TexFront &f = m_texFront[k];
++            if (f.genSum != gen)
++            {
++                f.content = contentHash(r);
++                f.genSum = gen;
++                ++m_stats.texHashes;
++            }
++            k.content = f.content;
++        }
++        TexEntry &e = m_texCache[k];
++        if (!e.tex)
++        {
++            gl.glGenTextures(1, &e.tex);
++            gl.glBindTexture(GL_TEXTURE_2D, e.tex);
++            gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, GL_RGBA,
++                            GL_UNSIGNED_BYTE, nullptr);
++            e.bytes = w * h * 4u;
++            m_texBytes += e.bytes;
++        }
++        e.lastUse = m_presents;
++        const bool decode = m_tc2 ? (e.genSum == ~0ull) : (e.genSum != gen);
++        if (decode)
++        {
++            m_texels.resize(static_cast<size_t>(w) * h);
++            m_cpu.DecodeTextureRgba(st, w, h, m_texels.data());
++            gl.glBindTexture(GL_TEXTURE_2D, e.tex);
++            gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA,
++                               GL_UNSIGNED_BYTE, m_texels.data());
++            e.genSum = m_tc2 ? 0ull : gen;
++            if (m_tc2Check)
++                e.dbg = m_texels;
++            ++m_stats.texDecodes;
++        }
++        else
++        {
++            ++m_stats.texHits;
++            if (m_tc2Check)
++            {
++                // Debug: decode anyway and compare with what the cached texture was built from.
++                m_texels.resize(static_cast<size_t>(w) * h);
++                m_cpu.DecodeTextureRgba(st, w, h, m_texels.data());
++                ++m_stats.texChecks;
++                if (e.dbg.size() != m_texels.size() || std::memcmp(e.dbg.data(), m_texels.data(), m_texels.size() * 4u) != 0)
++                {
++                    ++m_stats.texMismatches;
++                    ++m_texMismatchTotal;
++                    size_t diff = 0;
++                    for (size_t i = 0; i < m_texels.size() && i < e.dbg.size(); ++i)
++                        diff += e.dbg[i] != m_texels[i];
++                    if (m_texMismatchTotal <= 50)
++                        std::fprintf(stderr, "[gs:gpu:texcheck] MISMATCH tbp=0x%x tbw=%u psm=0x%x %ux%u cpsm=0x%x csa=%u clut=%016llx content=%016llx texels-differ=%zu\n",
++                                     k.tbp0, k.tbw, k.psm, w, h, k.cpsm, k.csa, (unsigned long long)k.clutHash,
++                                     (unsigned long long)k.content, diff);
++                    // keep rendering correct in check mode
++                    gl.glBindTexture(GL_TEXTURE_2D, e.tex);
++                    gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA,
++                                       GL_UNSIGNED_BYTE, m_texels.data());
++                    e.dbg = m_texels;
++                }
++            }
++        }
++        return &e;
++    }
++
++    static uint32_t presentDisplayHeight(uint64_t display64)
++    {
++        // mirrors decodeDisplaySize() in gs_cpu_backend.cpp
++        const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
++        const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
++        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
++        uint32_t w = (dw + 1u) / (magh + 1u), h = dh + 1u;
++        if (w < 64u || h < 64u)
++            h = 448u;
++        return std::min<uint32_t>(h, 512u);
++    }
++
++    // Display/preferred ranges into rs[0..n); context-frame ranges (only read by the
++    // "fbp 0 display is all black" fallback) into rs[n..n+*ctxN).
++    int presentReadSet(const GSPresentationRequest &q, PageRange *rs, int *ctxN = nullptr) const
++    {
++        int n = 0;
++        const uint32_t h1 = presentDisplayHeight(q.display1), h2 = presentDisplayHeight(q.display2);
++        const uint32_t hm = std::max(h1, h2);
++        auto disp = [&](uint64_t fb, uint32_t h) {
++            const uint32_t fbp = static_cast<uint32_t>(fb & 0x1FFu), fbw = static_cast<uint32_t>((fb >> 9) & 0x3Fu);
++            const uint32_t psm = static_cast<uint32_t>((fb >> 15) & 0x1Fu);
++            const uint32_t ox = static_cast<uint32_t>((fb >> 32) & 0x7FFu), oy = static_cast<uint32_t>((fb >> 43) & 0x7FFu);
++            rs[n++] = pageSpan(fbp << 5u, fbw ? fbw : 10u, psm, ox + 640u, oy + h);
++        };
++        // only enabled CRTs are read (PMODE.EN1/EN2, same as decodePmode())
++        if (q.pmode & 1u)
++            disp(q.dispfb1, h1);
++        if (q.pmode & 2u)
++            disp(q.dispfb2, h2);
++        if (q.hasPreferredSource) // base in blocks (frameBaseIsPages=false)
++            rs[n++] = pageSpan(q.preferredSource.fbp, q.preferredSource.fbw ? q.preferredSource.fbw : 10u, q.preferredSource.psm, 640u, hm);
++        int c = 0;
++        if (((q.pmode & 1u) && (q.dispfb1 & 0x1FFu) == 0u) || ((q.pmode & 2u) && (q.dispfb2 & 0x1FFu) == 0u))
++            for (const GSFrameReg &cf : q.contextFrames)
++                rs[n + c++] = pageSpan(cf.fbp << 5u, cf.fbw ? cf.fbw : 10u, cf.psm, 640u, hm);
++        if (ctxN)
++            *ctxN = c;
++        else
++            n += c;
++        return n;
++    }
++
++    static bool presentAllBlack(const PresentationFrame &f)
++    {
++        // same test as countNonBlackPixels() (RGB != 0), over the whole host frame
++        const uint8_t *p = f.pixels.data();
++        const size_t n = f.pixels.size() / 4u;
++        for (size_t i = 0; i < n; ++i)
++            if (p[i * 4u] | p[i * 4u + 1u] | p[i * 4u + 2u])
++                return false;
++        return true;
++    }
++
++    static bool sameFrameReg(const GSFrameReg &a, const GSFrameReg &b)
++    {
++        return a.fbp == b.fbp && a.fbw == b.fbw && a.psm == b.psm && a.fbmsk == b.fbmsk;
++    }
++
++    // ctxIgnored: the cached frame did not take the black-display fallback, so the context
++    // frames did not influence it (and won't, while the display pages are unchanged).
++    static bool samePresentRequest(const GSPresentationRequest &a, const GSPresentationRequest &b, bool ctxIgnored)
++    {
++        const bool fieldMode = (a.smode2 & 1u) != 0u && (a.smode2 & 2u) == 0u; // as decodeSMode2/fieldMode
++        const bool prefUsed = a.hasPreferredSource || b.hasPreferredSource;
++        return a.pmode == b.pmode && a.smode2 == b.smode2 && a.dispfb1 == b.dispfb1 && a.display1 == b.display1 &&
++               a.dispfb2 == b.dispfb2 && a.display2 == b.display2 && a.bgcolor == b.bgcolor &&
++               (!fieldMode || ((a.vsyncTick ^ b.vsyncTick) & 1u) == 0u) &&
++               (ctxIgnored || (sameFrameReg(a.contextFrames[0], b.contextFrames[0]) && sameFrameReg(a.contextFrames[1], b.contextFrames[1]))) &&
++               a.hasPreferredSource == b.hasPreferredSource &&
++               (!prefUsed || (sameFrameReg(a.preferredSource, b.preferredSource) && a.preferredDestFbp == b.preferredDestFbp));
++    }
++
++    // TEXCACHE2: drop entries not bound in the last ~2 s of presents (oldest-first fallback).
++    void evictTextures()
++    {
++        uint64_t age = 120;
++        while (m_texCache.size() > 2048 || m_texBytes > (192ull << 20))
++        {
++            for (auto it = m_texCache.begin(); it != m_texCache.end();)
++            {
++                if (m_presents - it->second.lastUse >= age)
++                {
++                    gl.glDeleteTextures(1, &it->second.tex);
++                    m_texBytes -= it->second.bytes;
++                    it = m_texCache.erase(it);
++                    ++m_stats.texEvicts;
++                }
++                else
++                    ++it;
++            }
++            if (age == 0)
++                break;
++            age /= 2;
++        }
++    }
++
++    uint64_t pageHash(uint32_t p)
++    {
++        const uint32_t i = p & (kPages - 1u);
++        if (m_pageHashGen[i] != m_pageGen[i] + 1u)
++        {
++            m_pageHash[i] = (m_vram && (i + 1u) * 8192u <= m_vramSize) ? tcHashPage(m_vram + i * 8192u) : 0u;
++            m_pageHashGen[i] = m_pageGen[i] + 1u;
++            ++m_stats.pageHashes;
++        }
++        return m_pageHash[i];
++    }
++
++    uint64_t contentHash(const PageRange &r)
++    {
++        uint64_t h = 0x243f6a8885a308d3ull ^ (static_cast<uint64_t>(r.last - r.first) << 32);
++        for (uint32_t p = r.first; p < r.last; ++p)
++            h = tcMum(h ^ pageHash(p), 0x9E3779B97F4A7C15ull + p);
++        return h | 1u; // never 0 (0 = "off" in TexKey)
++    }
++
++    // ---- drawing --------------------------------------------------------------
++    static uint8_t primClass(GSPrimType t)
++    {
++        switch (t)
++        {
++        case GS_PRIM_POINT: return 0;
++        case GS_PRIM_LINE:
++        case GS_PRIM_LINESTRIP: return 1;
++        case GS_PRIM_SPRITE: return 3;
++        default: return 2;
++        }
++    }
++
++    void appendDraw(const GSPrimitiveBatch &batch)
++    {
++        const GSDrawState &st = batch.state;
++        const auto &ctx = st.context;
++        const uint8_t cls = primClass(st.prim.type);
++        DrawKey k;
++        k.frame = ctx.frame;
++        k.scissor = ctx.scissor;
++        k.zbuf = ctx.zbuf;
++        k.test = ctx.test;
++        k.fba = ctx.fba;
++        k.colclamp = st.colclamp;
++        k.cls = (cls == 3) ? 2 : cls;
++        k.iip = (cls == 3) ? 0 : (st.prim.iip ? 1 : 0);
++        k.tme = st.prim.tme ? 1 : 0;
++        k.abe = st.prim.abe ? 1 : 0;
++        k.fge = st.prim.fge ? 1 : 0;
++        k.pabe = st.pabe ? 1 : 0;
++        if (k.tme)
++        {
++            k.tex0 = ctx.tex0;
++            k.tex0.cld = 0;
++            k.clamp = ctx.clamp;
++            k.texa = st.texa;
++            k.tw = st.textureWidth;
++            k.th = st.textureHeight;
++            k.linear = st.linearFilter ? 1 : 0;
++        }
++        if (k.abe)
++            k.alpha = ctx.alpha;
++        if (k.fge)
++        {
++            k.fogR = st.fogR;
++            k.fogG = st.fogG;
++            k.fogB = st.fogB;
++        }
++        if (!m_haveKey || !sameKey(k, m_key))
++        {
++            flushDraws();
++            m_key = k;
++            m_state = st;
++            m_haveKey = true;
++        }
++        ++m_stats.prims;
++
++        // Same pixel convention as the CPU rasterizer (integer XYOFFSET, pixel sampled at
++        // its centre x+0.5), so both paths line up for comparison.
++        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
++        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
++        const float tw = static_cast<float>(std::max<uint16_t>(st.textureWidth, 1));
++        const float th = static_cast<float>(std::max<uint16_t>(st.textureHeight, 1));
++        const float pc = (cls <= 1) ? 0.5f : 0.0f; // points/lines: hit the pixel centre
++        auto emit = [&](float x, float y, const GSVertex &cv, float s, float t, float q) {
++            const float gx = x - ofx, gy = y - ofy;
++            const float vtx[kFloatsPerVertex] = {gx + pc, gy + pc, static_cast<float>(cv.z), static_cast<float>(cv.fog),
++                                                 float(cv.r), float(cv.g), float(cv.b), float(cv.a), s, t, q, 0.0f};
++            m_verts.insert(m_verts.end(), vtx, vtx + kFloatsPerVertex);
++            m_bbox.add(Rect{static_cast<int>(std::floor(gx)), static_cast<int>(std::floor(gy)),
++                            static_cast<int>(std::ceil(gx)), static_cast<int>(std::ceil(gy))});
++        };
++        auto stq = [&](const GSVertex &v, float &s, float &t, float &q) {
++            if (st.prim.fst) { s = (v.u / 16.0f) / tw; t = (v.v / 16.0f) / th; q = 1.0f; }
++            else { s = v.s; t = v.t; q = v.q; }
++        };
++
++        if (cls == 3)
++        {
++            const GSVertex &v0 = batch.vertices[0];
++            const GSVertex &v1 = batch.vertices[1];
++            float s0, t0, q0, s1, t1, q1;
++            stq(v0, s0, t0, q0);
++            stq(v1, s1, t1, q1);
++            if (!st.prim.fst)
++            {
++                const float a0 = std::max(std::fabs(q0), 1e-20f), a1 = std::max(std::fabs(q1), 1e-20f);
++                s0 /= a0; t0 /= a0; s1 /= a1; t1 /= a1;
++                q0 = q1 = 1.0f;
++            }
++            emit(v0.x, v0.y, v1, s0, t0, 1.0f);
++            emit(v1.x, v0.y, v1, s1, t0, 1.0f);
++            emit(v0.x, v1.y, v1, s0, t1, 1.0f);
++            emit(v1.x, v0.y, v1, s1, t0, 1.0f);
++            emit(v1.x, v1.y, v1, s1, t1, 1.0f);
++            emit(v0.x, v1.y, v1, s0, t1, 1.0f);
++        }
++        else
++        {
++            const int n = (cls == 0) ? 1 : (cls == 1 ? 2 : 3);
++            for (int i = 0; i < n && i < batch.vertexCount; ++i)
++            {
++                const GSVertex &v = batch.vertices[i];
++                float s, t, q;
++                stq(v, s, t, q);
++                emit(v.x, v.y, v, s, t, q);
++            }
++            if (batch.vertexCount < n) // malformed; drop what we added
++                m_verts.resize(m_verts.size() - static_cast<size_t>(std::min<int>(n, batch.vertexCount)) * kFloatsPerVertex);
++        }
++        if (m_verts.size() >= kMaxBatchFloats)
++            flushDraws();
++    }
++
++    void logOnce(const char *what, uint64_t value)
++    {
++        const uint64_t key = (reinterpret_cast<uintptr_t>(what) * 31u) ^ value;
++        if (m_logged.size() < 256 && m_logged.emplace(key, 1).second)
++            std::fprintf(stderr, "[gs:gpu] approximated: %s (0x%llx)\n", what, static_cast<unsigned long long>(value));
++    }
++
++    void setBlend(const DrawKey &k, uint8_t fpsm)
++    {
++        if (!k.abe)
++        {
++            gl.glDisable(GL_BLEND);
++            return;
++        }
++        const int A = static_cast<int>(k.alpha & 3u), B = static_cast<int>((k.alpha >> 2) & 3u);
++        const int C = static_cast<int>((k.alpha >> 4) & 3u), D = static_cast<int>((k.alpha >> 6) & 3u);
++        const float fix = static_cast<float>((k.alpha >> 32) & 0xFFu) / 128.0f;
++        GLenum F = GL_SRC1_ALPHA, OMF = GL_ONE_MINUS_SRC1_ALPHA;
++        if (C == 1 && fpsm != GS_PSM_CT24) { F = GL_DST_ALPHA; OMF = GL_ONE_MINUS_DST_ALPHA; }
++        else if (C == 1) { F = GL_CONSTANT_ALPHA; OMF = GL_ONE_MINUS_CONSTANT_ALPHA; gl.glBlendColor(0, 0, 0, 1.0f); }
++        else if (C >= 2) { F = GL_CONSTANT_ALPHA; OMF = GL_ONE_MINUS_CONSTANT_ALPHA; gl.glBlendColor(0, 0, 0, fix); }
++        if (C == 3) logOnce("ALPHA.C=3 (reserved)", k.alpha);
++        // Output = (A - B) * F + D, expressed as coefficients of Cs and Cd.
++        auto coef = [&](int which, GLenum &factor, int &sign) {
++            const int kf = (A == which ? 1 : 0) - (B == which ? 1 : 0);
++            const int k1 = (D == which ? 1 : 0);
++            sign = 1;
++            if (k1 == 0 && kf == 0) factor = GL_ZERO;
++            else if (k1 == 1 && kf == 0) factor = GL_ONE;
++            else if (k1 == 0 && kf == 1) factor = F;
++            else if (k1 == 0 && kf == -1) { factor = F; sign = -1; }
++            else if (k1 == 1 && kf == -1) factor = OMF;
++            else { factor = GL_ONE; logOnce("blend coefficient 1+f", k.alpha); }
++        };
++        GLenum sf, df;
++        int ss, ds;
++        coef(0, sf, ss);
++        coef(1, df, ds);
++        if (sf == GL_ZERO) ss = 1;
++        if (df == GL_ZERO) ds = 1;
++        GLenum eq = GL_FUNC_ADD;
++        if (ss > 0 && ds < 0) eq = GL_FUNC_SUBTRACT;
++        else if (ss < 0 && ds > 0) eq = GL_FUNC_REVERSE_SUBTRACT;
++        else if (ss < 0 && ds < 0) { sf = GL_ZERO; df = GL_ZERO; }
++        gl.glEnable(GL_BLEND);
++        gl.glBlendEquationSeparate(eq, GL_FUNC_ADD);
++        gl.glBlendFuncSeparate(sf, df, GL_ONE, GL_ZERO);
++        if (k.pabe)
++            logOnce("PABE ignored", k.alpha);
++    }
++
++    void flushDraws()
++    {
++        if (m_verts.empty())
++            return;
++        const DrawKey &k = m_key;
++        const GSDrawState &st = m_state;
++        const auto &ctx = st.context;
++        const GLsizei count = static_cast<GLsizei>(m_verts.size() / kFloatsPerVertex);
++
++        Rect rc{ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1};
++        rc.x0 = std::max(rc.x0, m_bbox.x0 - 1);
++        rc.y0 = std::max(rc.y0, m_bbox.y0 - 1);
++        rc.x1 = std::min({rc.x1, m_bbox.x1 + 1, kDim - 1});
++        rc.y1 = std::min({rc.y1, m_bbox.y1 + 1, kDim - 1});
++        rc.x0 = std::max(rc.x0, 0);
++        rc.y0 = std::max(rc.y0, 0);
++        m_bbox = Rect{};
++        if (rc.empty() || k.frame.fbw == 0u)
++        {
++            m_verts.clear();
++            return;
++        }
++
++        Target &tgt = prepareTarget(k.frame, static_cast<uint32_t>(rc.y1) + 1u);
++        bool depthCreated = false;
++        const GLuint depth = prepareDepth(k.zbuf.zbp, depthCreated);
++        Target *rtt = (k.tme && m_rtt) ? rttSource(st, tgt) : nullptr;
++        TexEntry *tex = (k.tme && !rtt) ? prepareTexture(st) : nullptr;
++        // DATE / alpha-MSB preservation read the destination.
++        const uint32_t amask = (k.frame.fbmsk >> 24) & 0xFFu;
++        const bool date = ((k.test >> 14) & 1u) != 0u && k.frame.psm != GS_PSM_CT24;
++        const bool amsb = amask == 0x80u && k.frame.psm != GS_PSM_CT24;
++        if (amask != 0u && amask != 0xFFu && amask != 0x80u)
++            logOnce("partial alpha FBMSK", k.frame.fbmsk);
++        const bool colorWrites = (k.frame.fbmsk != 0xFFFFFFFFu);
++        if (colorWrites)
++            markDirty(tgt, rc);
++
++        gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_drawFbo);
++        if (m_attachedColor != tgt.tex)
++        {
++            gl.glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tgt.tex, 0);
++            m_attachedColor = tgt.tex;
++        }
++        if (m_attachedDepth != depth)
++        {
++            gl.glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
++            m_attachedDepth = depth;
++        }
++        if (!m_fboChecked)
++        {
++            const GLenum status = gl.glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
++            if (status != GL_FRAMEBUFFER_COMPLETE)
++                std::fprintf(stderr, "[gs:gpu] framebuffer incomplete: 0x%x\n", status);
++            m_fboChecked = true;
++        }
++        gl.glViewport(0, 0, kDim * m_scale, kDim * m_scale);
++        if (depthCreated)
++        {
++            gl.glDisable(GL_SCISSOR_TEST);
++            gl.glDepthMask(GL_TRUE);
++            gl.glClearDepth(0.0);
++            gl.glClear(GL_DEPTH_BUFFER_BIT);
++        }
++
++        if (date || amsb)
++        {
++            // Snapshot the destination so the shader can read it.
++            gl.glBindFramebuffer(GL_READ_FRAMEBUFFER, m_readFbo);
++            gl.glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tgt.tex, 0);
++            gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_scratchFbo);
++            gl.glDisable(GL_SCISSOR_TEST);
++            {
++                const int S = m_scale;
++                gl.glBlitFramebuffer(rc.x0 * S, rc.y0 * S, (rc.x1 + 1) * S, (rc.y1 + 1) * S, rc.x0 * S, rc.y0 * S, (rc.x1 + 1) * S,
++                                     (rc.y1 + 1) * S, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++            }
++            gl.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_drawFbo);
++            gl.glActiveTexture(GL_TEXTURE1);
++            gl.glBindTexture(GL_TEXTURE_2D, m_scratchTex);
++            gl.glActiveTexture(GL_TEXTURE0);
++            ++m_stats.dstCopies;
++        }
++
++        gl.glEnable(GL_SCISSOR_TEST);
++        gl.glScissor(ctx.scissor.x0 * m_scale, ctx.scissor.y0 * m_scale, (ctx.scissor.x1 - ctx.scissor.x0 + 1) * m_scale,
++                     (ctx.scissor.y1 - ctx.scissor.y0 + 1) * m_scale);
++
++        // Depth
++        const uint32_t zfmt = k.zbuf.psm & 0xFu;
++        float zmax = 4294967295.0f;
++        if (zfmt == 1u) zmax = 16777215.0f;
++        else if (zfmt == 2u || zfmt == 10u) zmax = 65535.0f;
++        const uint32_t ztst = static_cast<uint32_t>((k.test >> 17) & 3u);
++        static const GLenum kDepthFuncs[4] = {GL_NEVER, GL_ALWAYS, GL_GEQUAL, GL_GREATER};
++        gl.glEnable(GL_DEPTH_TEST);
++        gl.glDepthFunc(kDepthFuncs[ztst]);
++        const bool zwrite = !k.zbuf.zmask;
++
++        // Colour write mask
++        const bool wr = (k.frame.fbmsk & 0xFFu) != 0xFFu;
++        const bool wg = ((k.frame.fbmsk >> 8) & 0xFFu) != 0xFFu;
++        const bool wb = ((k.frame.fbmsk >> 16) & 0xFFu) != 0xFFu;
++        const bool wa = amask != 0xFFu && k.frame.psm != GS_PSM_CT24;
++
++        setBlend(k, k.frame.psm);
++
++        gl.glUseProgram(m_prog);
++        gl.glUniform1i(u.uIip, k.iip);
++        gl.glUniform1i(u.uTme, k.tme);
++        gl.glUniform1i(u.uTfx, k.tex0.tfx & 3);
++        gl.glUniform1i(u.uTcc, k.tex0.tcc & 1);
++        gl.glUniform1i(u.uFge, k.fge);
++        gl.glUniform3f(u.uFogCol, k.fogR, k.fogG, k.fogB);
++        gl.glUniform1i(u.uDate, date ? 1 : 0);
++        gl.glUniform1i(u.uDatm, static_cast<int>((k.test >> 15) & 1u));
++        gl.glUniform1i(u.uFba, (k.fba & 1u) ? 1 : 0);
++        gl.glUniform1i(u.uAMsb, amsb ? 1 : 0);
++        gl.glUniform1i(u.uCt16, (k.frame.psm == GS_PSM_CT16 || k.frame.psm == GS_PSM_CT16S) ? 1 : 0);
++        gl.glUniform1f(u.uZmax, zmax);
++
++        if (m_rtt)
++            gl.glUniform1i(u.uRtt, rtt ? 1 : 0);
++        if (rtt)
++        {
++            // Sample the (scaled) render target directly instead of its native VRAM resolve.
++            const uint32_t tw = std::min<uint32_t>(std::max<uint32_t>(st.textureWidth, 1u), kDim);
++            const uint32_t th = std::min<uint32_t>(std::max<uint32_t>(st.textureHeight, 1u), kDim);
++            const float dim = static_cast<float>(kDim);
++            gl.glActiveTexture(GL_TEXTURE0);
++            gl.glBindTexture(GL_TEXTURE_2D, rtt->tex);
++            const GLint filt = k.linear ? GL_LINEAR : GL_NEAREST;
++            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt);
++            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt);
++            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++            const uint32_t wms = static_cast<uint32_t>(k.clamp & 3u), wmt = static_cast<uint32_t>((k.clamp >> 2) & 3u);
++            gl.glUniform2f(u.uRttScale, tw / dim, th / dim);
++            gl.glUniform2f(u.uRttEdge, 0.5f / (tw * m_scale), 0.5f / (th * m_scale));
++            gl.glUniform2i(u.uRttWrap, (wms == 0u || wms == 3u) ? 0 : 1, (wmt == 0u || wmt == 3u) ? 0 : 1);
++            gl.glUniform1i(u.uRttCt24, k.tex0.psm == GS_PSM_CT24 ? 1 : 0);
++            gl.glUniform1f(u.uRttTa0, static_cast<float>(st.texa.ta0));
++            gl.glUniform1i(u.uRttAem, st.texa.aem ? 1 : 0);
++        }
++        else if (tex)
++        {
++            gl.glActiveTexture(GL_TEXTURE0);
++            gl.glBindTexture(GL_TEXTURE_2D, tex->tex);
++            const uint32_t wms = static_cast<uint32_t>(k.clamp & 3u), wmt = static_cast<uint32_t>((k.clamp >> 2) & 3u);
++            auto wrapOf = [&](uint32_t m) -> GLint {
++                if (m >= 2u) logOnce("region CLAMP/REPEAT", k.clamp);
++                return (m == 0u || m == 3u) ? GL_REPEAT : GL_CLAMP_TO_EDGE;
++            };
++            const GLint ws = wrapOf(wms), wt = wrapOf(wmt);
++            const GLint filt = k.linear ? GL_LINEAR : GL_NEAREST;
++            if (tex->wrapS != ws) { gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws); tex->wrapS = ws; }
++            if (tex->wrapT != wt) { gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt); tex->wrapT = wt; }
++            if (tex->filter != filt)
++            {
++                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt);
++                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt);
++                tex->filter = filt;
++            }
++        }
++
++        gl.glBindVertexArray(m_vao);
++        gl.glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
++        gl.glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_verts.size() * sizeof(float)), m_verts.data(), GL_STREAM_DRAW);
++        const GLenum mode = (k.cls == 0) ? GL_POINTS : (k.cls == 1 ? GL_LINES : GL_TRIANGLES);
++
++        // Alpha test. AFAIL != KEEP is done as a second pass over the failing fragments.
++        const bool ate = (k.test & 1u) != 0u;
++        const int atst = static_cast<int>((k.test >> 1) & 7u);
++        const int aref = static_cast<int>((k.test >> 4) & 0xFFu);
++        const int afail = static_cast<int>((k.test >> 12) & 3u);
++        const bool alphaTest = ate && atst != 1;
++        gl.glUniform1i(u.uAte, alphaTest ? 1 : 0);
++        gl.glUniform1i(u.uAtst, atst);
++        gl.glUniform1i(u.uAref, aref);
++
++        gl.glUniform1i(u.uAtInv, 0);
++        gl.glColorMask(wr, wg, wb, wa);
++        gl.glDepthMask(zwrite ? GL_TRUE : GL_FALSE);
++        gl.glDrawArrays(mode, 0, count);
++        if (alphaTest && afail != 0)
++        {
++            gl.glUniform1i(u.uAtInv, 1);
++            if (afail == 1) { gl.glColorMask(wr, wg, wb, wa); gl.glDepthMask(GL_FALSE); }
++            else if (afail == 2) { gl.glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE); gl.glDepthMask(zwrite ? GL_TRUE : GL_FALSE); }
++            else { gl.glColorMask(wr, wg, wb, GL_FALSE); gl.glDepthMask(GL_FALSE); }
++            gl.glDrawArrays(mode, 0, count);
++        }
++        ++m_stats.batches;
++        m_verts.clear();
++        if (m_debugErrors)
++        {
++            if (const GLenum err = gl.glGetError(); err != GL_NO_ERROR)
++                logOnce("GL error", err);
++        }
++    }
++
++    void maybePrintStats()
++    {
++        if (!m_statsOn)
++            return;
++        const auto now = std::chrono::steady_clock::now();
++        if (now - m_lastStats < std::chrono::seconds(5))
++            return;
++        const double span = std::chrono::duration<double>(now - m_lastStats).count();
++        m_lastStats = now;
++        std::fprintf(stderr, "[gs:gpu:time] worker busy %.0f%%, producers waited: queue-full %.0f ms, sync %.0f ms (over %.1fs)\n",
++                     100.0 * (m_busyNs / 1e9) / span, m_fullWaitNs.exchange(0) / 1e6, m_syncWaitNs.exchange(0) / 1e6, span);
++        m_busyNs = 0;
++        std::fprintf(stderr,
++                     "[gs:gpu:stats] prims=%llu batches=%llu resolves=%llu (%llu px) uploads=%llu texDecodes=%llu texHits=%llu "
++                     "l2l=%llu dstCopies=%llu targets=%zu textures=%zu | tc2=%d texHashes=%llu pageHashes=%llu texMB=%llu checks=%llu mismatches=%llu (total %llu) evicts=%llu | lazyPresent=%d convert=%llu reuse=%llu pchecks=%llu pmismatches=%llu (total %llu) ctxRedo=%llu\n",
++                     (unsigned long long)m_stats.prims, (unsigned long long)m_stats.batches,
++                     (unsigned long long)m_stats.resolves, (unsigned long long)m_stats.resolvedPixels,
++                     (unsigned long long)m_stats.uploads, (unsigned long long)m_stats.texDecodes,
++                     (unsigned long long)m_stats.texHits, (unsigned long long)m_stats.localCopies,
++                     (unsigned long long)m_stats.dstCopies, m_targets.size(), m_texCache.size(),
++                     m_tc2 ? 1 : 0, (unsigned long long)m_stats.texHashes, (unsigned long long)m_stats.pageHashes,
++                     (unsigned long long)(m_texBytes >> 20), (unsigned long long)m_stats.texChecks,
++                     (unsigned long long)m_stats.texMismatches, (unsigned long long)m_texMismatchTotal,
++                     (unsigned long long)m_stats.texEvicts, m_presentLazy ? 1 : 0,
++                     (unsigned long long)m_stats.presentConvert, (unsigned long long)m_stats.presentReuse,
++                     (unsigned long long)m_stats.presentChecks, (unsigned long long)m_stats.presentMismatches,
++                     (unsigned long long)m_presentMismatchTotal, (unsigned long long)m_stats.presentCtxRedo);
++        std::fprintf(stderr, "[gs:gpu:resolves] other=%llu present=%llu texture=%llu alias=%llu\n",
++                     (unsigned long long)m_stats.resolveBy[0], (unsigned long long)m_stats.resolveBy[1],
++                     (unsigned long long)m_stats.resolveBy[2], (unsigned long long)m_stats.resolveBy[3]);
++        if (m_presentLazy)
++            std::fprintf(stderr, "[gs:gpu:present] pmode=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx ctx0=%u/%u/%u ctx1=%u/%u/%u pref=%d %u/%u/%u dest=%u\n",
++                         (unsigned long long)m_pcReq[0].pmode, (unsigned long long)m_pcReq[0].dispfb1, (unsigned long long)m_pcReq[0].display1,
++                         (unsigned long long)m_pcReq[0].dispfb2, (unsigned long long)m_pcReq[0].display2,
++                         m_pcReq[0].contextFrames[0].fbp, m_pcReq[0].contextFrames[0].fbw, m_pcReq[0].contextFrames[0].psm,
++                         m_pcReq[0].contextFrames[1].fbp, m_pcReq[0].contextFrames[1].fbw, m_pcReq[0].contextFrames[1].psm,
++                         m_pcReq[0].hasPreferredSource ? 1 : 0, m_pcReq[0].preferredSource.fbp, m_pcReq[0].preferredSource.fbw,
++                         m_pcReq[0].preferredSource.psm, m_pcReq[0].preferredDestFbp);
++        m_stats = Stats{};
++    }
++
++    struct Uniforms
++    {
++        GLint uInvSize = -1, uTex = -1, uDst = -1, uIip = -1, uTme = -1, uTfx = -1, uTcc = -1, uFge = -1, uFogCol = -1,
++              uAte = -1, uAtst = -1, uAref = -1, uAtInv = -1, uDate = -1, uDatm = -1, uFba = -1, uAMsb = -1, uCt16 = -1,
++              uZmax = -1, uRtt = -1, uRttScale = -1, uRttEdge = -1, uRttWrap = -1, uRttCt24 = -1, uRttTa0 = -1, uRttAem = -1;
++    };
++
++    static constexpr size_t kMaxQueue = 16384;
++    static constexpr size_t kMaxBatchFloats = static_cast<size_t>(kFloatsPerVertex) * 6u * 20000u;
++
++    // queue
++    std::thread m_thread;
++    std::thread::id m_threadId{};
++    std::mutex m_qm;
++    std::condition_variable m_qcv, m_spaceCv, m_doneCv;
++    std::vector<Cmd> m_queue;
++    uint64_t m_pushed = 0, m_done = 0;
++    uint64_t m_busyNs = 0;
++    std::atomic<uint64_t> m_fullWaitNs{0}, m_syncWaitNs{0};
++    bool m_stop = false;
++
++    // EGL / GL
++    void *m_eglLib = nullptr;
++    EGLDisplay m_dpy = EGL_NO_DISPLAY;
++    EGLContext m_ctx = EGL_NO_CONTEXT;
++    decltype(&::eglMakeCurrent) m_eglMakeCurrent = nullptr;
++    decltype(&::eglDestroyContext) m_eglDestroyContext = nullptr;
++    decltype(&::eglTerminate) m_eglTerminate = nullptr;
++    GLApi gl;
++    Uniforms u;
++    GLuint m_prog = 0, m_vao = 0, m_vbo = 0, m_drawFbo = 0, m_readFbo = 0, m_scratchFbo = 0, m_scratchTex = 0;
++    GLuint m_attachedColor = 0, m_attachedDepth = 0;
++    bool m_fboChecked = false;
++    bool m_debugErrors = envFlag("PS2X_GS_GPU_GLERRORS");
++
++    // GS state mirrors (worker thread only)
++    GSCpuBackend m_cpu;
++    uint8_t *m_vram = nullptr;
++    uint32_t m_vramSize = 0;
++    uint64_t m_clutHash = 0;
++    PageRange m_xferDst{};
++    bool m_xferActive = false;
++    std::unordered_map<uint32_t, Target> m_targets;
++    std::unordered_map<uint32_t, GLuint> m_depth;
++    std::unordered_map<TexKey, TexEntry, TexKeyHash> m_texCache;
++    std::array<uint64_t, kPages> m_pageGen{};
++    uint64_t m_globalGen = 0;
++    // PS2X_GS_TEXCACHE2 (default on, =0 restores the generation-only cache)
++    bool m_tc2 = envOn("PS2X_GS_TEXCACHE2");
++    bool m_tc2Check = envFlag("PS2X_GS_TEXCACHE2_CHECK");
++    std::array<uint64_t, kPages> m_pageHash{}, m_pageHashGen{};
++    std::unordered_map<TexKey, TexFront, TexKeyHash> m_texFront;
++    uint64_t m_texBytes = 0, m_texMismatchTotal = 0, m_presents = 0;
++    // PS2X_GS_PRESENT_LAZY (default on)
++    bool m_presentLazy = envOn("PS2X_GS_PRESENT_LAZY");
++    // PS2X_GS_SCALE: internal resolution multiplier (see the header comment).
++    int m_scale = []() {
++        const char *e = std::getenv("PS2X_GS_SCALE");
++        const int v = e ? std::atoi(e) : 1;
++        return v < 1 ? 1 : (v > 4 ? 4 : v);
++    }();
++    bool m_resolveNearest = []() { const char *e = std::getenv("PS2X_GS_SCALE_RESOLVE"); return e && (e[0] == 'n' || e[0] == 'N'); }();
++    GLuint m_nativeFbo = 0, m_nativeTex = 0;
++    // PS2X_GS_SCALE_RTT (default on when PS2X_GS_SCALE > 1; =0 off, =force also at 1x)
++    bool m_rtt = [this]() {
++        const char *e = std::getenv("PS2X_GS_SCALE_RTT");
++        if (e && e[0] == 'f')
++            return true;
++        return m_scale > 1 && !(e && e[0] == '0');
++    }();
++    bool m_rttRowsLoose = envFlag("PS2X_GS_SCALE_RTT_LOOSE");
++    uint64_t m_rttCount[7] = {0, 0, 0, 0, 0, 0, 0};
++    uint64_t m_rttNextLog = 0;
++    int m_rttLog = 0, m_rttHitLog = 0;
++    PresentationFrame m_scaledFrame[2];
++    bool m_scaledValid[2] = {false, false};
++    std::vector<uint8_t> m_scaledRead;
++    uint64_t m_scaledPresents = 0, m_scaledFallbacks = 0;
++    int m_rctx = 0;
++    uint32_t m_bumpTag = 0;
++    int m_presentDiag = 0;
++    std::array<uint32_t, kPages> m_pageBumpTag{};
++    std::array<uint64_t, kPages> m_lastPageGenSnap{};
++    int m_resolveLog = 0;
++    bool m_presentCtxLazy = envOn("PS2X_GS_PRESENT_CTXLAZY");
++    bool m_presentCheck = envFlag("PS2X_GS_PRESENT_CHECK");
++    uint64_t m_presentMismatchTotal = 0;
++    // one cached converted frame per field parity (interlaced field mode alternates them)
++    bool m_pcValid[2] = {false, false};
++    uint64_t m_pcGen[2] = {0, 0};
++    GSPresentationRequest m_pcReq[2]{};
++    PresentationFrame m_pcFrame[2]{};
++
++    // pending batch
++    bool m_haveKey = false;
++    DrawKey m_key{};
++    GSDrawState m_state{};
++    std::vector<float> m_verts;
++    Rect m_bbox;
++
++    // scratch
++    std::vector<float> m_readback, m_upload;
++    std::vector<uint32_t> m_texels;
++    std::unordered_map<uint64_t, int> m_logged;
++    Stats m_stats;
++    bool m_statsOn = false;
++    std::chrono::steady_clock::time_point m_lastStats{};
++};
++} // namespace gsgpu
++
++std::unique_ptr<GSRasterBackend> createGsGpuBackend()
++{
++    auto be = std::make_unique<gsgpu::GSGpuBackend>();
++    if (!be->start())
++        return nullptr;
++    return be;
++}
++
++bool isGsGpuBackend(const GSRasterBackend *backend)
++{
++    return dynamic_cast<const gsgpu::GSGpuBackend *>(backend) != nullptr;
++}
++} // namespace

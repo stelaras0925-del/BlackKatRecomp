@@ -1,0 +1,9 @@
+# PS2Recomp patch series for BlackKatRecomp, applied in this order by tools/apply_patches.sh
+# on top of the pinned submodule commit (see README "PS2Recomp pin").
+# Each patch owns its files (no file is touched by two patches), so the order only matters for
+# readability. Regenerate from a patched submodule with tools/apply_patches.sh --help (see patches/README.md).
+0001-recompiler-codegen.patch
+0002-iop-sound.patch
+0003-gs-cpu-gpu.patch
+0004-vu1-vif1.patch
+0005-ee-core-ipu-sched.patch

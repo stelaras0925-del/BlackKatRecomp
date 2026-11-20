@@ -55,9 +55,17 @@ sudo pacman -S --needed base-devel cmake ninja clang git python pkgconf \
 git clone --recurse-submodules https://github.com/stelaras0925-del/BlackKatRecomp.git
 cd BlackKatRecomp
 
+tools/apply_patches.sh          # apply patches/ps2recomp-series to the submodule
 cmake --preset linux-release
 cmake --build --preset linux-release
 ```
+
+The runtime needs the PS2Recomp changes in `patches/ps2recomp-series/` (see [patches/README.md](patches/README.md)). `tools/apply_patches.sh` runs `git submodule update --init`, then applies the series in order. It is idempotent: patches that are already applied are reported and skipped. It stops with exit 1 on a conflict. Other modes:
+
+- `tools/apply_patches.sh --check`: dry run (exit 2 if patches are still pending).
+- `tools/apply_patches.sh --reset [-y]`: return the submodule to the pinned commit. It asks first unless `-y` is given.
+
+Configure runs the same check (`-DBKR_APPLY_PATCHES=ON`, the default). It stops with an error if the series is not applied. Pass `-DBKR_APPLY_PATCHES=OFF` to skip the check.
 
 Binaries land in `build/linux-release/bin/`:
 
@@ -116,6 +124,43 @@ cmake --build --preset linux-release
 Reconfigure after `build/generated/register_functions.cpp` appears so `blackkat` compiles the generated C++ instead of the empty table. `build/generated/` is gitignored.
 
 Until that file exists, configure prints that `blackkat` is built with an empty function table and that the game ELF is not required to build the target.
+
+## Run (launcher)
+
+Run `build/linux-release/bin/blackkat` with no arguments to open the launcher. It has these settings:
+
+- disc image path, with a Browse dialog through kdialog or zenity; the image is checked for `SLUS_203.65` and its md5;
+- game folder, with an extract button that runs `tools/extract_iso.sh`;
+- renderer (GPU or CPU);
+- internal resolution (1x–4x, GPU only);
+- sound and movies;
+- fullscreen or window size.
+
+**Launch** saves the settings to `$XDG_CONFIG_HOME/blackkat/config.ini` (default `~/.config/blackkat/config.ini`) and starts the game.
+
+```bash
+blackkat                         # launcher
+blackkat --play                  # saved settings, no launcher
+blackkat --scale 2 --windowed=1920x1344 --no-movies   # saved settings + overrides
+blackkat --iso /path/game.iso --cpu --fullscreen
+blackkat game/SLUS_203.65 /path/game.iso               # classic mode: no launcher, no config
+```
+
+Options: `--launcher`, `--play`, `--iso P`, `--elf P`, `--gpu`, `--cpu`, `--scale N`, `--fullscreen`, `--windowed[=WxH]`, `--audio`, `--no-audio`, `--movies`, `--no-movies`, `--help`.
+
+Command-line options override the config file. Environment variables that are already set override both:
+
+| Variable | Meaning |
+|---|---|
+| `PS2X_GS_GPU` | GPU renderer |
+| `PS2X_GS_SCALE` | internal resolution, 1–4 (GPU renderer) |
+| `PS2X_HOST_AUDIO` | sound |
+| `BLACKKAT_PLAY_FMV` | movies |
+| `PS2X_FULLSCREEN` | fullscreen |
+| `PS2X_WINDOW=WxH` | window size |
+| `BLACKKAT_ISO` | disc image path |
+| `PS2X_GS_SCALE_RTT=0` | at 2x and above, render-to-texture effects (water reflections) also run at the internal resolution; `0` reverts them to native |
+| `PS2X_SPU2_REVERB=1` | experimental SPU2 reverb (off by default) |
 
 ## Ghidra
 
