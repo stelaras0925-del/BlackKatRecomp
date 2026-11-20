@@ -1054,7 +1054,7 @@ index 37b6a4decc5865c7e51fbe9209ce46eafa6ccb27..d86665dd888c96b1b2126de55f8bf771
 +    uint64_t dispfbWrites() { return g_dispfbWrites.load(std::memory_order_relaxed); }
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453fc83156b 100644
+index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f889225c1d82bc 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -7,6 +7,7 @@
@@ -1065,7 +1065,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
  #include "Kernel/Stubs/Audio.h"
  #include "Kernel/Stubs/GS.h"
  #include "Kernel/Stubs/MPEG.h"
-@@ -20,12 +21,19 @@
+@@ -20,12 +21,42 @@
  #include <algorithm>
  #include <array>
  #include <cstring>
@@ -1078,6 +1078,29 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
 +#include <vector>
  #include <unordered_map>
  #include <sstream>
++#include "rlgl.h"
++
++// GLFW (inside raylib) for the real framebuffer size at fractional desktop scaling.
++struct GLFWwindow;
++extern "C" void glfwGetFramebufferSize(GLFWwindow *window, int *width, int *height);
++extern "C" int glfwGetPlatform(void);
++namespace
++{
++    inline void ps2xGlfwGetFramebufferSize(void *win, int *w, int *h)
++    {
++        *w = 0;
++        *h = 0;
++        if (win)
++            glfwGetFramebufferSize(static_cast<GLFWwindow *>(win), w, h);
++    }
++    inline int ps2xGlfwGetPlatform() { return glfwGetPlatform(); }
++    inline bool ps2xHidpiFix()
++    {
++        static const bool on = []() { const char *e = std::getenv("PS2X_HIDPI_FIX"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    std::string s_winShotPath; // PS2X_SHOT_WINDOW
++}
 +extern "C" void ps2x_spu2_pull(int16_t *out, uint32_t frames);
 +extern "C" bool ps2x_spu2_out_enabled();
 +extern "C" void ps2x_spu2_out_disable();
@@ -1085,7 +1108,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
  
  namespace ps2_stubs
  {
-@@ -414,7 +422,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -414,7 +445,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                     &sourceFbp,
                                                     &usedPreferredDisplaySource))
      {
@@ -1094,7 +1117,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
          UpdateTexture(tex, blank.data);
          UnloadImage(blank);
          outWidth = FB_WIDTH;
-@@ -450,13 +458,26 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -450,13 +481,26 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      s_lastWidth = width;
      s_lastHeight = height;
  
@@ -1124,7 +1147,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
          const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
          for (uint32_t y = 0; y < copyHeight; ++y)
          {
-@@ -668,42 +689,77 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,42 +712,77 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -1220,7 +1243,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -731,10 +787,68 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,10 +810,76 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -1253,6 +1276,14 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
 +            }
 +        }
 +        InitWindow(winW, winH, title);
++        {
++            int fbw = 0, fbh = 0;
++            ps2xGlfwGetFramebufferSize(GetWindowHandle(), &fbw, &fbh);
++            const Vector2 dpi = GetWindowScaleDPI();
++            std::fprintf(stderr, "[window] screen=%dx%d render=%dx%d framebuffer=%dx%d dpi=%.2fx%.2f highdpi=%d platform=0x%x hidpi_fix=%d\n",
++                         GetScreenWidth(), GetScreenHeight(), GetRenderWidth(), GetRenderHeight(), fbw, fbh, dpi.x, dpi.y,
++                         IsWindowState(FLAG_WINDOW_HIGHDPI) ? 1 : 0, ps2xGlfwGetPlatform(), ps2xHidpiFix() ? 1 : 0);
++        }
 +        if (testUnfocused)
 +            MinimizeWindow();
 +        if (const char *fe = std::getenv("PS2X_FULLSCREEN"); fe && fe[0] == '1' && !testHidden && !testUnfocused)
@@ -1293,7 +1324,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
  #endif
          SetTargetFPS(60);
          if (m_debugUiInitCallback)
-@@ -1396,6 +1510,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,6 +1541,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -1301,7 +1332,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
      targetFn(rdram, ctx, this);
  
      if (isStopRequested() || ctx->pc == 0u)
-@@ -1403,7 +1518,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,7 +1549,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -1316,7 +1347,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
      {
          ctx->pc = fallthroughPc;
      }
-@@ -2388,42 +2509,117 @@ void PS2Runtime::run()
+@@ -2388,44 +2540,145 @@ void PS2Runtime::run()
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
@@ -1449,6 +1480,8 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
 +                        ImageCrop(&img, Rectangle{0.0f, 0.0f, static_cast<float>(cw), static_cast<float>(ch)});
 +                        const std::string path = s_shotPrefix + "_" + std::to_string(s_shotSecs[s_shotNext]) + "s.png";
 +                        const bool ok = ExportImage(img, path.c_str());
++                        if (const char *ws = std::getenv("PS2X_SHOT_WINDOW"); ws && ws[0] == '1')
++                            s_winShotPath = s_shotPrefix + "_" + std::to_string(s_shotSecs[s_shotNext]) + "s_window.png";
 +                        std::fprintf(stderr, "[shot] %s %dx%d %s mono=%.3f\n", path.c_str(), cw, ch, ok ? "ok" : "FAILED",
 +                                     std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
 +                        UnloadImage(img);
@@ -1460,7 +1493,52 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..082eae89c37f6b0ae121f21f6a9ce453
 +
          BeginDrawing();
          ClearBackground(BLACK);
++        int winFbW = 0, winFbH = 0;
++        ps2xGlfwGetFramebufferSize(GetWindowHandle(), &winFbW, &winFbH);
++        if (ps2xHidpiFix() && winFbW > 0 && winFbH > 0)
++        {
++            // PS2X_HIDPI_FIX (default on, =0 off): map the logical screen onto the whole framebuffer.
++            // At fractional desktop scaling (KDE Wayland 125%) GLFW's framebuffer is larger than the
++            // logical window, and raylib's own viewport (screen size, anchored bottom-left) or its
++            // HIGHDPI scale matrix left the picture offset and cropped.
++            rlDrawRenderBatchActive();
++            rlViewport(0, 0, winFbW, winFbH);
++            rlMatrixMode(RL_PROJECTION);
++            rlLoadIdentity();
++            rlOrtho(0.0, static_cast<double>(GetScreenWidth()), static_cast<double>(GetScreenHeight()), 0.0, 0.0, 1.0);
++            rlMatrixMode(RL_MODELVIEW);
++            rlLoadIdentity();
++            static int s_fbLog = 0;
++            static int s_lastFbW = 0, s_lastFbH = 0, s_lastSw = 0, s_lastSh = 0;
++            if (s_fbLog < 16 && (winFbW != s_lastFbW || winFbH != s_lastFbH || GetScreenWidth() != s_lastSw || GetScreenHeight() != s_lastSh))
++            {
++                ++s_fbLog;
++                s_lastFbW = winFbW; s_lastFbH = winFbH; s_lastSw = GetScreenWidth(); s_lastSh = GetScreenHeight();
++                std::fprintf(stderr, "[window] present: screen=%dx%d framebuffer=%dx%d\n", s_lastSw, s_lastSh, winFbW, winFbH);
++            }
++        }
          const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+         const float screenWidth = static_cast<float>(GetScreenWidth());
+@@ -2440,6 +2693,18 @@ void PS2Runtime::run()
+             dstWidth,
+             dstHeight};
+         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        if (!s_winShotPath.empty() && winFbW > 0 && winFbH > 0)
++        {
++            // PS2X_SHOT_WINDOW=1: with each PS2X_SHOT also save the whole window framebuffer.
++            rlDrawRenderBatchActive();
++            unsigned char *px = rlReadScreenPixels(winFbW, winFbH);
++            Image wimg{px, winFbW, winFbH, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++            const bool ok = px && ExportImage(wimg, s_winShotPath.c_str());
++            std::fprintf(stderr, "[shot] window %s %dx%d %s\n", s_winShotPath.c_str(), winFbW, winFbH, ok ? "ok" : "FAILED");
++            if (px)
++                RL_FREE(px);
++            s_winShotPath.clear();
++        }
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
 index 8590f1424bd31e23feeb8cd04f6683766043ba8c..89a47b3b8f3c68d6ae1049d667a9626fc06bda71 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp

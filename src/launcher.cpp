@@ -24,6 +24,10 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <sstream>
+#include <cerrno>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <thread>
 #include <vector>
 
@@ -232,11 +236,19 @@ std::string configPath()
     return (base / "blackkat" / "config.ini").string();
 }
 
+static void parseSettings(std::istream &f, Settings &s);
+
 bool loadSettings(Settings &s)
 {
     std::ifstream f(configPath());
     if (!f)
         return false;
+    parseSettings(f, s);
+    return true;
+}
+
+static void parseSettings(std::istream &f, Settings &s)
+{
     std::string line;
     while (std::getline(f, line))
     {
@@ -259,7 +271,22 @@ bool loadSettings(Settings &s)
         else if (k == "iso_md5_key") s.md5Key = v;
         else if (k == "iso_md5_ok") s.md5Ok = std::atoi(v.c_str());
     }
-    return true;
+}
+
+static std::string serializeSettings(const Settings &s)
+{
+    std::ostringstream f;
+    f << "iso=" << s.iso << "\n"
+      << "elf=" << s.elf << "\n"
+      << "renderer=" << (s.gpu ? "gpu" : "cpu") << "\n"
+      << "scale=" << s.scale << "\n"
+      << "audio=" << (s.audio ? 1 : 0) << "\n"
+      << "movies=" << (s.movies ? 1 : 0) << "\n"
+      << "fullscreen=" << (s.fullscreen ? 1 : 0) << "\n"
+      << "window=" << s.winW << "x" << s.winH << "\n"
+      << "iso_md5_key=" << s.md5Key << "\n"
+      << "iso_md5_ok=" << s.md5Ok << "\n";
+    return f.str();
 }
 
 bool saveSettings(const Settings &s)
@@ -274,16 +301,7 @@ bool saveSettings(const Settings &s)
             return false;
         f << "# BlackKatRecomp launcher settings. Environment variables and command-line options override these.\n"
           << "[launcher]\n"
-          << "iso=" << s.iso << "\n"
-          << "elf=" << s.elf << "\n"
-          << "renderer=" << (s.gpu ? "gpu" : "cpu") << "\n"
-          << "scale=" << s.scale << "\n"
-          << "audio=" << (s.audio ? 1 : 0) << "\n"
-          << "movies=" << (s.movies ? 1 : 0) << "\n"
-          << "fullscreen=" << (s.fullscreen ? 1 : 0) << "\n"
-          << "window=" << s.winW << "x" << s.winH << "\n"
-          << "iso_md5_key=" << s.md5Key << "\n"
-          << "iso_md5_ok=" << s.md5Ok << "\n";
+          << serializeSettings(s);
         if (!f)
             return false;
     }
@@ -354,7 +372,69 @@ void applyToEnv(const Settings &s)
     set("PS2X_WINDOW", std::to_string(s.winW) + "x" + std::to_string(s.winH));
 }
 
+static bool runLauncherUi(Settings &s, const char *argv0);
+
+// The launcher window runs in a forked child process. raylib keeps its window config flags
+// (FLAG_WINDOW_HIGHDPI, needed for the launcher at fractional desktop scaling) and other
+// global state across CloseWindow(); with the launcher in-process the game window inherited
+// HIGHDPI and was offset/cropped at 125% scaling. The child sends the chosen settings back
+// through a pipe. BLACKKAT_LAUNCHER_INPROC=1 restores the in-process launcher.
 bool runLauncher(Settings &s, const char *argv0)
+{
+    const char *inproc = std::getenv("BLACKKAT_LAUNCHER_INPROC");
+    int fds[2];
+    if ((inproc && inproc[0] == '1') || pipe(fds) != 0)
+        return runLauncherUi(s, argv0);
+    std::fflush(nullptr);
+    const pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(fds[0]);
+        close(fds[1]);
+        return runLauncherUi(s, argv0);
+    }
+    if (pid == 0)
+    {
+        close(fds[0]);
+        const bool go = runLauncherUi(s, argv0);
+        if (go)
+        {
+            const std::string out = serializeSettings(s);
+            size_t off = 0;
+            while (off < out.size())
+            {
+                const ssize_t n = write(fds[1], out.data() + off, out.size() - off);
+                if (n <= 0)
+                    break;
+                off += static_cast<size_t>(n);
+            }
+        }
+        close(fds[1]);
+        std::fflush(nullptr);
+        _exit(go ? 0 : 1);
+    }
+    close(fds[1]);
+    std::string in;
+    char buf[4096];
+    for (;;)
+    {
+        const ssize_t n = read(fds[0], buf, sizeof(buf));
+        if (n > 0)
+            in.append(buf, static_cast<size_t>(n));
+        else if (n == 0 || errno != EINTR)
+            break;
+    }
+    close(fds[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || in.empty())
+        return false;
+    std::istringstream is(in);
+    parseSettings(is, s);
+    return true;
+}
+
+static bool runLauncherUi(Settings &s, const char *argv0)
 {
     // Test runs: PS2X_TEST_WINDOW=unfocused|hidden keeps the launcher from taking focus.
     // BLACKKAT_LAUNCHER_SHOT=<png> saves a screenshot after ~1 s; BLACKKAT_LAUNCHER_AUTO=1 then

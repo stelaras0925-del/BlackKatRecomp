@@ -1316,3 +1316,20 @@ PS2X_GS_SCALE_RTT (default on when PS2X_GS_SCALE > 1; =0 off; =force also at 1x)
 PS2X_SPU2_REVERB=1 (default off):
 - What it does: psx-spx/SPU2 reverb per core at 24 kHz on the VMIXEL/VMIXER voices.
 - Black Kat: in the sea battle and the slot-4 on-foot scene the game leaves the effect area at ESA=0xFFFF8 EEA=0xFFFFF with all coefficients and EVOL at 0, so the reverb output is silent (peak 0). It stays off. With it on, wet-only voices lose the old "0.5 dry" stand-in, which matches hardware when EVOL=0.
+
+### 2026-11-20: game window offset and cropped at 125% scaling (launcher HIGHDPI leak)
+
+Symptom: in his real KDE session at 125%, both windowed and fullscreen, the picture was shifted down/right and cut off.
+
+Cause:
+- The launcher set FLAG_WINDOW_HIGHDPI. raylib ORs `SetConfigFlags` into a global, and `CloseWindow()` does not clear it.
+- So the game window was created with HIGHDPI and GLFW_SCALE_TO_MONITOR. GLFW runs on X11 here (XWayland, platform 0x60004).
+- The log showed screen 1280x896 but render/framebuffer 1600x1120, highdpi=1, so the window was scaled by raylib on top of the desktop scaling.
+
+Fix:
+- `src/launcher.cpp`: the launcher UI runs in a forked child, and the settings come back through a pipe. The game process never touches raylib before its own InitWindow. `BLACKKAT_LAUNCHER_INPROC=1` reverts to in-process.
+- `ps2_runtime.cpp`: PS2X_HIDPI_FIX (default on, =0 off). Each frame it maps the logical screen onto the real framebuffer size (glfwGetFramebufferSize) with rlViewport/rlOrtho, so any framebuffer/window mismatch still fills the window.
+- Logging: a `[window] screen/render/framebuffer/dpi/highdpi/platform` line at InitWindow, plus a line when the present size changes.
+- PS2X_SHOT_WINDOW=1 saves the whole window framebuffer with each PS2X_SHOT.
+
+After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, highdpi=0 (dpi 1.25).
