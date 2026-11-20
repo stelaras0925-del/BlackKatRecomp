@@ -1258,6 +1258,105 @@ namespace
          ...);
     }
 
+    // ---- Widescreen (BLACKKAT_WIDESCREEN=1) ------------------------------------------------
+    // 0x1530D8 builds the perspective matrix (called from the camera code 0x102B18..0x103378):
+    //   f12 = vertical-ish FOV in degrees (* pi/360 -> half angle), f13/f14 = screen x/y scale
+    //   (* 1/4096), f15/f16 = near/far. m[0][0] = sin * f13/4096, m[1][1] = -sin * f14/4096 * 4/3
+    //   (lui 0x3FAA / ori 0xAA8F at 0x15314C = 1.33333). Hor+ 16:9: m[0][0] *= (4/3)/(16/9) = 0.75,
+    //   i.e. a wider horizontal FOV with the vertical unchanged; the presenter then shows the
+    //   picture at 16:9 (PS2X_PRESENT_ASPECT). BLACKKAT_WS_XSCALE overrides the factor (debug).
+    constexpr uint32_t kPerspective = 0x001530D8u;
+    PS2Runtime::RecompiledFunction g_origPerspective = nullptr;
+    float g_wsXScale = 1.0f;
+    void blackkatPerspective(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const int s_logMax = []() { const char *e = std::getenv("BLACKKAT_WS_LOG"); return e ? std::atoi(e) : 0; }();
+        static int s_n = 0;
+        const uint32_t m = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        const float fov = ctx->f[12], sx = ctx->f[13], sy = ctx->f[14], zn = ctx->f[15], zf = ctx->f[16];
+        g_origPerspective(rdram, ctx, runtime);
+        uint8_t *p = getMemPtr(rdram, m);
+        if (!p)
+            return;
+        float m00 = 0.0f, m11 = 0.0f;
+        std::memcpy(&m00, p, 4);
+        std::memcpy(&m11, p + 20, 4);
+        if (g_wsXScale != 1.0f)
+        {
+            const float v = m00 * g_wsXScale;
+            std::memcpy(p, &v, 4);
+        }
+        if (s_n < s_logMax)
+        {
+            ++s_n;
+            std::fprintf(stderr, "[ws] persp #%d ra=%x m=%x fov=%g sx=%g sy=%g near=%g far=%g m00=%g -> %g m11=%g\n", s_n, ra, m, fov, sx, sy, zn, zf,
+                         m00, m00 * g_wsXScale, m11);
+        }
+    }
+
+    // ---- 60 fps (BLACKKAT_60FPS=1, experimental) ----------------------------------------
+    // 0x00330D88 (word): vsyncs per game frame (2 in game, 1 = 60 fps); 0x00723308 (float):
+    // frame time used by the game logic (1/30 -> 1/60). Same variables as the public PCSX2
+    // "60 FPS" pnach for SLUS-20365 (PeterDelta, BETA). Re-applied from scePadRead (once per
+    // game frame) because the game re-initialises them.
+    constexpr uint32_t kVsyncsPerFrame = 0x00330D88u, kFrameTime = 0x00723308u;
+    PS2Runtime::RecompiledFunction g_origPadRead60 = nullptr;
+    uint32_t g_fpsVsyncs = 1u;
+    float g_fpsFrameTime = 1.0f / 60.0f;
+    bool g_fpsCountOnly = false; // BLACKKAT_60FPS=count: only measure game frames/s (scePadRead calls)
+    void blackkat60Fps(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        {
+            static auto s_t0 = std::chrono::steady_clock::now();
+            static uint32_t s_calls = 0;
+            ++s_calls;
+            const auto now = std::chrono::steady_clock::now();
+            const double el = std::chrono::duration<double>(now - s_t0).count();
+            if (el >= 5.0)
+            {
+                std::fprintf(stderr, "[60fps] game frames/s %.2f (scePadRead calls)\n", s_calls / el);
+                s_calls = 0;
+                s_t0 = now;
+            }
+        }
+        if (g_fpsCountOnly)
+        {
+            g_origPadRead60(rdram, ctx, runtime);
+            return;
+        }
+        static uint32_t s_lastV = 0xFFFFFFFFu;
+        static uint32_t s_lastT = 0xFFFFFFFFu;
+        if (uint8_t *pv = getMemPtr(rdram, kVsyncsPerFrame))
+        {
+            uint32_t v = 0;
+            std::memcpy(&v, pv, 4);
+            if (v != s_lastV)
+            {
+                std::fprintf(stderr, "[60fps] vsyncs/frame %u -> %u\n", v, g_fpsVsyncs);
+                s_lastV = g_fpsVsyncs;
+            }
+            if (v == 2u)
+                std::memcpy(pv, &g_fpsVsyncs, 4);
+        }
+        if (uint8_t *pt = getMemPtr(rdram, kFrameTime))
+        {
+            uint32_t bits = 0;
+            std::memcpy(&bits, pt, 4);
+            float t = 0.0f;
+            std::memcpy(&t, &bits, 4);
+            uint32_t want = 0;
+            std::memcpy(&want, &g_fpsFrameTime, 4);
+            if (bits != s_lastT && bits != want)
+            {
+                std::fprintf(stderr, "[60fps] frame time %g (0x%08x) -> %g\n", t, bits, g_fpsFrameTime);
+                s_lastT = bits;
+            }
+            if (t > 0.03f && t < 0.04f)
+                std::memcpy(pt, &g_fpsFrameTime, 4);
+        }
+        g_origPadRead60(rdram, ctx, runtime);
+    }
+
     void applyBlackKatNtscU(PS2Runtime &runtime)
     {
         const bool padOk = runtime.replaceFunction(kScePadPortOpen, &blackkatScePadPortOpen);
@@ -1333,6 +1432,27 @@ namespace
                       << (padOk ? "bound" : "FAILED") << std::endl;
         }
         g_origFmvStart = runtime.lookupFunction(kFmvStart);
+        if (const char *ws = std::getenv("BLACKKAT_WIDESCREEN"); ws && ws[0] == '1')
+        {
+            g_wsXScale = 0.75f;
+            if (const char *xs = std::getenv("BLACKKAT_WS_XSCALE"); xs && xs[0])
+                g_wsXScale = std::strtof(xs, nullptr);
+            ::setenv("PS2X_PRESENT_ASPECT", "1.777778", 0);
+            g_origPerspective = runtime.lookupFunction(kPerspective);
+            const bool ok = g_origPerspective && runtime.replaceFunction(kPerspective, &blackkatPerspective);
+            std::cerr << "[blackkat] widescreen 16:9: perspective@0x1530D8 x-scale " << g_wsXScale << " "
+                      << (ok ? "bound" : "FAILED") << ", present aspect " << std::getenv("PS2X_PRESENT_ASPECT") << std::endl;
+        }
+        if (const char *f60 = std::getenv("BLACKKAT_60FPS"); f60 && (f60[0] == '1' || f60[0] == 'c'))
+        {
+            g_fpsCountOnly = (f60[0] == 'c');
+            if (const char *v = std::getenv("BLACKKAT_60FPS_VSYNCS"); v && v[0]) g_fpsVsyncs = static_cast<uint32_t>(std::atoi(v));
+            if (const char *ft = std::getenv("BLACKKAT_60FPS_DT"); ft && ft[0]) g_fpsFrameTime = std::strtof(ft, nullptr);
+            g_origPadRead60 = runtime.lookupFunction(kScePadRead);
+            const bool ok = g_origPadRead60 && runtime.replaceFunction(kScePadRead, &blackkat60Fps);
+            std::cerr << "[blackkat] experimental 60 fps: vsyncs/frame=" << g_fpsVsyncs << " frame time=" << g_fpsFrameTime << " "
+                      << (ok ? "bound" : "FAILED") << std::endl;
+        }
         if (const char *bl = std::getenv("BLACKKAT_BONELOG"); bl && std::atoi(bl) > 0)
         {
             g_origMatMul = runtime.lookupFunction(kMatMul);

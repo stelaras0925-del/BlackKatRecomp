@@ -18,6 +18,7 @@ struct Settings
     bool audio = true;      // host audio output
     bool movies = true;     // play FMVs (IPU) or skip them
     bool fullscreen = false;
+    bool widescreen = false; // aspect ratio: false 4:3 (original), true 16:9 (hor+ FOV, HUD stretched)
     int winW = 1280, winH = 896;
     std::string monitor;    // monitor for the game (and launcher) window: connector name (DP-2...), index, or "" = primary
     // Options
