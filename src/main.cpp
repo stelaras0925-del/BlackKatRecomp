@@ -6,6 +6,7 @@
 // the function table is empty and loadELF still boots the runtime.
 
 #include "ps2_runtime.h"
+#include "launcher.h"
 #include "runtime/ee_scheduler.h"
 
 #include <cstdlib>
@@ -470,7 +471,74 @@ int main(int argc, char *argv[])
 
     try
     {
-        const std::filesystem::path elfPath = guestElfPath(argc, argv);
+        // Command line:
+        //   blackkat                      launcher (settings from ~/.config/blackkat/config.ini)
+        //   blackkat --launcher [opts]    launcher, options pre-fill it
+        //   blackkat --play [opts]        start with the saved settings, no launcher
+        //   blackkat [elf] [iso]          classic: no launcher, no config file (env vars only)
+        // opts: --iso P --elf P --gpu --cpu --scale N --fullscreen --windowed[=WxH] --audio --no-audio
+        //       --movies --no-movies. Environment variables override all of these.
+        std::filesystem::path cliElf, cliIso;
+        {
+            bool launcher = (argc <= 1), play = false, classic = false;
+            bklaunch::Settings set;
+            std::vector<std::string> opts(argv + 1, argv + argc);
+            const bool anyDash = std::any_of(opts.begin(), opts.end(), [](const std::string &a) { return a.rfind("--", 0) == 0; });
+            if (anyDash)
+                bklaunch::loadSettings(set);
+            for (size_t i = 0; i < opts.size(); ++i)
+            {
+                const std::string &a = opts[i];
+                auto next = [&]() -> std::string { return i + 1 < opts.size() ? opts[++i] : std::string(); };
+                if (a == "--launcher") launcher = true;
+                else if (a == "--play") play = true;
+                else if (a == "--iso") set.iso = next();
+                else if (a == "--elf") set.elf = next();
+                else if (a == "--gpu") set.gpu = true;
+                else if (a == "--cpu") set.gpu = false;
+                else if (a == "--scale") set.scale = std::clamp(std::atoi(next().c_str()), 1, 4);
+                else if (a == "--fullscreen") set.fullscreen = true;
+                else if (a.rfind("--windowed", 0) == 0) { set.fullscreen = false; int w = 0, h = 0; if (std::sscanf(a.c_str(), "--windowed=%dx%d", &w, &h) == 2) { set.winW = w; set.winH = h; } }
+                else if (a == "--audio") set.audio = true;
+                else if (a == "--no-audio") set.audio = false;
+                else if (a == "--movies") set.movies = true;
+                else if (a == "--no-movies") set.movies = false;
+                else if (a == "--help" || a == "-h")
+                {
+                    std::cout << "Usage: blackkat [--launcher|--play] [--iso P] [--elf P] [--gpu|--cpu] [--scale 1-4]\n"
+                                 "                [--fullscreen|--windowed[=WxH]] [--audio|--no-audio] [--movies|--no-movies]\n"
+                                 "       blackkat [path/to/SLUS_203.65] [path/to/disc.iso]   (classic, no launcher/config)\n"
+                                 "Settings: " << bklaunch::configPath() << std::endl;
+                    return 0;
+                }
+                else if (a.rfind("--", 0) == 0) { std::cerr << "blackkat: unknown option " << a << " (see --help)" << std::endl; return 1; }
+                else classic = true;
+            }
+            if (!classic && (launcher || play || anyDash))
+            {
+                if (argc <= 1)
+                    bklaunch::loadSettings(set);
+                if (set.elf.empty())
+                    set.elf = bklaunch::defaultElf(argv[0]);
+                if (launcher && !play)
+                {
+                    if (!bklaunch::runLauncher(set, argv[0]))
+                        return 0;
+                }
+                else
+                {
+                    const bklaunch::IsoCheck chk = bklaunch::checkIso(set.iso, &set);
+                    if (!chk.ok())
+                        std::cerr << "[blackkat] disc image check: " << chk.message << " (" << set.iso << ")" << std::endl;
+                }
+                bklaunch::applyToEnv(set);
+                cliElf = set.elf.empty() ? std::filesystem::path("game") / "SLUS_203.65" : std::filesystem::path(set.elf);
+                std::cerr << "[blackkat] launcher settings: iso=" << set.iso << " elf=" << set.elf << " gpu=" << set.gpu
+                          << " scale=" << set.scale << " audio=" << set.audio << " movies=" << set.movies
+                          << " fullscreen=" << set.fullscreen << " window=" << set.winW << "x" << set.winH << std::endl;
+            }
+        }
+        const std::filesystem::path elfPath = cliElf.empty() ? guestElfPath(argc, argv) : cliElf;
         if (!std::filesystem::exists(elfPath))
         {
             std::cerr
@@ -501,7 +569,7 @@ int main(int argc, char *argv[])
         // blackkat [elf] [iso], or BLACKKAT_ISO=/path/to/game.iso
         {
             std::filesystem::path iso;
-            if (argc >= 3 && argv[2] != nullptr && argv[2][0] != '\0')
+            if (cliElf.empty() && argc >= 3 && argv[2] != nullptr && argv[2][0] != '\0')
                 iso = argv[2];
             else if (const char *env = std::getenv("BLACKKAT_ISO"); env && env[0])
                 iso = env;

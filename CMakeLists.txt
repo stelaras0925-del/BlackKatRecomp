@@ -32,6 +32,30 @@ set(PS2X_BUILD_RUNTIME ON CACHE BOOL "Build ps2xRuntime")
 set(PS2X_BUILD_STUDIO OFF CACHE BOOL "Build ps2xStudio (not required to port Black Kat)")
 set(PS2X_BUILD_TEST OFF CACHE BOOL "Build ps2xTest")
 
+# The port needs BlackKatRecomp's changes on top of the pinned PS2Recomp (patches/ps2recomp-series).
+# Configure only checks them (no files are modified); tools/apply_patches.sh applies them.
+option(BKR_APPLY_PATCHES "Check at configure time that the PS2Recomp patch series is applied" ON)
+if(BKR_APPLY_PATCHES)
+    find_program(BKR_BASH bash REQUIRED)
+    execute_process(
+        COMMAND "${BKR_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_patches.sh" --check --quiet
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE bkr_patch_result
+        OUTPUT_VARIABLE bkr_patch_out
+        ERROR_VARIABLE bkr_patch_err)
+    if(bkr_patch_result EQUAL 2)
+        message(FATAL_ERROR "PS2Recomp patches are not applied to third_party/PS2Recomp.\n"
+            "Run from the repository root:  tools/apply_patches.sh\n"
+            "(or configure with -DBKR_APPLY_PATCHES=OFF to skip this check)\n${bkr_patch_err}")
+    elseif(NOT bkr_patch_result EQUAL 0)
+        # Usually local work in the submodule on top of the series: keep building, but say so.
+        message(WARNING "third_party/PS2Recomp differs from patches/ps2recomp-series (local changes, or a "
+            "conflicting checkout). Run tools/apply_patches.sh --check for details; --reset restores the pin.")
+    else()
+        message(STATUS "PS2Recomp patch series: applied")
+    endif()
+endif()
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PreparePs2RecompOverlay.cmake")
 bkr_prepare_ps2recomp_overlay("${CMAKE_CURRENT_SOURCE_DIR}/third_party/PS2Recomp")
 
@@ -61,11 +85,21 @@ if(NOT TARGET ps2_runtime)
     message(STATUS
         "BlackKatRecomp: ps2_runtime was not built, so the blackkat game target is skipped.")
 else()
+    # Launcher UI (Dear ImGui through rlImGui, both fetched by PS2Recomp's runtime CMake) in its
+    # own library: linking rlImGui to blackkat directly would add its include paths to every
+    # generated source and rebuild all of them.
+    if(NOT TARGET rlImGui)
+        message(FATAL_ERROR "rlImGui target missing (needed by the blackkat launcher)")
+    endif()
+    add_library(blackkat_launcher STATIC src/launcher.cpp)
+    target_link_libraries(blackkat_launcher PRIVATE rlImGui)
+    target_compile_features(blackkat_launcher PRIVATE cxx_std_20)
+
     add_executable(blackkat
         src/main.cpp
         src/overrides/blackkat_slus_20365.cpp
     )
-    target_link_libraries(blackkat PRIVATE ps2_runtime)
+    target_link_libraries(blackkat PRIVATE ps2_runtime blackkat_launcher)
     target_include_directories(blackkat PRIVATE "${BKR_GENERATED_DIR}")
     target_compile_features(blackkat PRIVATE cxx_std_20)
     set_target_properties(blackkat PROPERTIES

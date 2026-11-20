@@ -1,0 +1,58 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 4bf8dc550c05ba3e576b1288f1b5c0f2aaac3d98..95f69d7a3fa87f1c5126e80c6d1b7fd6e11943fe 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -406,10 +406,10 @@ namespace ps2recomp
+             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
+         case OPCODE_BLEZ:
+         case OPCODE_BLEZL:
+-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
+         case OPCODE_BGTZ:
+         case OPCODE_BGTZL:
+-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
+         case OPCODE_REGIMM:
+             switch (m_branchInst.rt)
+             {
+@@ -417,12 +417,12 @@ namespace ps2recomp
+             case REGIMM_BLTZL:
+             case REGIMM_BLTZAL:
+             case REGIMM_BLTZALL:
+-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
+             case REGIMM_BGEZ:
+             case REGIMM_BGEZL:
+             case REGIMM_BGEZAL:
+             case REGIMM_BGEZALL:
+-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
+             default:
+                 return "false";
+             }
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 0485d500608d302758ceacbb6cf5b8bebe542dba..d0ad3aad30b473718daedc66fd623b49c3d3319c 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -853,7 +853,20 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
+ #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+ #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
++// EE FPU CVT.W.S always truncates toward zero (it ignores any rounding mode) and saturates:
++// |x| >= 2^31 (or Inf/NaN bit patterns) gives 0x7FFFFFFF for positive, 0x80000000 for negative.
++// nearbyintf() rounded half-way values to even (1.5 -> 2, 3.5 -> 4), which broke code that splits
++// a coordinate into int + fraction (e.g. Black Kat's terrain upsampler at 0x163058 -> every 4th
++// height row/column became 0 -> tall square columns).
++static inline int32_t ps2_fpu_cvt_w_s(float a)
++{
++    uint32_t bits;
++    std::memcpy(&bits, &a, sizeof(bits));
++    if (((bits >> 23) & 0xFFu) >= 158u)
++        return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
++    return static_cast<int32_t>(a);
++}
++#define FPU_CVT_W_S(a) ps2_fpu_cvt_w_s((float)(a))
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+ #define FPU_C_F_S(a, b) (0)
+ #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

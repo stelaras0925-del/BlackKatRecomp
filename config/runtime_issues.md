@@ -1267,3 +1267,124 @@ Checked with movies on (hidden window, /tmp mc0): intro plays to the end and the
 X / C (Circle, ESC maps to Circle too) skips; menu background movies; New Game -> SEQ_01 movie (skipped) -> sea battle;
 slot-4 load (keyscript needs an extra X at 5 s to skip the intro and +3 s on the old timings).
 Debug additions: PS2X_IPU_TRACE=<file>; [shot] and "[spu2] first ADMA block" lines carry mono= (steady clock) for A/V checks.
+
+## Patch series, launcher, GS internal resolution (2026-11-20)
+
+Patches: the 45 historical `patches/ps2recomp-*.patch` files do not chain. Applied in order on the pin, 32 of 45
+fail, because they were written against intermediate states. `patches/ps2recomp-series/` (0001-0005, split by file,
+no overlaps) is generated from the submodule working tree and is what `tools/apply_patches.sh` applies
+(`--check`, `--reset [-y]`). Configure checks it (`BKR_APPLY_PATCHES`, default ON): pending patches are an error;
+local changes beyond the series are a warning. Refresh 0003 and 0005 whenever gs_gpu_backend.inl,
+gs_frontend.cpp or ps2_runtime.cpp change (see patches/README.md).
+
+Launcher: `blackkat` with no args (or `--launcher`) opens a raylib + Dear ImGui (rlImGui) window.
+It saves to `$XDG_CONFIG_HOME/blackkat/config.ini`. `--play` uses the saved settings with no UI.
+A positional arg selects classic mode (no config).
+The settings are exported as env vars with setenv(overwrite=0), so env > CLI/config.
+Test hooks: BLACKKAT_LAUNCHER_SHOT=<png> (screenshot at frame 60), BLACKKAT_LAUNCHER_AUTO=1 (presses Launch at frame 70).
+Build note: src/launcher.cpp is in its own static lib (blackkat_launcher). Linking rlImGui to `blackkat` directly
+adds include paths to every generated .cpp and rebuilds all ~37.9k of them; this happened once (2,369 rebuilt
+before it was stopped).
+
+PS2X_GS_SCALE=N (1-4, GPU renderer only):
+- GPU targets are allocated at kDim*N, and draws use an N-times viewport and scissor (vertex coords are unchanged).
+- CPU-visible VRAM stays native. Resolves blit the target down to a native scratch FBO (LINEAR by default,
+  PS2X_GS_SCALE_RESOLVE=nearest), and uploads go into native then NEAREST up.
+- Present reads the display rect straight from the scaled target when it is the DISPFB target and is not stale.
+  Otherwise it falls back to native and logs `[gs:gpu:scale] native present (<reason>)`.
+- Effects that read back through VRAM (render-to-texture reflections, FMV) stay at native res.
+- Window: PS2X_WINDOW=WxH and PS2X_FULLSCREEN=1 (borderless). UploadFrame grows its texture for >640-wide frames.
+
+### Overnight 2026-11-20: clean-clone build, RTT at internal resolution, SPU2 reverb
+
+Clean-clone check:
+- Setup: `/tmp/bk-clean` is a clone of the branch plus the working-tree changes. The submodule comes from GitHub at the pin. `tools/apply_patches.sh` applies the series.
+- Result: identical to the dev tree. Configure took 69 s and the build 2h23m at `nice 19 -j8` (38,049 steps, 0 errors, 16 warnings).
+- Problem: the result ran at only 5 vsync/s. Upstream `PS2X_ENABLE_AGRESSIVE_LOGS` defaults to ON, and the dev tree had it OFF in its cache.
+- Fix: `CMakePresets.json` linux-base now sets it OFF.
+
+PS2X_GS_SCALE_RTT (default on when PS2X_GS_SCALE > 1; =0 off; =force also at 1x):
+- What it does: a draw whose TEX0 is a whole render target (TBP0 = FBP*32, TBW = FBW, CT32/CT24 on both sides, not stale, not the target being drawn) samples the scaled GPU target directly. Before, it went through the native resolve plus CPU decode.
+- Shader: rgb = c/255; alpha is A/128 from the target, or TEXA for CT24. Wrap is done in the shader (fract or clamp), and st is scaled by texSize/kDim.
+- Black Kat: the 256x256 effect buffers (fbp 0x17e, and 0x46/0x15e at fbw 4) hit this path. The water reflection is visibly sharper at 2x.
+- Remaining misses:
+  - `stale`: 0x17e lies inside the 0x15e back buffer, so a draw there marks it stale;
+  - `width`: the 1024x512 full-frame sample at tbw 10.
+  These still use the native path.
+- Speed: 2x sea battle 59.99 vsync/s, slot-4 59.99, 4x 60.00.
+
+PS2X_SPU2_REVERB=1 (default off):
+- What it does: psx-spx/SPU2 reverb per core at 24 kHz on the VMIXEL/VMIXER voices.
+- Black Kat: in the sea battle and the slot-4 on-foot scene the game leaves the effect area at ESA=0xFFFF8 EEA=0xFFFFF with all coefficients and EVOL at 0, so the reverb output is silent (peak 0). It stays off. With it on, wet-only voices lose the old "0.5 dry" stand-in, which matches hardware when EVOL=0.
+
+### 2026-11-20: game window offset and cropped at 125% scaling (launcher HIGHDPI leak)
+
+Symptom: in his real KDE session at 125%, both windowed and fullscreen, the picture was shifted down/right and cut off.
+
+Cause:
+- The launcher set FLAG_WINDOW_HIGHDPI. raylib ORs `SetConfigFlags` into a global, and `CloseWindow()` does not clear it.
+- So the game window was created with HIGHDPI and GLFW_SCALE_TO_MONITOR. GLFW runs on X11 here (XWayland, platform 0x60004).
+- The log showed screen 1280x896 but render/framebuffer 1600x1120, highdpi=1, so the window was scaled by raylib on top of the desktop scaling.
+
+Fix:
+- `src/launcher.cpp`: the launcher UI runs in a forked child, and the settings come back through a pipe. The game process never touches raylib before its own InitWindow. `BLACKKAT_LAUNCHER_INPROC=1` reverts to in-process.
+- `ps2_runtime.cpp`: PS2X_HIDPI_FIX (default on, =0 off). Each frame it maps the logical screen onto the real framebuffer size (glfwGetFramebufferSize) with rlViewport/rlOrtho, so any framebuffer/window mismatch still fills the window.
+- Logging: a `[window] screen/render/framebuffer/dpi/highdpi/platform` line at InitWindow, plus a line when the present size changes.
+- PS2X_SHOT_WINDOW=1 saves the whole window framebuffer with each PS2X_SHOT.
+
+After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, highdpi=0 (dpi 1.25).
+
+## Controller support (pad v2, 2026-11-20)
+- Path: game libpad -> HLE stubs `Kernel/Stubs/Pad.cpp` -> `PSPadBackend::readState` (`ps2_pad.cpp`).
+  The game uses DualShock mode, pressure mode (scePadEnterPressMode) and vibration (scePadSetActAlign/SetActDirect;
+  in-game it sends big-motor 255 pulses).
+- Only joysticks with an SDL/GLFW gamepad mapping are used (the GameSir dongle's "2.4G XBOX 360 For Windows
+  Keyboard" and the G502 mouse expose joystick nodes and are now skipped). Extra mappings: SDL_GAMECONTROLLERCONFIG,
+  PS2X_GAMEPAD_DB=<file>, or ~/.config/blackkat/gamecontrollerdb.txt. Unmapped xpad-layout pads (6 axes, 11/15
+  buttons, 1 hat) get an Xbox 360 mapping (the GameSir Nova 2 Lite in XInput mode, 3537:100f, is not in GLFW's db).
+- Radial deadzone PS2X_PAD_DEADZONE (default 0.20). Analog L2/R2 from the triggers (feeds pressure bytes). Pressure
+  bytes fixed to the PS2SDK order (..., L1, R1, L2, R2; upstream had L2/R1 swapped).
+- Rumble: evdev FF_RUMBLE on the event node matching the gamepad name; small motor on/off, big motor 0..255,
+  1 s effect refreshed every 400 ms while active.
+- Gotcha: `<linux/input.h>` #defines KEY_X/KEY_UP/...; included at the top it silently remapped raylib keys and broke
+  keyboard input. It is now included after the keyboard code.
+- Flags: PS2X_PAD_LEGACY=1 (old path), PS2X_PAD_ALLJOY=1, PS2X_PAD_XPAD_GUESS=0, PS2X_PAD_RUMBLE=0,
+  PS2X_PAD_RUMBLE_TEST=1 (one 300 ms pulse), PS2X_PAD_DEADZONE=x, PS2X_PAD_EXCLUSIVE=1, PS2X_PAD_LOG=1.
+
+### Rumble fix (2026-11-20): vibration kept going (e.g. after digging up a treasure)
+- The game sends scePadSetActDirect every frame (~30/s): align 00 01 ff.. (byte0 = small motor, byte1 = big motor);
+  byte3 toggles 00/40 but is unaligned (ignored). A hit in the opening = big ff for ~130 ms, then 0.
+- Causes: (1) small motor was "any nonzero = on"; a DualShock 2 only uses bit 0 (PCSX2: `vibrationMotors[0] & 0x01`),
+  so even values the game uses as "off" kept it buzzing; (2) 1 s effects renewed every 400 ms outlived the game's
+  requests when it stopped sending (cutscene/FMV/load/pause); (3) a failed effect update skipped the stop, and port
+  close / mode change / scePadEnd did not stop the motor.
+- Fix: small = value & 1; 200 ms effects renewed every 100 ms only while the game sends nonzero; explicit EV_FF 0 +
+  EVIOCRMFF on every stop; failed upload -> erase + one fresh upload; watchdog thread stops the motor 150 ms after the
+  last request; stop on window focus loss, scePadPortClose, scePadSetMainMode, scePadEnd, device change and exit
+  (the kernel also flushes the fd's effects on process death).
+- Flags: PS2X_PAD_RUMBLE_WATCHDOG_MS (default 150, 0 off), PS2X_PAD_SMALL_ANY=1 (old small-motor rule),
+  PS2X_PAD_RUMBLE_UNFOCUSED=1 (keep rumbling unfocused), PS2X_PAD_RUMBLE=0 (+PS2X_PAD_LOG=1 logs what would be
+  sent: "[pad] rumble play/stop (...)", raw calls as "[padact]").
+
+## Button prompt style (PS2 / Xbox), 2026-11-20
+- The game draws prompts from small PSMCT16 (RGBA5551, 1-bit alpha) textures, not font glyphs:
+  four 32x32 face icons (menus, uploaded once at boot to TBP 0x2de0 triangle / 0x2de8 square / 0x2df0 cross /
+  0x2df8 circle) and two 64x64 HUD atlases streamed to TBP 0x3660 whenever drawn (face buttons: circle, square /
+  triangle, cross; shoulder pills: L1, L2 / R1, R2 - e.g. "[L2] Press to clear", the weapon-slot badge).
+- Swap: generic runtime hook at GS host->local upload (`gs/gs_texrep.inl`, called from GS::processImageData).
+  Complete single-packet CT16/CT32 uploads up to 128x128 whose byte size is registered are hashed
+  (ps2x_texrep::hash64) and replaced when they match. Tables are registered with ps2xTexRepAdd() by the game
+  override (`blackkat_prompts::install`, BLACKKAT_BUTTON_STYLE=ps2|xbox|auto; auto = xbox when a non-PlayStation
+  gamepad is present at start, via GLFW directly because raylib's pad state is filled only by its first poll).
+- Art: original, generated by tools/gen_button_prompts.py (procedural ball/pill + stroke letters, no fonts or
+  vendor assets) -> assets/button_prompts/xbox/*.png previews and src/overrides/blackkat_button_prompts.inc.
+  Mapping by pad position: Cross->A, Circle->B, Square->X, Triangle->Y, L1->LB, R1->RB, L2->LT, R2->RT.
+- Debug: PS2X_TEXREP_LOG=1 (log uploads + hashes), PS2X_TEXREP_DUMP=<dir> (raw dumps; /tmp only).
+- Not covered: Select/Start prompts (no texture seen so far), text that names buttons in words, FMVs.
+
+## Launcher v2 (pirate theme), 2026-11-20
+- `src/launcher.cpp` UI rewritten (backup `src/launcher.cpp.pre-v2.bak`); config.ini keys/format unchanged, fork-child HiDPI path unchanged.
+- raylib-drawn night sea (gradient, moon, stars, animated waves) + ImGui on a dark-wood/gold panel; sections Game / Display / Controls; segmented buttons (renderer, 1x-4x with output size, window mode, button prompts); "Set Sail" button with glow on hover/focus.
+- Fonts: system Noto Sans (UI) / Noto Serif Bold (title) located via `fc-match` at runtime (SIL OFL, nothing bundled); falls back to ImGui default font scaled 1.25 if fc-match finds no .ttf/.otf.
+- Navigation: keyboard + gamepad (d-pad/stick move, A select, B back, Start = Set Sail, Enter = Set Sail). Debug: `BLACKKAT_LAUNCHER_NAV=1` shows the nav cursor (used for screenshots).
+- No ISO-derived background art (would need game-format decoding at runtime; not worth it).
