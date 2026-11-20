@@ -471,7 +471,7 @@ index f0ad5070b42f89c6c697c906e93f59cebf2ba904..1085c7dc95b90055ebd1fd6fe5f11136
 +    return h;
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f51b809c4f755837ccf45e47604d539bf7..1215addadd51420efcea7fca0bc29792409201e7 100644
+index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e951089618 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -1,6 +1,8 @@
@@ -1343,9 +1343,16 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..1215addadd51420efcea7fca0bc29792
          m_backend->Submit(batch);
          recordDrawDebugEventUnlocked(needed);
      }
-@@ -1611,6 +2374,14 @@ void GS::vertexKick(bool drawing)
+@@ -1608,9 +2371,21 @@ void GS::vertexKick(bool drawing)
+     }
+ }
+ 
++#include "gs_texrep.inl"
++
  void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
  {
++    if (const uint8_t *rep = ps2x_texrep::onUpload(m_bitbltbuf, m_trxpos, m_trxreg, data, sizeBytes))
++        data = rep;
      if (m_backend)
 +        if (g_gsWatch.lo >= 0 && (long)m_bitbltbuf.dbp >= g_gsWatch.lo && (long)m_bitbltbuf.dbp < g_gsWatch.hi && g_gsWatch.lines < 400)
 +        {
@@ -1358,7 +1365,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..1215addadd51420efcea7fca0bc29792
          m_backend->UploadImage(data, sizeBytes);
  }
  
-@@ -1629,6 +2400,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
+@@ -1629,6 +2404,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
  
  uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -1366,7 +1373,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..1215addadd51420efcea7fca0bc29792
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
  }
-@@ -1698,7 +2470,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+@@ -1698,7 +2474,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
      const uint64_t tex1 = batch.state.context.tex1;
      const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
      const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
@@ -1381,7 +1388,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..1215addadd51420efcea7fca0bc29792
      return batch;
  }
  
-@@ -1734,3 +2512,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
+@@ -1734,3 +2516,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
          m_hasPreferredDisplaySource = true;
      }
  }
@@ -3642,3 +3649,126 @@ index 0000000000000000000000000000000000000000..a8f05f2d9445f90f61352115eed25935
 +    return dynamic_cast<const gsgpu::GSGpuBackend *>(backend) != nullptr;
 +}
 +} // namespace
+diff --git a/ps2xRuntime/src/lib/gs/gs_texrep.inl b/ps2xRuntime/src/lib/gs/gs_texrep.inl
+new file mode 100644
+index 0000000000000000000000000000000000000000..02b63fb9dc5d8410871f70ab8ed6b21c0edc9a4a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_texrep.inl
+@@ -0,0 +1,117 @@
++// Host->local texture upload hook (included by gs_frontend.cpp).
++// Debug: PS2X_TEXREP_LOG=1 logs small single-packet CT16/CT32 uploads (<=128x128) with their hash64;
++// PS2X_TEXREP_DUMP=<dir> also writes each distinct one as <dir>/<hash>_<dbp>_<w>x<h>_psm<p>.raw.
++#include <unordered_set>
++#include <unordered_map>
++#include <atomic>
++#include <mutex>
++#include <string>
++#include <vector>
++namespace ps2x_texrep
++{
++    // Fast 64-bit hash of upload bytes (8 bytes per step). Replacement tables key on this value.
++    inline uint64_t hash64(const uint8_t *p, size_t n)
++    {
++        uint64_t h = 0xcbf29ce484222325ull ^ static_cast<uint64_t>(n);
++        size_t i = 0;
++        for (; i + 8 <= n; i += 8)
++        {
++            uint64_t w;
++            std::memcpy(&w, p + i, 8);
++            h ^= w;
++            h *= 0x100000001b3ull;
++            h ^= h >> 29;
++        }
++        for (; i < n; ++i) { h ^= p[i]; h *= 0x100000001b3ull; }
++        return h;
++    }
++    inline uint32_t bytesPerPixel(uint8_t psm)
++    {
++        switch (psm) { case 0x00: return 4u; case 0x02: case 0x0A: return 2u; default: return 0u; }
++    }
++    struct Debug
++    {
++        bool log = false;
++        std::string dumpDir;
++        std::unordered_set<uint64_t> seen;
++        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++        Debug()
++        {
++            log = std::getenv("PS2X_TEXREP_LOG") && std::getenv("PS2X_TEXREP_LOG")[0] == '1';
++            if (const char *d = std::getenv("PS2X_TEXREP_DUMP")) { dumpDir = d; log = true; }
++        }
++    };
++    inline Debug &debug() { static Debug d; return d; }
++
++    // Replacement table: original-data hash -> replacement bytes (same size/format). Filled at startup by
++    // game overrides through ps2xTexRepAdd() (e.g. Black Kat's Xbox-style button prompts).
++    struct Table
++    {
++        std::mutex m;
++        std::unordered_map<uint64_t, std::pair<std::string, std::vector<uint8_t>>> map;
++        std::atomic<uint64_t> sizeMask{0}; // bit (size>>8)&63 set for every registered byte size (cheap prefilter)
++        std::atomic<bool> any{false};
++        std::atomic<uint32_t> hits{0};
++    };
++    inline Table &table() { static Table *t = new Table(); return *t; }
++
++    // Returns replacement pixels (same size) or nullptr.
++    inline const uint8_t *onUpload(const GSBitBltBuf &bb, const GSTrxPos &pos, const GSTrxReg &reg, const uint8_t *data, uint32_t size)
++    {
++        Table &tab = table();
++        if (!tab.any.load(std::memory_order_relaxed) && !debug().log)
++            return nullptr;
++        const uint32_t bpp = bytesPerPixel(bb.dpsm);
++        if (!bpp || reg.rrw == 0 || reg.rrh == 0 || reg.rrw > 128 || reg.rrh > 128)
++            return nullptr;
++        if (size != static_cast<uint32_t>(reg.rrw) * reg.rrh * bpp)
++            return nullptr; // only complete single-packet uploads
++        Debug &dbg = debug();
++        if (!dbg.log && !(tab.sizeMask.load(std::memory_order_relaxed) & (1ull << ((size >> 8) & 63u))))
++            return nullptr;
++        const uint64_t h = hash64(data, size);
++        const uint8_t *rep = nullptr;
++        if (tab.any.load(std::memory_order_relaxed))
++        {
++            std::lock_guard<std::mutex> lk(tab.m);
++            auto it = tab.map.find(h);
++            if (it != tab.map.end() && it->second.second.size() == size)
++            {
++                rep = it->second.second.data(); // stable: entries are never erased
++                tab.hits.fetch_add(1);
++                static std::unordered_set<uint64_t> s_logged; // first replacement of each texture (or all with PS2X_TEXREP_LOG)
++                if (dbg.log || s_logged.insert(h).second)
++                    std::fprintf(stderr, "[texrep] replaced upload dbp=%x %ux%u psm=%x hash=%016llx -> %s\n", bb.dbp, reg.rrw, reg.rrh,
++                                 bb.dpsm, (unsigned long long)h, it->second.first.c_str());
++            }
++        }
++        if (!dbg.log)
++            return rep;
++        if (dbg.seen.insert(h).second)
++        {
++            std::fprintf(stderr, "[texrep] t=%.3f upload dbp=%x dbw=%u pos=(%u,%u) %ux%u psm=%x hash=%016llx\n",
++                         std::chrono::duration<double>(std::chrono::steady_clock::now() - dbg.t0).count(), bb.dbp, bb.dbw,
++                         pos.dsax, pos.dsay, reg.rrw, reg.rrh, bb.dpsm, (unsigned long long)h);
++            if (!dbg.dumpDir.empty())
++            {
++                char name[512];
++                std::snprintf(name, sizeof(name), "%s/%016llx_%x_%ux%u_psm%x.raw", dbg.dumpDir.c_str(), (unsigned long long)h, bb.dbp,
++                              reg.rrw, reg.rrh, bb.dpsm);
++                if (FILE *f = std::fopen(name, "wb")) { std::fwrite(data, 1, size, f); std::fclose(f); }
++            }
++        }
++        return rep;
++    }
++}
++
++// Register a texture replacement: uploads whose data hashes to origHash (hash64 over the raw upload
++// bytes, ps2x_texrep::hash64; see PS2X_TEXREP_LOG) get `data` written instead. Must be the same size and pixel format.
++void ps2xTexRepAdd(uint64_t origHash, const void *data, uint32_t size, const char *name)
++{
++    auto &tab = ps2x_texrep::table();
++    std::lock_guard<std::mutex> lk(tab.m);
++    const auto *b = static_cast<const uint8_t *>(data);
++    tab.map[origHash] = {name ? name : "?", std::vector<uint8_t>(b, b + size)};
++    tab.sizeMask.fetch_or(1ull << ((size >> 8) & 63u));
++    tab.any.store(true);
++}

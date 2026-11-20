@@ -19,6 +19,10 @@ struct Settings
     bool movies = true;     // play FMVs (IPU) or skip them
     bool fullscreen = false;
     int winW = 1280, winH = 896;
+    // Options
+    int buttons = 0;        // button prompts: 0 PS2 (original), 1 Xbox, 2 auto (Xbox when an Xbox-style pad is connected)
+    bool rumble = true;     // controller vibration
+    float deadzone = 0.20f; // stick deadzone (0..0.9)
     // ISO md5 cache (md5 of SLUS_203.65 inside the image), keyed by path|size|mtime
     std::string md5Key;
     int md5Ok = 0;          // 1 ok, -1 mismatch, 0 unknown
