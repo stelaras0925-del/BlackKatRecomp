@@ -5,8 +5,11 @@
 #include "launcher.h"
 
 #include "raylib.h"
+#include "rlgl.h"
 #include "imgui.h"
 #include "rlImGui.h"
+#include "imgui_impl_raylib.h"
+#include "imgui_internal.h" // input queue (mouse position rescale)
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -24,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string>
@@ -35,6 +39,14 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+
+// Monitor selection, implemented in the runtime (ps2xRuntime/src/lib/ps2_monitor.inl).
+int ps2xMonitorResolve(const char *spec, const char *tag);
+void ps2xMonitorPlace(int mon, bool fullscreen, bool testHidden, bool allowResize, const char *tag);
+std::string ps2xMonitorListText();
+
+struct GLFWwindow;
+extern "C" void glfwGetFramebufferSize(GLFWwindow *window, int *width, int *height);
 
 namespace bklaunch
 {
@@ -270,6 +282,7 @@ static void parseSettings(std::istream &f, Settings &s)
         else if (k == "audio") s.audio = b();
         else if (k == "movies") s.movies = b();
         else if (k == "fullscreen") s.fullscreen = b();
+        else if (k == "monitor") s.monitor = v;
         else if (k == "window") { int w = 0, h = 0; if (std::sscanf(v.c_str(), "%dx%d", &w, &h) == 2 && w >= 320 && h >= 200) { s.winW = w; s.winH = h; } }
         else if (k == "button_prompts") s.buttons = (v == "xbox") ? 1 : (v == "auto") ? 2 : 0;
         else if (k == "rumble") s.rumble = b();
@@ -290,6 +303,7 @@ static std::string serializeSettings(const Settings &s)
       << "movies=" << (s.movies ? 1 : 0) << "\n"
       << "fullscreen=" << (s.fullscreen ? 1 : 0) << "\n"
       << "window=" << s.winW << "x" << s.winH << "\n"
+      << "monitor=" << s.monitor << "\n"
       << "button_prompts=" << (s.buttons == 1 ? "xbox" : s.buttons == 2 ? "auto" : "ps2") << "\n"
       << "rumble=" << (s.rumble ? 1 : 0) << "\n"
       << "deadzone=" << s.deadzone << "\n"
@@ -379,6 +393,7 @@ void applyToEnv(const Settings &s)
     set("BLACKKAT_PLAY_FMV", s.movies ? "1" : "0");
     set("PS2X_FULLSCREEN", s.fullscreen ? "1" : "0");
     set("PS2X_WINDOW", std::to_string(s.winW) + "x" + std::to_string(s.winH));
+    if (!s.monitor.empty()) set("PS2X_MONITOR", s.monitor);
     set("BLACKKAT_BUTTON_STYLE", s.buttons == 1 ? "xbox" : s.buttons == 2 ? "auto" : "ps2");
     set("PS2X_PAD_RUMBLE", s.rumble ? "1" : "0");
     char dz[16];
@@ -624,6 +639,42 @@ void rowLabel(const char *text, float col)
 }
 
 // Segmented control: equal-width buttons, the selected one gold. Returns true when changed.
+// Screenshot of the framebuffer. raylib's LoadImageFromScreen() multiplies the screen size by the
+// desktop DPI even without FLAG_WINDOW_HIGHDPI (reads past the framebuffer at 125%).
+Image screenshotImage()
+{
+    int w = 0, h = 0;
+    glfwGetFramebufferSize(static_cast<GLFWwindow *>(GetWindowHandle()), &w, &h);
+    Image img = {};
+    img.data = rlReadScreenPixels(w, h);
+    img.width = w;
+    img.height = h;
+    img.mipmaps = 1;
+    img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    return img;
+}
+
+// GLFW (inside raylib) for the real framebuffer size in logs; raylib has no getter for the mouse scale.
+Vector2 GetMouseScaleForLog()
+{
+    // GetMousePosition() = cursor * scale; probe with a known cursor is not possible without moving
+    // the real cursor, so report the ratio of screen size to framebuffer size (raylib's HIGHDPI scale).
+    int fbw = 0, fbh = 0;
+    glfwGetFramebufferSize(static_cast<GLFWwindow *>(GetWindowHandle()), &fbw, &fbh);
+    return Vector2{fbw ? static_cast<float>(GetScreenWidth()) / fbw : 1.0f, fbh ? static_cast<float>(GetScreenHeight()) / fbh : 1.0f};
+}
+
+// Test/probe support: rect (UI units) of named controls and the control under the mouse this frame.
+struct ItemRect { ImVec2 a, b; };
+std::map<std::string, ItemRect> g_itemRects;
+std::string g_hoverName;
+void trackItem(const char *name)
+{
+    g_itemRects[name] = ItemRect{ImGui::GetItemRectMin(), ImGui::GetItemRectMax()};
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        g_hoverName = name;
+}
+
 bool segmented(const char *id, const char *const *labels, int n, int *v, float width)
 {
     bool changed = false;
@@ -644,6 +695,7 @@ bool segmented(const char *id, const char *const *labels, int n, int *v, float w
         }
         ImGui::PushID(i);
         if (ImGui::Button(labels[i], ImVec2(bw, 0)) && !sel) { *v = i; changed = true; }
+        trackItem(labels[i]);
         ImGui::PopID();
         if (sel) ImGui::PopStyleColor(4);
     }
@@ -670,13 +722,117 @@ static bool runLauncherUi(Settings &s, const char *argv0)
     // presses Set Sail (or closes the launcher if the settings are not launchable).
     // BLACKKAT_LAUNCHER_NAV=1 shows the controller/keyboard focus cursor from the start (screenshots).
     const char *tw = std::getenv("PS2X_TEST_WINDOW");
-    unsigned flags = FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT | FLAG_WINDOW_HIGHDPI; // HIGHDPI: fractional desktop scaling (KDE 125%)
-    if (tw && (tw[0] == 'h' || tw[0] == 'H')) flags |= FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED;
-    else if (tw && (tw[0] == 'u' || tw[0] == 'U')) flags |= FLAG_WINDOW_UNFOCUSED;
+    // Scaling: the window works in real pixels (no FLAG_WINDOW_HIGHDPI). raylib 5.5's HIGHDPI mode
+    // on X11 keeps the startup screen scale/mouse scale after a resize while the resize callback
+    // switches the screen size to pixels, so the UI was drawn 1.25x too big, cropped and mis-hit
+    // after any resize. Instead the UI is laid out in fixed "UI units" (design 920x760) and scaled
+    // uniformly to the window (ui = min(w/920, h/760), clamped), with fonts rasterised at that
+    // scale. BLACKKAT_LAUNCHER_RAYLIB_HIDPI=1 restores the old raylib HIGHDPI path (for comparison).
+    const bool legacyHidpi = std::getenv("BLACKKAT_LAUNCHER_RAYLIB_HIDPI") && std::getenv("BLACKKAT_LAUNCHER_RAYLIB_HIDPI")[0] == '1';
+    unsigned flags = FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT | (legacyHidpi ? FLAG_WINDOW_HIGHDPI : 0u);
+    const bool testHidden = tw && (tw[0] == 'h' || tw[0] == 'H');
+    const bool testUnfocused = tw && (tw[0] == 'u' || tw[0] == 'U');
+    if (testHidden) flags |= FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED;
+    else if (testUnfocused) flags |= FLAG_WINDOW_UNFOCUSED;
+    else flags |= FLAG_WINDOW_HIDDEN; // shown after it is placed on the chosen monitor
     SetConfigFlags(flags);
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(920, 720, "Black Kat - BlackKatRecomp launcher");
-    SetWindowMinSize(840, 700);
+    constexpr float kDesignW = 920.0f, kDesignH = 760.0f, kMinUi = 0.75f, kMaxUi = 3.0f;
+    InitWindow(static_cast<int>(kDesignW), static_cast<int>(kDesignH), "Black Kat - BlackKatRecomp launcher");
+    const float dpi = std::clamp(GetWindowScaleDPI().y, 1.0f, 4.0f); // desktop scale (X11: Xft.dpi/96)
+    if (!legacyHidpi)
+    {
+        SetWindowSize(static_cast<int>(std::lround(kDesignW * dpi)), static_cast<int>(std::lround(kDesignH * dpi)));
+        SetWindowMinSize(static_cast<int>(std::ceil(kDesignW * kMinUi)), static_cast<int>(std::ceil(kDesignH * kMinUi)));
+    }
+    else
+        SetWindowMinSize(840, 740);
+    // Open on the same monitor the game will use (PS2X_MONITOR overrides the saved monitor=).
+    {
+        const char *envMon = std::getenv("PS2X_MONITOR");
+        const int mon = ps2xMonitorResolve(envMon && envMon[0] ? envMon : s.monitor.c_str(), "launcher");
+        if (mon >= 0)
+            ps2xMonitorPlace(mon, false, testHidden, false, "launcher");
+        if (!testHidden && !testUnfocused)
+        {
+            ClearWindowState(FLAG_WINDOW_HIDDEN);
+            if (mon >= 0)
+                ps2xMonitorPlace(mon, false, false, false, "launcher"); // again after mapping (WM placement)
+        }
+    }
+    // Monitor picker entries: "Primary (default)" + one per connected monitor. Under XWayland
+    // GLFW reports every monitor in X11 units (scaled by the largest desktop scale), so the real
+    // mode and per-monitor scale come from kscreen-doctor (KDE, read-only) when it is available.
+    struct KsOut { std::string mode; int hz = 0; double scale = 0.0; };
+    std::map<std::string, KsOut> ks;
+    if (onPath("kscreen-doctor"))
+        if (FILE *pk = popen("kscreen-doctor -o 2>/dev/null", "r"))
+        {
+            std::string txt;
+            char buf[4096];
+            size_t nr;
+            while ((nr = std::fread(buf, 1, sizeof buf, pk)) > 0) txt.append(buf, nr);
+            pclose(pk);
+            std::string clean; // strip ANSI colour codes
+            for (size_t i = 0; i < txt.size(); ++i)
+            {
+                if (txt[i] == '\x1b') { while (i < txt.size() && txt[i] != 'm') ++i; continue; }
+                clean += txt[i];
+            }
+            std::istringstream is(clean);
+            std::string line, cur;
+            while (std::getline(is, line))
+            {
+                std::istringstream ls(line);
+                std::string w;
+                ls >> w;
+                if (w == "Output:") { std::string idx; ls >> idx >> cur; }
+                else if (!cur.empty() && w == "Modes:")
+                {
+                    std::string tok;
+                    while (ls >> tok)
+                        if (!tok.empty() && tok.back() == '*')
+                        {
+                            tok.pop_back();
+                            if (tok.back() == '!') tok.pop_back();
+                            const size_t c = tok.find(':'), at = tok.find('@');
+                            if (c != std::string::npos && at != std::string::npos)
+                            {
+                                ks[cur].mode = tok.substr(c + 1, at - c - 1);
+                                ks[cur].hz = static_cast<int>(std::lround(std::atof(tok.c_str() + at + 1)));
+                            }
+                        }
+                }
+                else if (!cur.empty() && w == "Scale:") { double sc = 0; ls >> sc; ks[cur].scale = sc; }
+            }
+        }
+
+    struct MonEntry { std::string value, label; };
+    std::vector<MonEntry> monEntries;
+    monEntries.push_back({"", "Primary (default)"});
+    {
+        std::istringstream ml(ps2xMonitorListText());
+        std::string line;
+        int idx = 0;
+        while (std::getline(ml, line))
+        {
+            std::string name, size, hz;
+            std::istringstream ls(line);
+            std::getline(ls, name, '|'); std::getline(ls, size, '|'); std::getline(ls, hz, '|');
+            std::string label = (name.empty() ? "Monitor " + std::to_string(idx + 1) : name) + "   ";
+            if (auto it = ks.find(name); it != ks.end() && !it->second.mode.empty())
+            {
+                label += it->second.mode + " @" + std::to_string(it->second.hz);
+                if (it->second.scale > 0.0 && std::fabs(it->second.scale - 1.0) > 0.01)
+                    label += "   " + std::to_string(static_cast<int>(std::lround(it->second.scale * 100))) + "%";
+            }
+            else
+                label += size + " @" + hz;
+            if (idx == 0) label += "   (primary)";
+            monEntries.push_back({name.empty() ? std::to_string(idx) : name, label});
+            ++idx;
+        }
+    }
     SetTraceLogLevel(LOG_INFO);
     SetTargetFPS(60);
     SetExitKey(KEY_NULL); // Esc / B cancel inside the UI; close with the window button or Quit
@@ -684,6 +840,7 @@ static bool runLauncherUi(Settings &s, const char *argv0)
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    std::fprintf(stderr, "[launcher] window %dx%d dpi=%.2f scaling=%s\n", GetScreenWidth(), GetScreenHeight(), dpi, legacyHidpi ? "raylib-highdpi(legacy)" : "ui-units");
 
     // Fonts: system fonts through fontconfig (Noto/DejaVu/Liberation, whatever fc-match picks);
     // raylib/ImGui's built-in font if fontconfig finds nothing. Nothing is bundled.
@@ -726,6 +883,24 @@ static bool runLauncherUi(Settings &s, const char *argv0)
     const char *modeLabels[] = {"Windowed", "Fullscreen"};
     const char *promptLabels[] = {"PS2  (original)", "Xbox  (A B X Y)", "Auto"};
     bool gpB = false;
+    // BLACKKAT_LAUNCHER_RESIZE_TEST=<png prefix>: resize to several sizes, screenshot each
+    // (<prefix><name>.png), log sizes and which control is under synthetic mouse positions.
+    const std::string resizePrefix = std::getenv("BLACKKAT_LAUNCHER_RESIZE_TEST") ? std::getenv("BLACKKAT_LAUNCHER_RESIZE_TEST") : "";
+    struct TestSize { const char *name; int w, h; };
+    const std::vector<TestSize> testSizes = {
+        {"min", static_cast<int>(std::ceil(kDesignW * kMinUi)), static_cast<int>(std::ceil(kDesignH * kMinUi))},
+        {"1280x800", static_cast<int>(std::lround(1280 * dpi)), static_cast<int>(std::lround(800 * dpi))},
+        {"1920x1080", static_cast<int>(std::lround(1920 * dpi)), static_cast<int>(std::lround(1080 * dpi))},
+        {"wide", static_cast<int>(std::lround(2400 * dpi)), static_cast<int>(std::lround(700 * dpi))},
+        {"tall", static_cast<int>(std::lround(800 * dpi)), static_cast<int>(std::lround(1200 * dpi))},
+        {"default", static_cast<int>(std::lround(kDesignW * dpi)), static_cast<int>(std::lround(kDesignH * dpi))},
+    };
+    const char *probeNames[] = {"Set Sail", "Browse##iso", "4x", "##monitor", "Quit", "Xbox  (A B X Y)"};
+    constexpr int kProbeN = 6, kStep = 50;
+    bool probeActive = false;
+    float probeX = 0, probeY = 0;
+    const char *probeName = nullptr;
+    // F11 / Alt+Enter: borderless fullscreen toggle (maximise works through the window manager).
 
     while (!done && !WindowShouldClose())
     {
@@ -746,8 +921,39 @@ static bool runLauncherUi(Settings &s, const char *argv0)
         std::error_code ec;
         const bool elfOk = !s.elf.empty() && fs::is_regular_file(s.elf, ec);
         const bool canLaunch = iso.ok() && elfOk;
-        const int W = GetScreenWidth(), H = GetScreenHeight();
+        // Pixel size of the window (legacy: raylib's logical screen size) and the UI scale.
+        const int PW = GetScreenWidth(), PH = GetScreenHeight();
+        const float ui = legacyHidpi ? 1.0f : std::clamp(std::min(PW / kDesignW, PH / kDesignH), kMinUi, kMaxUi);
+        const float W = PW / ui, H = PH / ui; // window size in UI units (>= 920x760 in one axis)
         const float t = static_cast<float>(GetTime());
+        if (IsKeyPressed(KEY_F11) || (IsKeyPressed(KEY_ENTER) && (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))))
+            ToggleBorderlessWindowed();
+
+        // Resize test: phase per size: 0 resize, 30 log + screenshot (after EndDrawing), 32.. probes.
+        probeActive = false;
+        probeName = nullptr;
+        if (!resizePrefix.empty())
+        {
+            const int idx = (frame - 20) / kStep, ph = (frame - 20) % kStep;
+            if (frame >= 20 && idx < static_cast<int>(testSizes.size()))
+            {
+                if (ph == 0)
+                    SetWindowSize(testSizes[idx].w, testSizes[idx].h);
+                if (ph >= 32 && ph < 32 + kProbeN)
+                {
+                    probeName = probeNames[ph - 32];
+                    auto it = g_itemRects.find(probeName);
+                    if (it != g_itemRects.end())
+                    {
+                        probeX = (it->second.a.x + it->second.b.x) * 0.5f * ui; // control centre in window pixels
+                        probeY = (it->second.a.y + it->second.b.y) * 0.5f * ui;
+                        probeActive = true;
+                    }
+                }
+            }
+            else if (frame >= 20)
+                done = true;
+        }
 
         // Controller: B = back/cancel (ImGui Escape), Start = Set Sail. rlImGui maps A/D-pad/stick.
         const bool bDown = IsGamepadAvailable(0) && IsGamepadButtonDown(0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT);
@@ -757,10 +963,37 @@ static bool runLauncherUi(Settings &s, const char *argv0)
 
         BeginDrawing();
         ClearBackground(Color{6, 14, 36, 255});
-        drawSea(t, W, H);
-        rlImGuiBegin();
+        drawSea(t, PW, PH); // background in window pixels, full size every frame
+        g_hoverName.clear();
+        if (legacyHidpi)
+            rlImGuiBegin();
+        else
+        {
+            // rlImGuiBegin() split up so the UI can run in UI units: display size = pixels / ui,
+            // fonts rasterised at ui (framebuffer scale), mouse positions from the backend divided by ui.
+            ImGui_ImplRaylib_NewFrame();
+            ImGui_ImplRaylib_ProcessEvents();
+            io.DisplaySize = ImVec2(W, H);
+            io.DisplayFramebufferScale = ImVec2(ui, ui);
+            const float tiny = std::numeric_limits<float>::min(); // rlImGui's "no mouse" position
+            for (ImGuiInputEvent &e : ImGui::GetCurrentContext()->InputEventsQueue)
+                if (e.Type == ImGuiInputEventType_MousePos && e.MousePos.PosX != tiny && e.MousePos.PosX != -FLT_MAX)
+                {
+                    e.MousePos.PosX /= ui;
+                    e.MousePos.PosY /= ui;
+                }
+            if (probeActive)
+                io.AddMousePosEvent(probeX / ui, probeY / ui);
+            ImGui::NewFrame();
+        }
         if (navShow && frame > 2) ImGui::SetNavCursorVisible(true);
-        const float margin = 24.0f, top = 96.0f;
+        // Layout in UI units: a 920x760 block (title + panel) centred in the window; the panel grows
+        // sideways up to 1040 wide on wide windows and keeps its design height on tall ones.
+        const float margin = 24.0f;
+        const float y0 = std::max(0.0f, std::floor((H - kDesignH) * 0.5f));
+        const float top = y0 + 96.0f;
+        const float panelW = std::min(W - 2 * margin, 1040.0f);
+        const float panelX = std::floor((W - panelW) * 0.5f);
         // Title on the night sky, above the panel
         {
             ImDrawList *bg = ImGui::GetBackgroundDrawList();
@@ -768,7 +1001,7 @@ static bool runLauncherUi(Settings &s, const char *argv0)
             ImFont *tf = fonts.title ? fonts.title : ImGui::GetFont();
             const float tsz = fonts.title ? 40.0f : 26.0f;
             const ImVec2 sz = tf->CalcTextSizeA(tsz, FLT_MAX, 0.0f, title);
-            const ImVec2 p((W - sz.x) * 0.5f, 14.0f);
+            const ImVec2 p((W - sz.x) * 0.5f, y0 + 14.0f);
             bg->AddText(tf, tsz, ImVec2(p.x + 2, p.y + 3), IM_COL32(0, 0, 0, 160), title);
             bg->AddText(tf, tsz, p, u32(kGold), title);
             const char *sub = "BlackKatRecomp  \xC2\xB7  NTSC-U SLUS-20365";
@@ -777,8 +1010,8 @@ static bool runLauncherUi(Settings &s, const char *argv0)
             const ImVec2 ss = uf->CalcTextSizeA(usz, FLT_MAX, 0.0f, sub);
             bg->AddText(uf, usz, ImVec2((W - ss.x) * 0.5f, p.y + sz.y + 4), u32(kParchDim), sub);
         }
-        ImGui::SetNextWindowPos(ImVec2(margin, top));
-        ImGui::SetNextWindowSize(ImVec2(W - 2 * margin, H - top - margin));
+        ImGui::SetNextWindowPos(ImVec2(panelX, top));
+        ImGui::SetNextWindowSize(ImVec2(panelW, kDesignH - 96.0f - margin));
         ImGui::Begin("launcher", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground);
         const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         drawPanel(ImGui::GetBackgroundDrawList(), wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
@@ -792,7 +1025,9 @@ static bool runLauncherUi(Settings &s, const char *argv0)
         ImGui::InputTextWithHint("##iso", "path to the Black Kat (NTSC-U) .iso", isoBuf, sizeof isoBuf);
         ImGui::SameLine();
         ImGui::BeginDisabled(dialog.valid());
-        if (ImGui::Button("Browse##iso", ImVec2(browseW, 0)))
+        const bool browseIso = ImGui::Button("Browse##iso", ImVec2(browseW, 0));
+        trackItem("Browse##iso");
+        if (browseIso)
         {
             const std::string start = s.iso.empty() ? std::string() : fs::path(s.iso).parent_path().string();
             dialogFor = 1;
@@ -869,6 +1104,39 @@ static bool runLauncherUi(Settings &s, const char *argv0)
             s.winW = std::clamp(s.winW, 320, 7680); s.winH = std::clamp(s.winH, 200, 4320);
         }
         ImGui::EndDisabled();
+        rowLabel("Monitor", col);
+        {
+            auto ieq = [](const std::string &a, const std::string &b) {
+                if (a.size() != b.size()) return false;
+                for (size_t i = 0; i < a.size(); ++i)
+                    if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+                return true;
+            };
+            int sel = -1;
+            if (s.monitor.empty() || ieq(s.monitor, "primary")) sel = 0;
+            for (size_t i = 1; i < monEntries.size() && sel < 0; ++i)
+                if (ieq(monEntries[i].value, s.monitor)) sel = static_cast<int>(i);
+            if (sel < 0 && !s.monitor.empty() && std::all_of(s.monitor.begin(), s.monitor.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            {
+                const int ix = std::atoi(s.monitor.c_str()) + 1;
+                if (ix > 0 && ix < static_cast<int>(monEntries.size())) sel = ix;
+            }
+            const std::string preview = sel >= 0 ? monEntries[sel].label : s.monitor + "  (not connected: primary)";
+            ImGui::SetNextItemWidth(segW);
+            if (ImGui::BeginCombo("##monitor", preview.c_str()))
+            {
+                for (size_t i = 0; i < monEntries.size(); ++i)
+                {
+                    const bool on = static_cast<int>(i) == sel;
+                    if (ImGui::Selectable(monEntries[i].label.c_str(), on)) s.monitor = monEntries[i].value;
+                    if (on) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            trackItem("##monitor");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Screen for the game window (windowed: centred, fullscreen: borderless on that screen).\nThe launcher opens there next time.");
+        }
 
         sectionHeader(fonts, "Controls");
         rowLabel("Button prompts", col);
@@ -899,6 +1167,7 @@ static bool runLauncherUi(Settings &s, const char *argv0)
         ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 2.0f);
         if (fonts.title) ImGui::PushFont(fonts.title, 26.0f);
         const bool sail = ImGui::Button("Set Sail", ImVec2(240, footerH - 8));
+        trackItem("Set Sail");
         if (frame <= 2) ImGui::SetItemDefaultFocus();
         if (canLaunch && (ImGui::IsItemHovered() || ImGui::IsItemFocused()))
         {
@@ -916,7 +1185,9 @@ static bool runLauncherUi(Settings &s, const char *argv0)
             launch = done = true;
         ImGui::SameLine(0, 14);
         ImGui::BeginGroup();
-        if (ImGui::Button("Quit", ImVec2(110, 0)))
+        const bool quitPressed = ImGui::Button("Quit", ImVec2(110, 0));
+        trackItem("Quit");
+        if (quitPressed)
             done = true;
         ImGui::TextDisabled("Settings: %s", configPath().c_str());
         ImGui::EndGroup();
@@ -933,12 +1204,53 @@ static bool runLauncherUi(Settings &s, const char *argv0)
             ImGui::TextColored(kBad, "Choose the disc image and the extracted game folder to set sail.");
         }
         ImGui::End();
-        rlImGuiEnd();
+        if (legacyHidpi)
+            rlImGuiEnd();
+        else
+        {
+            // Render the UI-unit draw data scaled to window pixels (vertices and clip rects); the
+            // backend's scissor maths then works in pixels (it uses io.DisplaySize for the flip).
+            ImGui::Render();
+            ImDrawData *dd = ImGui::GetDrawData();
+            for (ImDrawList *dl : dd->CmdLists)
+                for (ImDrawVert &v : dl->VtxBuffer)
+                {
+                    v.pos.x *= ui;
+                    v.pos.y *= ui;
+                }
+            dd->ScaleClipRects(ImVec2(ui, ui));
+            io.DisplaySize = ImVec2(static_cast<float>(PW), static_cast<float>(PH));
+            ImGui_ImplRaylib_RenderDrawData(dd);
+        }
         EndDrawing();
+
+        if (!resizePrefix.empty() && frame >= 20)
+        {
+            const int idx = (frame - 20) / kStep, ph = (frame - 20) % kStep;
+            if (idx < static_cast<int>(testSizes.size()))
+            {
+                if (ph == 30)
+                {
+                    int fbw = 0, fbh = 0;
+                    glfwGetFramebufferSize(static_cast<GLFWwindow *>(GetWindowHandle()), &fbw, &fbh);
+                    const Vector2 ms = GetMouseScaleForLog();
+                    std::fprintf(stderr, "[launcher:resize] %-9s requested=%dx%d screen=%dx%d render=%dx%d framebuffer=%dx%d ui=%.3f ui_units=%.0fx%.0f screen_per_fb=%.3f\n",
+                                 testSizes[idx].name, testSizes[idx].w, testSizes[idx].h, GetScreenWidth(), GetScreenHeight(), GetRenderWidth(), GetRenderHeight(),
+                                 fbw, fbh, ui, W, H, ms.x);
+                    const std::string path = resizePrefix + testSizes[idx].name + ".png";
+                    Image img = screenshotImage();
+                    ExportImage(img, path.c_str());
+                    UnloadImage(img);
+                }
+                if (ph >= 32 && ph < 32 + kProbeN && probeName)
+                    std::fprintf(stderr, "[launcher:probe] %-9s mouse px=(%.0f,%.0f) target='%s' -> hovered='%s'%s\n", testSizes[idx].name, probeX, probeY,
+                                 probeName, g_hoverName.c_str(), (probeActive && g_hoverName == probeName) ? "" : "  <-- MISMATCH");
+            }
+        }
 
         if (!shotPath.empty() && frame == 60)
         {
-            Image img = LoadImageFromScreen();
+            Image img = screenshotImage();
             ExportImage(img, shotPath.c_str());
             UnloadImage(img);
             std::fprintf(stderr, "[launcher] screenshot %s\n", shotPath.c_str());

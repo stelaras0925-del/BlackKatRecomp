@@ -19,6 +19,7 @@ struct Settings
     bool movies = true;     // play FMVs (IPU) or skip them
     bool fullscreen = false;
     int winW = 1280, winH = 896;
+    std::string monitor;    // monitor for the game (and launcher) window: connector name (DP-2...), index, or "" = primary
     // Options
     int buttons = 0;        // button prompts: 0 PS2 (original), 1 Xbox, 2 auto (Xbox when an Xbox-style pad is connected)
     bool rumble = true;     // controller vibration
