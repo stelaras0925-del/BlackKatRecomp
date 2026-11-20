@@ -1388,3 +1388,23 @@ After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, hig
 - Fonts: system Noto Sans (UI) / Noto Serif Bold (title) located via `fc-match` at runtime (SIL OFL, nothing bundled); falls back to ImGui default font scaled 1.25 if fc-match finds no .ttf/.otf.
 - Navigation: keyboard + gamepad (d-pad/stick move, A select, B back, Start = Set Sail, Enter = Set Sail). Debug: `BLACKKAT_LAUNCHER_NAV=1` shows the nav cursor (used for screenshots).
 - No ISO-derived background art (would need game-format decoding at runtime; not worth it).
+
+## Monitor selection, 2026-11-20
+- `PS2X_MONITOR=<connector|index|primary>` (runtime, `ps2xRuntime/src/lib/ps2_monitor.inl`, included by ps2_runtime.cpp; patch 0005). Launcher: Display > Monitor picker, config `monitor=` (connector name, empty = primary), CLI `--monitor NAME|INDEX|primary`. Env beats CLI/config (as for the other settings).
+- Names are GLFW monitor names = RandR/KDE connector names (DP-2, DP-3). Index = GLFW order, 0 = primary (KDE priority 1). Unknown name/index: primary, logged as "not found, using primary".
+- Windowed: window centred in the monitor work area, shrunk (aspect kept) if it does not fit. Fullscreen: unchanged mode = borderless (raylib ToggleBorderlessWindowed) on the chosen monitor, no video mode switch. Was never exclusive.
+- Normal runs create the window hidden, place it, show it, and place it again after mapping (KWin placement). The launcher does the same and opens on the chosen monitor.
+- XWayland (GLFW X11 here): X11 coordinates are scaled by the largest desktop scale (1.25), so DP-3 (1920x1080, scale 1) shows up in GLFW as 2400x1350 at 0,0 and DP-2 (2560x1440, 125%) as 2560x1440 at 2400,0. Placement maths happens in X11 units, so it is correct. The launcher picker shows the real mode and scale from `kscreen-doctor -o` (read-only) when available. X11 clients have one global scale, so KWin shows X windows on DP-3 at 0.8x (a 1280x896 window is 1024x717 physical there; borderless fullscreen renders 2400x1350 and KWin downscales it to 1920x1080).
+- Logs: `[monitor:game]` / `[monitor:launcher]` list monitors, show the chosen one, the requested and final window geometry (they wait up to 500 ms for the WM) and GetCurrentMonitor. Hidden test windows apply only the borderless geometry: no undecorate/topmost/focus.
+
+## Launcher resize fix, 2026-11-20
+- Symptom: after resizing the launcher window the UI was drawn about 1.25x too big, cropped on the right and bottom, and clicks landed in the wrong place.
+- Cause: raylib 5.5 FLAG_WINDOW_HIGHDPI on X11/XWayland. At start the screen size is logical (920x760), the framebuffer 1150x950, screenScale 1.25 and mouse scale 0.8. On resize, WindowSizeCallback sets the screen size to the new size in pixels but keeps screenScale and mouse scale from startup, so everything was scaled twice.
+- Fix (src/launcher.cpp, backup .pre-resize.bak): no FLAG_WINDOW_HIGHDPI. The window works in pixels, sized 920x760 x desktop DPI at start, minimum size 690x570.
+  - The UI is laid out in "UI units": a 920x760 design block, centred, with the panel up to 1040 wide.
+  - Uniform scale ui = clamp(min(w/920, h/760), 0.75, 3).
+  - rlImGuiBegin/End are split: DisplaySize = pixels/ui, DisplayFramebufferScale = ui so fonts are rasterised sharp, queued mouse positions are divided by ui, and draw data (vertices and clip rects) is multiplied by ui before the raylib backend.
+  - The sea background is redrawn at the full pixel size every frame.
+  - F11 / Alt+Enter toggles borderless fullscreen; maximise goes through the window manager.
+- Screenshots: raylib's LoadImageFromScreen() multiplies by the DPI even without HIGHDPI, so the launcher reads the framebuffer with rlReadScreenPixels instead.
+- Test hooks: BLACKKAT_LAUNCHER_RESIZE_TEST=<png prefix> resizes through min / 1280x800 / 1920x1080 / wide / tall / default (logical x DPI), screenshots each, logs sizes, and probes 6 controls with synthetic mouse positions. BLACKKAT_LAUNCHER_RAYLIB_HIDPI=1 brings back the old path for comparison.

@@ -1054,7 +1054,7 @@ index 37b6a4decc5865c7e51fbe9209ce46eafa6ccb27..d86665dd888c96b1b2126de55f8bf771
 +    uint64_t dispfbWrites() { return g_dispfbWrites.load(std::memory_order_relaxed); }
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f889225c1d82bc 100644
+index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..205b5dc2723b31558fbe829ef82425b6caa844f0 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -7,6 +7,7 @@
@@ -1065,7 +1065,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
  #include "Kernel/Stubs/Audio.h"
  #include "Kernel/Stubs/GS.h"
  #include "Kernel/Stubs/MPEG.h"
-@@ -20,12 +21,42 @@
+@@ -20,12 +21,43 @@
  #include <algorithm>
  #include <array>
  #include <cstring>
@@ -1101,6 +1101,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
 +    }
 +    std::string s_winShotPath; // PS2X_SHOT_WINDOW
 +}
++#include "ps2_monitor.inl"
 +extern "C" void ps2x_spu2_pull(int16_t *out, uint32_t frames);
 +extern "C" bool ps2x_spu2_out_enabled();
 +extern "C" void ps2x_spu2_out_disable();
@@ -1108,7 +1109,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
  
  namespace ps2_stubs
  {
-@@ -414,7 +445,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -414,7 +446,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                     &sourceFbp,
                                                     &usedPreferredDisplaySource))
      {
@@ -1117,7 +1118,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
          UpdateTexture(tex, blank.data);
          UnloadImage(blank);
          outWidth = FB_WIDTH;
-@@ -450,13 +481,26 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -450,13 +482,26 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      s_lastWidth = width;
      s_lastHeight = height;
  
@@ -1147,7 +1148,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
          const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
          for (uint32_t y = 0; y < copyHeight; ++y)
          {
-@@ -668,42 +712,77 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,42 +713,77 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -1243,7 +1244,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -731,10 +810,76 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,10 +811,100 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -1258,10 +1259,15 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
 +        const bool testHidden = testWinEnv && (testWinEnv[0] == 'h' || testWinEnv[0] == 'H');
 +        const bool testUnfocused = testWinEnv && (testWinEnv[0] == 'u' || testWinEnv[0] == 'U');
 +        unsigned int winFlags = FLAG_WINDOW_RESIZABLE;
++        // Normal runs create the window hidden and show it once it sits on the chosen monitor
++        // (PS2X_MONITOR), so it never flashes up on another screen.
++        const bool showAfterPlace = !testHidden && !testUnfocused;
 +        if (testHidden)
 +            winFlags |= FLAG_WINDOW_HIDDEN | FLAG_WINDOW_UNFOCUSED;
 +        else if (testUnfocused)
 +            winFlags |= FLAG_WINDOW_UNFOCUSED;
++        else
++            winFlags |= FLAG_WINDOW_HIDDEN;
 +        SetConfigFlags(winFlags);
 +        // PS2X_WINDOW=WxH: initial window size (default 640x448). PS2X_FULLSCREEN=1: borderless
 +        // fullscreen on the current monitor (ignored for test windows).
@@ -1284,10 +1290,29 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
 +                         GetScreenWidth(), GetScreenHeight(), GetRenderWidth(), GetRenderHeight(), fbw, fbh, dpi.x, dpi.y,
 +                         IsWindowState(FLAG_WINDOW_HIGHDPI) ? 1 : 0, ps2xGlfwGetPlatform(), ps2xHidpiFix() ? 1 : 0);
 +        }
++        // PS2X_MONITOR=<name|index|primary>: windowed = centred on that monitor's work area,
++        // PS2X_FULLSCREEN=1 = borderless fullscreen on it (no mode switch). Test windows: hidden
++        // runs apply the same geometry without showing/focusing (fullscreen = geometry only),
++        // unfocused runs are placed windowed and minimised.
++        {
++            const char *fe = std::getenv("PS2X_FULLSCREEN");
++            const bool wantFs = fe && fe[0] == '1';
++            const int mon = ps2xMonitorResolve(std::getenv("PS2X_MONITOR"), "game");
++            if (showAfterPlace)
++            {
++                if (mon >= 0)
++                    ps2xMonitorPlace(mon, false, false, true, "game");
++                ClearWindowState(FLAG_WINDOW_HIDDEN);
++                if (mon >= 0)
++                    ps2xMonitorPlace(mon, wantFs, false, false, "game"); // again after mapping (WM placement)
++                else if (wantFs)
++                    ToggleBorderlessWindowed();
++            }
++            else if (mon >= 0)
++                ps2xMonitorPlace(mon, wantFs && testHidden, testHidden, true, "game");
++        }
 +        if (testUnfocused)
 +            MinimizeWindow();
-+        if (const char *fe = std::getenv("PS2X_FULLSCREEN"); fe && fe[0] == '1' && !testHidden && !testUnfocused)
-+            ToggleBorderlessWindowed();
 +        if (testHidden || testUnfocused)
 +            std::cerr << "[runtime] PS2X_TEST_WINDOW=" << testWinEnv << " (no focus/cursor grab)" << std::endl;
 +        // PS2X_HOST_AUDIO=0 skips opening the host audio device (headless / testing).
@@ -1324,7 +1349,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
  #endif
          SetTargetFPS(60);
          if (m_debugUiInitCallback)
-@@ -1396,6 +1541,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,6 +1566,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -1332,7 +1357,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
      targetFn(rdram, ctx, this);
  
      if (isStopRequested() || ctx->pc == 0u)
-@@ -1403,7 +1549,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,7 +1574,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -1347,7 +1372,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
      {
          ctx->pc = fallthroughPc;
      }
-@@ -2388,44 +2540,145 @@ void PS2Runtime::run()
+@@ -2388,44 +2565,145 @@ void PS2Runtime::run()
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
@@ -1520,7 +1545,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..f9c49c6bcffab2068163aabe75f88922
          const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
          const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
          const float screenWidth = static_cast<float>(GetScreenWidth());
-@@ -2440,6 +2693,18 @@ void PS2Runtime::run()
+@@ -2440,6 +2718,18 @@ void PS2Runtime::run()
              dstWidth,
              dstHeight};
          DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
@@ -3717,3 +3742,214 @@ index 0000000000000000000000000000000000000000..de75f130eac302ddcf7f964b82019ec4
 +}
 +
 +} // namespace ps2x_ipu
+diff --git a/ps2xRuntime/src/lib/ps2_monitor.inl b/ps2xRuntime/src/lib/ps2_monitor.inl
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc88922a4a5a4899d27fd820706d089ef8292e28
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_monitor.inl
+@@ -0,0 +1,205 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include <cctype>
++//
++// Monitor selection for the host window (included by ps2_runtime.cpp; also used by the
++// blackkat launcher through the two extern functions at the bottom).
++//
++//   PS2X_MONITOR=<connector name|index|primary>   e.g. DP-2, HDMI-A-1, 1, primary
++//
++// Names are GLFW's monitor names (X11/XWayland: the RandR output = KDE connector name).
++// Index is GLFW's order (0 = primary). Unknown names/indices fall back to the primary monitor.
++// Windowed: the window is centred in the monitor's work area (shrunk, keeping its aspect, if it
++// does not fit). Fullscreen: borderless fullscreen on that monitor (no video mode switch).
++
++struct GLFWmonitor;
++struct GLFWvidmode // layout from glfw3.h (not included in this file)
++{
++    int width, height, redBits, greenBits, blueBits, refreshRate;
++};
++extern "C" GLFWmonitor **glfwGetMonitors(int *count);
++extern "C" const char *glfwGetMonitorName(GLFWmonitor *monitor);
++extern "C" void glfwGetMonitorPos(GLFWmonitor *monitor, int *x, int *y);
++extern "C" void glfwGetMonitorWorkarea(GLFWmonitor *monitor, int *x, int *y, int *w, int *h);
++extern "C" const GLFWvidmode *glfwGetVideoMode(GLFWmonitor *monitor);
++extern "C" void glfwGetMonitorContentScale(GLFWmonitor *monitor, float *x, float *y);
++extern "C" void glfwGetWindowPos(GLFWwindow *window, int *x, int *y);
++extern "C" void glfwGetWindowSize(GLFWwindow *window, int *w, int *h);
++
++namespace
++{
++    struct Ps2xMonInfo
++    {
++        std::string name;
++        int x = 0, y = 0, w = 0, h = 0, hz = 0;
++        int wx = 0, wy = 0, ww = 0, wh = 0; // work area
++        float sx = 1.0f, sy = 1.0f;
++    };
++
++    std::vector<Ps2xMonInfo> ps2xMonList()
++    {
++        std::vector<Ps2xMonInfo> out;
++        int n = 0;
++        GLFWmonitor **mons = glfwGetMonitors(&n);
++        for (int i = 0; mons && i < n; ++i)
++        {
++            Ps2xMonInfo m;
++            const char *nm = glfwGetMonitorName(mons[i]);
++            m.name = nm ? nm : "";
++            glfwGetMonitorPos(mons[i], &m.x, &m.y);
++            if (const GLFWvidmode *vm = glfwGetVideoMode(mons[i]))
++            {
++                m.w = vm->width;
++                m.h = vm->height;
++                m.hz = vm->refreshRate;
++            }
++            glfwGetMonitorWorkarea(mons[i], &m.wx, &m.wy, &m.ww, &m.wh);
++            if (m.ww <= 0 || m.wh <= 0)
++            {
++                m.wx = m.x; m.wy = m.y; m.ww = m.w; m.wh = m.h;
++            }
++            glfwGetMonitorContentScale(mons[i], &m.sx, &m.sy);
++            out.push_back(m);
++        }
++        return out;
++    }
++
++    bool ps2xIEquals(const std::string &a, const std::string &b)
++    {
++        if (a.size() != b.size())
++            return false;
++        for (size_t i = 0; i < a.size(); ++i)
++            if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
++                return false;
++        return true;
++    }
++}
++
++// Resolves a monitor spec (name / index / "primary" / empty) to a GLFW monitor index after
++// InitWindow. Returns 0 (primary) when not found, -1 when GLFW reports no monitors.
++int ps2xMonitorResolve(const char *spec, const char *tag)
++{
++    const std::vector<Ps2xMonInfo> mons = ps2xMonList();
++    if (mons.empty())
++    {
++        std::fprintf(stderr, "[monitor:%s] no monitors reported by GLFW\n", tag);
++        return -1;
++    }
++    std::string sp = spec ? spec : "";
++    while (!sp.empty() && std::isspace(static_cast<unsigned char>(sp.back()))) sp.pop_back();
++    while (!sp.empty() && std::isspace(static_cast<unsigned char>(sp.front()))) sp.erase(sp.begin());
++    int pick = 0;
++    const char *how = "primary (default)";
++    if (!sp.empty() && !ps2xIEquals(sp, "primary"))
++    {
++        int found = -1;
++        for (size_t i = 0; i < mons.size() && found < 0; ++i)
++            if (ps2xIEquals(mons[i].name, sp))
++                found = static_cast<int>(i);
++        if (found < 0 && std::all_of(sp.begin(), sp.end(), [](char c) { return c >= '0' && c <= '9'; }))
++        {
++            const int idx = std::atoi(sp.c_str());
++            if (idx >= 0 && idx < static_cast<int>(mons.size()))
++                found = idx;
++        }
++        if (found >= 0)
++        {
++            pick = found;
++            how = "matched";
++        }
++        else
++            how = "not found, using primary";
++    }
++    for (size_t i = 0; i < mons.size(); ++i)
++    {
++        const Ps2xMonInfo &m = mons[i];
++        std::fprintf(stderr, "[monitor:%s] #%zu '%s' %dx%d@%d pos=%d,%d work=%d,%d %dx%d scale=%.2f%s\n", tag, i, m.name.c_str(),
++                     m.w, m.h, m.hz, m.x, m.y, m.wx, m.wy, m.ww, m.wh, m.sx, i == 0 ? " (primary)" : "");
++    }
++    std::fprintf(stderr, "[monitor:%s] PS2X_MONITOR='%s' -> #%d '%s' (%s)\n", tag, sp.c_str(), pick, mons[pick].name.c_str(), how);
++    return pick;
++}
++
++// Places the (raylib) window on monitor `mon`. fullscreen: borderless fullscreen on it.
++// testHidden: the window is never shown, so the borderless step only applies raylib's borderless
++// geometry (monitor position + mode size) without the decoration/topmost/focus changes.
++// allowResize: windowed windows larger than the work area are shrunk (aspect kept).
++void ps2xMonitorPlace(int mon, bool fullscreen, bool testHidden, bool allowResize, const char *tag)
++{
++    const std::vector<Ps2xMonInfo> mons = ps2xMonList();
++    GLFWwindow *win = static_cast<GLFWwindow *>(GetWindowHandle());
++    if (!win || mon < 0 || mon >= static_cast<int>(mons.size()))
++        return;
++    if (ps2xGlfwGetPlatform() == 0x00060003) // GLFW_PLATFORM_WAYLAND: clients cannot position windows
++        std::fprintf(stderr, "[monitor:%s] native Wayland: window position is up to the compositor\n", tag);
++    const Ps2xMonInfo &m = mons[mon];
++    int ww = 0, wh = 0;
++    glfwGetWindowSize(win, &ww, &wh);
++    const char *mode = "windowed";
++    int tx = 0, ty = 0, tw = ww, th = wh; // requested geometry
++    if (fullscreen)
++    {
++        // Centre on the monitor first so raylib's GetCurrentMonitor() (used by
++        // ToggleBorderlessWindowed) picks it.
++        SetWindowPosition(m.x + (m.w - ww) / 2, m.y + (m.h - wh) / 2);
++        if (!testHidden)
++        {
++            if (!IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
++                ToggleBorderlessWindowed();
++            mode = "borderless";
++            tx = m.x; ty = m.y; tw = m.w; th = m.h;
++        }
++        else
++        {
++            SetWindowPosition(m.x, m.y);
++            SetWindowSize(m.w, m.h);
++            mode = "borderless(test: geometry only)";
++            tx = m.x; ty = m.y; tw = m.w; th = m.h;
++        }
++    }
++    else
++    {
++        if (allowResize)
++        {
++            const int maxW = std::max(320, m.ww - 16);
++            const int maxH = std::max(200, m.wh - 56); // room for the title bar
++            if (ww > maxW || wh > maxH)
++            {
++                const double k = std::min(static_cast<double>(maxW) / ww, static_cast<double>(maxH) / wh);
++                const int nw = std::max(320, static_cast<int>(ww * k)), nh = std::max(200, static_cast<int>(wh * k));
++                std::fprintf(stderr, "[monitor:%s] window %dx%d does not fit the work area %dx%d: %dx%d\n", tag, ww, wh, m.ww, m.wh, nw, nh);
++                SetWindowSize(nw, nh);
++                ww = nw;
++                wh = nh;
++            }
++        }
++        int x = m.wx + (m.ww - ww) / 2, y = m.wy + (m.wh - wh) / 2;
++        x = std::max(x, m.wx);
++        y = std::max(y, m.wy);
++        SetWindowPosition(x, y);
++        tx = x; ty = y; tw = ww; th = wh;
++    }
++    // The window manager applies X11 move/resize requests asynchronously: wait (<= 500 ms) until
++    // the window reports the requested geometry before logging where it ended up.
++    int fx = 0, fy = 0, fw = 0, fh = 0, waited = 0;
++    for (;; waited += 10)
++    {
++        PollInputEvents();
++        glfwGetWindowPos(win, &fx, &fy);
++        glfwGetWindowSize(win, &fw, &fh);
++        if ((fx == tx && fy == ty && fw == tw && fh == th) || waited >= 500)
++            break;
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    }
++    std::fprintf(stderr, "[monitor:%s] placed %s on #%d '%s' (%d,%d %dx%d): requested pos=%d,%d size=%dx%d -> window pos=%d,%d size=%dx%d after %d ms%s, GetCurrentMonitor=%d\n",
++                 tag, mode, mon, m.name.c_str(), m.x, m.y, m.w, m.h, tx, ty, tw, th, fx, fy, fw, fh, waited,
++                 (fx == tx && fy == ty && fw == tw && fh == th) ? "" : " (MISMATCH)", GetCurrentMonitor());
++}
++
++// Launcher helpers: list for the picker ("name|WxH|Hz" per line) and display label.
++std::string ps2xMonitorListText()
++{
++    std::string out;
++    for (const Ps2xMonInfo &m : ps2xMonList())
++        out += m.name + "|" + std::to_string(m.w) + "x" + std::to_string(m.h) + "|" + std::to_string(m.hz) + "\n";
++    return out;
++}

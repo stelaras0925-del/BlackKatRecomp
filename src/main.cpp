@@ -499,6 +499,8 @@ int main(int argc, char *argv[])
                 else if (a == "--scale") set.scale = std::clamp(std::atoi(next().c_str()), 1, 4);
                 else if (a == "--fullscreen") set.fullscreen = true;
                 else if (a.rfind("--windowed", 0) == 0) { set.fullscreen = false; int w = 0, h = 0; if (std::sscanf(a.c_str(), "--windowed=%dx%d", &w, &h) == 2) { set.winW = w; set.winH = h; } }
+                else if (a == "--monitor") set.monitor = next();
+                else if (a.rfind("--monitor=", 0) == 0) set.monitor = a.substr(10);
                 else if (a == "--audio") set.audio = true;
                 else if (a == "--no-audio") set.audio = false;
                 else if (a == "--movies") set.movies = true;
@@ -506,7 +508,8 @@ int main(int argc, char *argv[])
                 else if (a == "--help" || a == "-h")
                 {
                     std::cout << "Usage: blackkat [--launcher|--play] [--iso P] [--elf P] [--gpu|--cpu] [--scale 1-4]\n"
-                                 "                [--fullscreen|--windowed[=WxH]] [--audio|--no-audio] [--movies|--no-movies]\n"
+                                 "                [--fullscreen|--windowed[=WxH]] [--monitor NAME|INDEX|primary]\n"
+                                 "                [--audio|--no-audio] [--movies|--no-movies]\n"
                                  "       blackkat [path/to/SLUS_203.65] [path/to/disc.iso]   (classic, no launcher/config)\n"
                                  "Settings: " << bklaunch::configPath() << std::endl;
                     return 0;
@@ -535,7 +538,8 @@ int main(int argc, char *argv[])
                 cliElf = set.elf.empty() ? std::filesystem::path("game") / "SLUS_203.65" : std::filesystem::path(set.elf);
                 std::cerr << "[blackkat] launcher settings: iso=" << set.iso << " elf=" << set.elf << " gpu=" << set.gpu
                           << " scale=" << set.scale << " audio=" << set.audio << " movies=" << set.movies
-                          << " fullscreen=" << set.fullscreen << " window=" << set.winW << "x" << set.winH << std::endl;
+                          << " fullscreen=" << set.fullscreen << " window=" << set.winW << "x" << set.winH
+                          << " monitor=" << (set.monitor.empty() ? "primary" : set.monitor) << std::endl;
             }
         }
         const std::filesystem::path elfPath = cliElf.empty() ? guestElfPath(argc, argv) : cliElf;
