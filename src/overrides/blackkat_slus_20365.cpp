@@ -20,6 +20,8 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 
+#include <atomic>
+#include <time.h>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -56,6 +58,10 @@ namespace blackkat_prompts
             ps2xTexRepAdd(t.origHash, t.px, static_cast<uint32_t>(t.w) * t.h * 2u, t.name);
     }
 }
+
+// Phase 0a draw tagging (PS2X_DRAWTAG=1), defined in the ps2xRuntime library.
+extern "C" void ps2xDrawTagAddRange(uint32_t lo, uint32_t hi, uint32_t id);
+extern "C" void ps2xDrawTagSetName(uint32_t id, const char *name);
 
 namespace
 {
@@ -1258,6 +1264,157 @@ namespace
          ...);
     }
 
+    // ---- Phase 0a draw tagging (PS2X_DRAWTAG=1, diagnostic) ------------------------------
+    // Wraps the main display-list emitters with a tag stack and the heap malloc (0x1F7CF0) so that
+    // every allocation made while an emitter runs is registered as that emitter's range
+    // (ps2xDrawTagAddRange). The runtime maps each VU1 MSCAL / VIF DIRECT to the range that holds it.
+    struct DtEmitter { uint32_t addr; const char *name; };
+    constexpr DtEmitter kDtEmitters[] = {
+        {0x00156E90u, "obj_156e90"},     {0x0015CF80u, "sprite_15cf80"},  {0x0015DA40u, "patch_15da40"},
+        {0x0015DCE8u, "patch_15dce8"},   {0x0015FE10u, "strip_15fe10"},   {0x00160CC0u, "p3090_160cc0"},
+        {0x0015E520u, "fn_15e520"},      {0x0015D358u, "fn_15d358"},      {0x00207F00u, "scene_gui_207f00"},
+        {0x00208988u, "gui_font_208988"},{0x002095C8u, "gui_2095c8"},     {0x001D2B50u, "fn_1d2b50"},
+        {0x0018E040u, "fn_18e040"},      {0x001C7EE8u, "fn_1c7ee8"},      {0x00286F98u, "fn_286f98"},
+        {0x00156C20u, "fn_156c20"},      {0x0015D880u, "fn_15d880"},      {0x0015EB98u, "fn_15eb98"},
+        {0x00161468u, "fn_161468"},      {0x0015E2E0u, "p2190_15e2e0"},   {0x0010C9B8u, "sea_10c9b8"},
+        {0x0010D8C0u, "sea_10d8c0"},     {0x00110B50u, "sea_110b50"},     {0x0010E4A0u, "sea_10e4a0"},
+        {0x00172B08u, "wakes_172b08"},   {0x00133F00u, "shadows_133f00"}, {0x0012ADD0u, "rain_12add0"},
+        {0x00128F80u, "lightning_128f80"},{0x001315A8u, "warp_1315a8"},   {0x00131EF8u, "screenfx_131ef8"},
+        {0x0016E780u, "imposters_16e780"},{0x001270B0u, "tree_1270b0"},   {0x0012C090u, "stripes_12c090"},
+        {0x00171E40u, "detail_171e40"},  {0x0015C040u, "render_frame_15c040"},
+    };
+    constexpr size_t kDtCount = sizeof(kDtEmitters) / sizeof(kDtEmitters[0]);
+    PS2Runtime::RecompiledFunction g_dtOrig[kDtCount] = {};
+    PS2Runtime::RecompiledFunction g_dtOrigMalloc = nullptr;
+    thread_local uint32_t tl_dtStack[32];
+    thread_local uint32_t tl_dtDepth = 0;
+
+    template <size_t I>
+    void blackkatDrawTagWrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t depth = tl_dtDepth;
+        if (depth < 32u)
+            tl_dtStack[depth] = static_cast<uint32_t>(I + 1u);
+        tl_dtDepth = depth + 1u;
+        g_dtOrig[I](rdram, ctx, runtime);
+        tl_dtDepth = depth; // restore even if the callee did not return normally
+    }
+
+    void blackkatDrawTagMalloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t size = getRegU32(ctx, 5);
+        g_dtOrigMalloc(rdram, ctx, runtime);
+        const uint32_t depth = tl_dtDepth;
+        if (depth > 0u && depth <= 32u)
+        {
+            const uint32_t p = getRegU32(ctx, 2);
+            if (p && size)
+                ps2xDrawTagAddRange(p, p + size, tl_dtStack[depth - 1u]);
+        }
+    }
+
+    template <size_t... Is>
+    unsigned bindDrawTagWrappers(PS2Runtime &runtime, std::index_sequence<Is...>)
+    {
+        unsigned bound = 0;
+        ((g_dtOrig[Is] = runtime.lookupFunction(kDtEmitters[Is].addr),
+          (g_dtOrig[Is] && runtime.replaceFunction(kDtEmitters[Is].addr, &blackkatDrawTagWrapper<Is>)) ? (void)(++bound, ps2xDrawTagSetName(static_cast<uint32_t>(Is + 1u), kDtEmitters[Is].name)) : (void)(std::cerr << "[drawtag] emitter 0x" << std::hex << kDtEmitters[Is].addr << std::dec << " NOT bound" << std::endl)),
+         ...);
+        return bound;
+    }
+
+    // ---- Frame log (BLACKKAT_FRAMELOG=1, diagnostic) -------------------------------------
+} // namespace (temporarily closed for the EE scheduler profile counters)
+extern std::atomic<uint64_t> g_ps2xEeProfPaceNs, g_ps2xEeProfIdleNs, g_ps2xEeProfIdleCycles, g_ps2xEeProfCycles,
+    g_ps2xEeProfCkDispatch, g_ps2xEeProfCkBackedge, g_ps2xEeProfCkOther;
+void ps2xEeBackedgeHistDump(uint64_t frames);
+namespace
+{
+    // Counts the game's own frame functions: 0x15C040 (render frame: builds and kicks the VIF1 chain)
+    // and 0x15B3E8 (flip: waits for vsync and swaps the display buffer). One flip = one distinct game frame.
+    uint8_t *g_flRdram = nullptr;
+    PS2Runtime::RecompiledFunction g_flOrigRender = nullptr, g_flOrigFlip = nullptr;
+    std::atomic<uint32_t> g_flRender{0}, g_flFlip{0};
+    // Wall time inside 0x114528 (waits for the VIF1/VU1 DMA of the previous frame: D1_CHCR poll) and
+    // 0x188F60 (polled by the flip at 0x15B468 until the vsync flag is set), and between flips.
+    PS2Runtime::RecompiledFunction g_flOrigVuWait = nullptr, g_flOrigVsPoll = nullptr;
+    double g_flVuWaitS = 0.0, g_flVsPollS = 0.0;
+    uint32_t g_flHist[8] = {};
+    void blackkatFrameLogVuWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        g_flOrigVuWait(rdram, ctx, runtime);
+        g_flVuWaitS += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    void blackkatFrameLogVsPoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        g_flOrigVsPoll(rdram, ctx, runtime);
+        g_flVsPollS += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    void blackkatFrameLogReport()
+    {
+        {
+            static auto s_last = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            const double dt = std::chrono::duration<double>(now - s_last).count();
+            s_last = now;
+            const int v = static_cast<int>(dt * 60.0 + 0.5);
+            ++g_flHist[std::min(std::max(v, 0), 7)];
+        }
+        static auto s_t0 = std::chrono::steady_clock::now();
+        static double s_total = 0.0;
+        const auto now = std::chrono::steady_clock::now();
+        const double el = std::chrono::duration<double>(now - s_t0).count();
+        if (el >= 5.0)
+        {
+            s_total += el;
+            const uint32_t f = g_flFlip.exchange(0), r = g_flRender.exchange(0);
+            uint32_t vpf = 0;
+            if (uint8_t *pv = getMemPtr(g_flRdram, 0x00330D88u))
+                std::memcpy(&vpf, pv, 4);
+            std::fprintf(stderr, "[framelog] t=%.0fs game frames/s: flip(0x15B3E8)=%.2f render(0x15C040)=%.2f vsyncs/frame setting=%u | "
+                         "per s: in VU1/DMA wait(0x114528)=%.0f ms, in vsync poll(0x188F60)=%.0f ms | frame time in 1/60 s: 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7+:%u\n",
+                         s_total, f / el, r / el, vpf, 1000.0 * g_flVuWaitS / el, 1000.0 * g_flVsPollS / el, g_flHist[1], g_flHist[2], g_flHist[3],
+                         g_flHist[4], g_flHist[5], g_flHist[6], g_flHist[7]);
+            {
+                // EE scheduler profile (counters in EeScheduler.cpp) + this (EE executor) thread's CPU time.
+                static uint64_t l[7] = {};
+                static double lcpu = 0.0;
+                timespec ts{};
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+                const double cpu = ts.tv_sec + ts.tv_nsec * 1e-9;
+                const uint64_t c[7] = {g_ps2xEeProfCycles.load(), g_ps2xEeProfIdleCycles.load(), g_ps2xEeProfPaceNs.load(), g_ps2xEeProfIdleNs.load(),
+                                       g_ps2xEeProfCkDispatch.load(), g_ps2xEeProfCkBackedge.load(), g_ps2xEeProfCkOther.load()};
+                double d[7];
+                for (int i = 0; i < 7; ++i) { d[i] = double(c[i] - l[i]); l[i] = c[i]; }
+                const double fr = f > 0 ? double(f) : 1.0;
+                std::fprintf(stderr, "[eeprof] t=%.0fs EE thread CPU=%.0f ms/s | pace-wait (cycles ahead of host clock)=%.0f ms/s, idle-wait (no runnable thread)=%.0f ms/s | "
+                             "EE cycles/s=%.1fM (idle-skipped %.1fM) | per game frame: cycles=%.2fM busy=%.2fM dispatch-ck=%.0fk backedge-ck=%.0fk other-ck=%.0fk\n",
+                             s_total, lcpu > 0.0 ? 1000.0 * (cpu - lcpu) / el : 0.0, d[2] / 1e6 / el, d[3] / 1e6 / el, d[0] / 1e6 / el, d[1] / 1e6 / el,
+                             d[0] / 1e6 / fr, (d[0] - d[1]) / 1e6 / fr, d[4] / 1e3 / fr, d[5] / 1e3 / fr, d[6] / 1e3 / fr);
+                lcpu = cpu;
+                ps2xEeBackedgeHistDump(f);
+            }
+            g_flVuWaitS = g_flVsPollS = 0.0;
+            for (auto &h : g_flHist) h = 0;
+            s_t0 = now;
+        }
+    }
+    void blackkatFrameLogRender(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_flRdram = rdram;
+        g_flRender.fetch_add(1);
+        g_flOrigRender(rdram, ctx, runtime);
+    }
+    void blackkatFrameLogFlip(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_flRdram = rdram;
+        g_flFlip.fetch_add(1);
+        blackkatFrameLogReport();
+        g_flOrigFlip(rdram, ctx, runtime);
+    }
+
     // ---- Widescreen (BLACKKAT_WIDESCREEN=1) ------------------------------------------------
     // 0x1530D8 builds the perspective matrix (called from the camera code 0x102B18..0x103378):
     //   f12 = vertical-ish FOV in degrees (* pi/360 -> half angle), f13/f14 = screen x/y scale
@@ -1431,6 +1588,15 @@ namespace
                       << autoPress().everyMs << " ms after " << autoPress().delayMs << " ms, pad read hook "
                       << (padOk ? "bound" : "FAILED") << std::endl;
         }
+        if (const char *dt = std::getenv("PS2X_DRAWTAG"); dt && dt[0] == '1')
+        {
+            const unsigned n = bindDrawTagWrappers(runtime, std::make_index_sequence<kDtCount>{});
+            g_dtOrigMalloc = runtime.lookupFunction(0x001F7CF0u);
+            const bool mok = g_dtOrigMalloc && runtime.replaceFunction(0x001F7CF0u, &blackkatDrawTagMalloc);
+            std::cerr << "[drawtag] emitters bound " << n << "/" << kDtCount << ", malloc@0x1F7CF0 " << (mok ? "bound" : "FAILED") << std::endl;
+            for (size_t i = 0; i < kDtCount; ++i)
+                std::cerr << "[drawtag] emitter id " << (i + 1) << " = " << kDtEmitters[i].name << std::endl;
+        }
         g_origFmvStart = runtime.lookupFunction(kFmvStart);
         if (const char *ws = std::getenv("BLACKKAT_WIDESCREEN"); ws && ws[0] == '1')
         {
@@ -1438,10 +1604,32 @@ namespace
             if (const char *xs = std::getenv("BLACKKAT_WS_XSCALE"); xs && xs[0])
                 g_wsXScale = std::strtof(xs, nullptr);
             ::setenv("PS2X_PRESENT_ASPECT", "1.777778", 0);
+            // BLACKKAT_WS_HUD (default 1): keep the 4:3 HUD unstretched (anchored left/centre/right) and show
+            // menus/FMVs at 4:3 with pillarbox (runtime gs_wshud.inl). BLACKKAT_WS_HUD=0: old stretched HUD.
+            if (const char *wh = std::getenv("BLACKKAT_WS_HUD"); !(wh && wh[0] == '0'))
+            {
+                char sc[32];
+                std::snprintf(sc, sizeof(sc), "%.6f", g_wsXScale);
+                ::setenv("PS2X_WS_HUD_SCALE", sc, 0);
+                std::cerr << "[blackkat] widescreen HUD fix-up on (BLACKKAT_WS_HUD=0 to turn off), scale " << sc << std::endl;
+            }
             g_origPerspective = runtime.lookupFunction(kPerspective);
             const bool ok = g_origPerspective && runtime.replaceFunction(kPerspective, &blackkatPerspective);
             std::cerr << "[blackkat] widescreen 16:9: perspective@0x1530D8 x-scale " << g_wsXScale << " "
                       << (ok ? "bound" : "FAILED") << ", present aspect " << std::getenv("PS2X_PRESENT_ASPECT") << std::endl;
+        }
+        if (const char *fl = std::getenv("BLACKKAT_FRAMELOG"); fl && fl[0] == '1')
+        {
+            g_flOrigRender = runtime.lookupFunction(0x0015C040u);
+            g_flOrigFlip = runtime.lookupFunction(0x0015B3E8u);
+            const bool r = g_flOrigRender && runtime.replaceFunction(0x0015C040u, &blackkatFrameLogRender);
+            const bool f = g_flOrigFlip && runtime.replaceFunction(0x0015B3E8u, &blackkatFrameLogFlip);
+            g_flOrigVuWait = runtime.lookupFunction(0x00114528u);
+            g_flOrigVsPoll = runtime.lookupFunction(0x00188F60u);
+            const bool w = g_flOrigVuWait && runtime.replaceFunction(0x00114528u, &blackkatFrameLogVuWait);
+            const bool v = g_flOrigVsPoll && runtime.replaceFunction(0x00188F60u, &blackkatFrameLogVsPoll);
+            std::cerr << "[framelog] render@0x15C040 " << (r ? "bound" : "FAILED") << ", flip@0x15B3E8 " << (f ? "bound" : "FAILED")
+                      << ", vu1wait@0x114528 " << (w ? "bound" : "FAILED") << ", vsyncpoll@0x188F60 " << (v ? "bound" : "FAILED") << std::endl;
         }
         if (const char *f60 = std::getenv("BLACKKAT_60FPS"); f60 && (f60[0] == '1' || f60[0] == 'c'))
         {

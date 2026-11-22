@@ -471,7 +471,7 @@ index f0ad5070b42f89c6c697c906e93f59cebf2ba904..1085c7dc95b90055ebd1fd6fe5f11136
 +    return h;
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e951089618 100644
+index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed4373f023887 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -1,6 +1,8 @@
@@ -483,7 +483,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
  #include "runtime/ps2_memory.h"
  #include <atomic>
  #include <algorithm>
-@@ -111,6 +113,522 @@ GS::GS()
+@@ -111,6 +113,537 @@ GS::GS()
      reset();
  }
  
@@ -505,6 +505,21 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
 +#include <mutex>
 +#include <thread>
 +#include <pthread.h>
++// Phase 0a draw tagging (PS2X_DRAWTAG=1), implemented in gs_drawtag.inl.
++namespace ps2x_drawtag
++{
++    bool on();
++    bool onPrim(const GSPrimitiveBatch &batch, int path);
++    void onPresent();
++}
++// Widescreen HUD fix-up (PS2X_WS_HUD_SCALE), implemented in gs_wshud.inl.
++namespace ps2x_wshud
++{
++    bool on();
++    void onPrim(GSPrimitiveBatch &batch, int path);
++    void onImage();
++    void onPresent();
++}
 +#include <chrono>
 +#include <cstdio>
 +
@@ -1006,7 +1021,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
  void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  {
      m_localMemoryStorage = vram;
-@@ -118,6 +636,8 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+@@ -118,6 +651,8 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
      m_privRegs = privRegs;
      if (!m_backend)
          m_backend = std::make_unique<GSCpuBackend>();
@@ -1015,7 +1030,18 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
      m_backend->Initialize(vram, vramSize);
      reset();
  }
-@@ -610,7 +1130,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -548,6 +1083,10 @@ void GS::latchHostPresentationFrame()
+             m_backend->Flush();
+             m_backend->Sync(GSSyncReason::Presentation);
+             frame = m_backend->Present(request);
++            if (ps2x_drawtag::on())
++                ps2x_drawtag::onPresent();
++            if (ps2x_wshud::on())
++                ps2x_wshud::onPresent();
+         }
+     }
+ 
+@@ -610,7 +1149,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
      outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
      if (outWidth != 0u && outHeight != 0u)
      {
@@ -1025,7 +1051,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
          for (uint32_t y = 0; y < outHeight; ++y)
          {
              const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
-@@ -640,6 +1161,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -640,6 +1180,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -1033,7 +1059,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16 || !m_backend)
          return;
-@@ -930,7 +1452,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -930,7 +1471,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(x) / 16.0f;
          vtx.y = static_cast<float>(y) / 16.0f;
@@ -1042,7 +1068,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -967,7 +1489,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -967,7 +1508,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(x) / 16.0f;
          vtx.y = static_cast<float>(y) / 16.0f;
@@ -1051,7 +1077,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -1001,7 +1523,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1001,7 +1542,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
          vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
@@ -1060,7 +1086,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -1032,7 +1554,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1032,7 +1573,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
          vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
@@ -1069,7 +1095,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -1062,6 +1584,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1062,6 +1603,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
  
  void GS::writeRegister(uint8_t regAddr, uint64_t value)
  {
@@ -1077,7 +1103,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      writeRegisterUnlocked(regAddr, value);
  }
-@@ -1392,6 +1915,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1392,6 +1934,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
              command.trxpos = m_trxpos;
              command.trxreg = m_trxreg;
              command.direction = m_trxdir;
@@ -1095,7 +1121,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
              m_backend->BeginTransfer(command);
          }
          recordTransferDebugEventUnlocked();
-@@ -1525,10 +2059,73 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1525,10 +2078,73 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      recordRegisterDebugEventUnlocked(regAddr, value);
  }
  
@@ -1169,10 +1195,17 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
  
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);
-@@ -1576,7 +2173,173 @@ void GS::vertexKick(bool drawing)
+@@ -1576,10 +2192,184 @@ void GS::vertexKick(bool drawing)
      if (drawing && m_backend)
      {
          GSPrimitiveBatch batch = buildDrawBatch(needed);
++        if (ps2x_drawtag::on() && ps2x_drawtag::onPrim(batch, g_ps2xGifCurPath))
++        {
++            recordDrawDebugEventUnlocked(needed);
++            goto ps2x_drawtag_skipped;
++        }
++        if (ps2x_wshud::on())
++            ps2x_wshud::onPrim(batch, g_ps2xGifCurPath);
 +        if (g_gsDrawLog.enabled && g_gsDrawLog.active())
 +        {
 +            auto &L = g_gsDrawLog;
@@ -1343,14 +1376,22 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
          m_backend->Submit(batch);
          recordDrawDebugEventUnlocked(needed);
      }
-@@ -1608,9 +2371,21 @@ void GS::vertexKick(bool drawing)
++ps2x_drawtag_skipped:
+ 
+     switch (m_prim.type)
+     {
+@@ -1608,9 +2398,25 @@ void GS::vertexKick(bool drawing)
      }
  }
  
 +#include "gs_texrep.inl"
++#include "gs_drawtag.inl"
++#include "gs_wshud.inl"
 +
  void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
  {
++    if (ps2x_wshud::on())
++        ps2x_wshud::onImage();
 +    if (const uint8_t *rep = ps2x_texrep::onUpload(m_bitbltbuf, m_trxpos, m_trxreg, data, sizeBytes))
 +        data = rep;
      if (m_backend)
@@ -1365,7 +1406,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
          m_backend->UploadImage(data, sizeBytes);
  }
  
-@@ -1629,6 +2404,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
+@@ -1629,6 +2435,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
  
  uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -1373,7 +1414,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
  }
-@@ -1698,7 +2474,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+@@ -1698,7 +2505,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
      const uint64_t tex1 = batch.state.context.tex1;
      const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
      const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
@@ -1388,7 +1429,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
      return batch;
  }
  
-@@ -1734,3 +2516,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
+@@ -1734,3 +2547,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
          m_hasPreferredDisplaySource = true;
      }
  }
@@ -1396,25 +1437,44 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..8049acd8a675d4ab7b5d81ab35f519e9
 +// Opt-in GPU GS backend (PS2X_GS_GPU=1). Kept in this translation unit so no CMake change is needed.
 +#include "gs_gpu_backend.inl"
 diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
-index c0507c73c38a188543d30109ab2506ac4dbc83e6..eae9ad2b1d4801ade6d7df27b7c46027f080af86 100644
+index c0507c73c38a188543d30109ab2506ac4dbc83e6..8a29591d804e09f619620939d7abe4ab19a8878b 100644
 --- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
 +++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
-@@ -2,6 +2,9 @@
+@@ -2,6 +2,12 @@
  #include <algorithm>
  #include <cstring>
  
 +// Diagnostic: GIF path of the packet being processed by drain() (-1 outside drain).
 +int g_ps2xGifCurPath = -1;
++// Phase 0a (PS2X_DRAWTAG=1): tag of the packet being processed (0 = none), taken from the
++// 16-byte in-band prefix added by the VU1 XGKICK / VIF1 DIRECT paths; the prefix is stripped here.
++uint32_t g_ps2xDrawTag = 0u;
 +
  GifArbiter::GifArbiter(ProcessPacketFn processFn)
      : m_processFn(std::move(processFn))
  {
-@@ -57,7 +60,9 @@ void GifArbiter::drain()
+@@ -57,7 +63,24 @@ void GifArbiter::drain()
          auto &pkt = m_queue[i];
          if (!pkt.data.empty())
          {
+-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
 +            g_ps2xGifCurPath = static_cast<int>(pkt.pathId);
-             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            const uint8_t *pd = pkt.data.data();
++            uint32_t ps = static_cast<uint32_t>(pkt.data.size());
++            if (ps >= 32u)
++            {
++                uint64_t lo = 0, hi = 0;
++                std::memcpy(&lo, pd, 8);
++                std::memcpy(&hi, pd + 8, 8);
++                if (lo == (1ull << 60) && (hi >> 32) == 0xD7A61A60ull)
++                {
++                    g_ps2xDrawTag = static_cast<uint32_t>(hi);
++                    pd += 16;
++                    ps -= 16u;
++                }
++            }
++            m_processFn(pd, ps);
++            g_ps2xDrawTag = 0u;
 +            g_ps2xGifCurPath = -1;
          }
      }
@@ -3771,4 +3831,435 @@ index 0000000000000000000000000000000000000000..02b63fb9dc5d8410871f70ab8ed6b21c
 +    tab.map[origHash] = {name ? name : "?", std::vector<uint8_t>(b, b + size)};
 +    tab.sizeMask.fetch_or(1ull << ((size >> 8) & 63u));
 +    tab.any.store(true);
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_drawtag.inl b/ps2xRuntime/src/lib/gs/gs_drawtag.inl
+new file mode 100644
+index 0000000000000000000000000000000000000000..82df9c76c1a3bd3e633dbdf3f4d9a420ee469a08
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_drawtag.inl
+@@ -0,0 +1,227 @@
++// Phase 0a draw tagging, GS side (PS2X_DRAWTAG=1; diagnostic, default off). #included at the end of gs_frontend.cpp.
++// Aggregates every GS primitive by (GIF path, draw tag, prim, texture format, frame buffer, Z test) and prints
++// a table every PS2X_DRAWTAG_SEC seconds (default 10) as [drawtag] lines on stderr. The tag (g_ps2xDrawTag, set by
++// GifArbiter::drain) carries the VU1 program start and the emitter id (see ps2_vif1_interpreter.cpp).
++//   PS2X_DRAWTAG_SEQ=sec   : print every draw run, in order, for PS2X_DRAWTAG_SEQN (default 8) presents after t=sec
++//                            ([drawtag:seq] lines; presents are host frames, the game may draw every 2nd/4th one)
++//   PS2X_DRAWTAG_SKIP=list : drop draws, comma list of tokens: 0x2c18 (program byte address), e12 (emitter id),
++//                            d (VIF DIRECT), u (untagged path1), p2 / p3 (all path2 / path3)
++#include <set>
++#include <map>
++extern uint32_t g_ps2xDrawTag;
++extern "C" void ps2xDrawTagVifReport(FILE *f);
++namespace ps2x_drawtag
++{
++    namespace
++    {
++        struct Val
++        {
++            uint64_t runs = 0, prims = 0, verts = 0, constZ = 0;
++            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
++            double z0 = 1e18, z1 = -1e18;
++            std::set<uint32_t> tbp;
++        };
++        std::mutex g_m;
++        std::map<std::pair<uint64_t, uint64_t>, Val> g_agg;
++        std::pair<uint64_t, uint64_t> g_lastKey{~0ull, ~0ull};
++        std::string g_names[256];
++        uint64_t g_presents = 0, g_intervalPresents = 0;
++        std::chrono::steady_clock::time_point g_t0, g_lastDump;
++        bool g_started = false;
++        // SEQ dump state
++        int g_seqState = 0; // 0 idle, 1 wait frame start, 2 dumping, 3 done
++        uint64_t g_seqPresent = 0;
++        struct Run { std::pair<uint64_t, uint64_t> key{~0ull, ~0ull}; uint64_t prims = 0; float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f; double z0 = 1e18, z1 = -1e18; uint32_t tbp = 0; } g_run;
++        uint64_t g_seqN = 0;
++
++        double secs() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_t0).count(); }
++        const char *primName(unsigned t)
++        {
++            static const char *n[8] = {"point", "line", "lstrip", "tri", "tristrip", "trifan", "sprite", "?7"};
++            return n[t & 7];
++        }
++        std::string tagDesc(uint32_t tag, int path)
++        {
++            char b[96];
++            if (!(tag & 0x80000000u))
++            {
++                std::snprintf(b, sizeof(b), "path%d untagged", path);
++                return b;
++            }
++            const uint32_t prog = tag & 0x7FFu, em = (tag >> 11) & 0xFFu;
++            const char *emn = em == 0 ? "noaddr" : em == 0xFF ? "other" : (g_names[em].empty() ? "?" : g_names[em].c_str());
++            if (prog == 0x7FFu)
++                std::snprintf(b, sizeof(b), "path%d DIRECT em=%s(%u)", path, emn, em);
++            else
++                std::snprintf(b, sizeof(b), "path%d prog=0x%04x em=%s(%u)", path, prog * 8u, emn, em);
++            return b;
++        }
++        std::string keyDesc(const std::pair<uint64_t, uint64_t> &k)
++        {
++            const int path = static_cast<int>(k.first & 0xF) - 1;
++            const uint32_t tag = static_cast<uint32_t>(k.first >> 32);
++            const uint64_t b = k.second;
++            char s[200];
++            std::snprintf(s, sizeof(s), "%s %s tme%u fst%u abe%u ctx%u fb=%x/psm%x tex=psm%x/%ux%u zte%u ztst%u",
++                          tagDesc(tag, path).c_str(), primName(b & 7), (unsigned)((b >> 3) & 1), (unsigned)((b >> 4) & 1),
++                          (unsigned)((b >> 5) & 1), (unsigned)((b >> 6) & 1), (unsigned)((b >> 8) & 0x1FF), (unsigned)((b >> 17) & 0x3F),
++                          (unsigned)((b >> 23) & 0x3F), 1u << ((b >> 29) & 0xF), 1u << ((b >> 33) & 0xF), (unsigned)((b >> 37) & 1),
++                          (unsigned)((b >> 38) & 3));
++            return s;
++        }
++        struct Skip { std::vector<uint32_t> progs, ems; bool direct = false, untagged = false, p2 = false, p3 = false; };
++        const Skip &skip()
++        {
++            static const Skip s = []() {
++                Skip k;
++                const char *e = std::getenv("PS2X_DRAWTAG_SKIP");
++                if (!e)
++                    return k;
++                std::string str(e);
++                size_t i = 0;
++                while (i <= str.size())
++                {
++                    size_t j = str.find(',', i);
++                    if (j == std::string::npos) j = str.size();
++                    std::string t = str.substr(i, j - i);
++                    if (t == "d") k.direct = true;
++                    else if (t == "u") k.untagged = true;
++                    else if (t == "p2") k.p2 = true;
++                    else if (t == "p3") k.p3 = true;
++                    else if (!t.empty() && t[0] == 'e') k.ems.push_back((uint32_t)std::strtoul(t.c_str() + 1, nullptr, 10));
++                    else if (!t.empty()) k.progs.push_back((uint32_t)std::strtoul(t.c_str(), nullptr, 16) / 8u);
++                    i = j + 1;
++                }
++                std::fprintf(stderr, "[drawtag] skip list: %s\n", e);
++                return k;
++            }();
++            return s;
++        }
++        void dumpLocked(double t)
++        {
++            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_lastDump).count();
++            std::fprintf(stderr, "[drawtag] ==== t=%.1f interval=%.1fs frames(presents)=%llu keys=%zu\n", t, dt,
++                         (unsigned long long)g_intervalPresents, g_agg.size());
++            std::vector<std::pair<std::pair<uint64_t, uint64_t>, Val *>> v;
++            for (auto &kv : g_agg)
++                v.emplace_back(kv.first, &kv.second);
++            std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second->prims > b.second->prims; });
++            for (auto &e : v)
++            {
++                const Val &x = *e.second;
++                std::fprintf(stderr, "[drawtag] %s | runs=%llu prims=%llu verts=%llu constZ=%llu ntex=%zu bbox=(%.0f,%.0f)-(%.0f,%.0f) z=%.0f..%.0f\n",
++                             keyDesc(e.first).c_str(), (unsigned long long)x.runs, (unsigned long long)x.prims, (unsigned long long)x.verts,
++                             (unsigned long long)x.constZ, x.tbp.size(), x.x0, x.y0, x.x1, x.y1, x.z0, x.z1);
++            }
++            ps2xDrawTagVifReport(stderr);
++            g_agg.clear();
++            g_lastKey = {~0ull, ~0ull};
++            g_intervalPresents = 0;
++            g_lastDump = std::chrono::steady_clock::now();
++        }
++        void flushRunLocked()
++        {
++            if (g_seqState == 2 && g_run.prims)
++                std::fprintf(stderr, "[drawtag:seq] #%llu %s | prims=%llu tbp=%x bbox=(%.0f,%.0f)-(%.0f,%.0f) z=%.0f..%.0f\n", (unsigned long long)++g_seqN,
++                             keyDesc(g_run.key).c_str(), (unsigned long long)g_run.prims, g_run.tbp, g_run.x0, g_run.y0, g_run.x1, g_run.y1, g_run.z0, g_run.z1);
++            g_run = Run{};
++        }
++    }
++
++    bool on()
++    {
++        static const bool v = []() { const char *e = std::getenv("PS2X_DRAWTAG"); return e && e[0] == '1'; }();
++        return v;
++    }
++
++    // Returns true when the primitive must be dropped (PS2X_DRAWTAG_SKIP).
++    bool onPrim(const GSPrimitiveBatch &batch, int path)
++    {
++        const uint32_t tag = g_ps2xDrawTag;
++        const GSContext &c = batch.state.context;
++        const auto &pr = batch.state.prim;
++        const uint64_t k1 = (uint64_t)(path + 1) | ((uint64_t)tag << 32);
++        const uint64_t k2 = (uint64_t)(pr.type & 7) | ((uint64_t)(pr.tme & 1) << 3) | ((uint64_t)(pr.fst & 1) << 4) | ((uint64_t)(pr.abe & 1) << 5) |
++                            ((uint64_t)(pr.ctxt & 1) << 6) | ((uint64_t)(c.frame.fbp & 0x1FF) << 8) | ((uint64_t)(c.frame.psm & 0x3F) << 17) |
++                            ((uint64_t)(pr.tme ? (c.tex0.psm & 0x3F) : 0) << 23) | ((uint64_t)(pr.tme ? (c.tex0.tw & 0xF) : 0) << 29) |
++                            ((uint64_t)(pr.tme ? (c.tex0.th & 0xF) : 0) << 33) | ((uint64_t)((c.test >> 16) & 1) << 37) | ((uint64_t)((c.test >> 17) & 3) << 38);
++        const std::pair<uint64_t, uint64_t> key{k1, k2};
++        const float ofx = static_cast<float>(c.xyoffset.ofx >> 4), ofy = static_cast<float>(c.xyoffset.ofy >> 4);
++        {
++            std::lock_guard<std::mutex> lk(g_m);
++            if (!g_started)
++            {
++                g_started = true;
++                g_t0 = g_lastDump = std::chrono::steady_clock::now();
++            }
++            Val &v = g_agg[key];
++            if (key != g_lastKey)
++            {
++                ++v.runs;
++                g_lastKey = key;
++                flushRunLocked();
++                g_run.key = key;
++                g_run.tbp = pr.tme ? c.tex0.tbp0 : 0u;
++            }
++            ++v.prims;
++            ++g_run.prims;
++            v.verts += batch.vertexCount;
++            if (pr.tme)
++                v.tbp.insert(c.tex0.tbp0);
++            bool cz = true;
++            for (int i = 0; i < batch.vertexCount; ++i)
++            {
++                const auto &vx = batch.vertices[i];
++                const float sx = vx.x - ofx, sy = vx.y - ofy;
++                v.x0 = std::min(v.x0, sx); v.x1 = std::max(v.x1, sx); v.y0 = std::min(v.y0, sy); v.y1 = std::max(v.y1, sy);
++                v.z0 = std::min<double>(v.z0, vx.z); v.z1 = std::max<double>(v.z1, vx.z);
++                g_run.x0 = std::min(g_run.x0, sx); g_run.x1 = std::max(g_run.x1, sx); g_run.y0 = std::min(g_run.y0, sy); g_run.y1 = std::max(g_run.y1, sy);
++                g_run.z0 = std::min<double>(g_run.z0, vx.z); g_run.z1 = std::max<double>(g_run.z1, vx.z);
++                if (i && vx.z != batch.vertices[0].z)
++                    cz = false;
++            }
++            if (cz)
++                ++v.constZ;
++        }
++        const Skip &s = skip();
++        if (s.p2 && path == 2) return true;
++        if (s.p3 && path == 3) return true;
++        if (!(tag & 0x80000000u))
++            return s.untagged && path == 1;
++        const uint32_t prog = tag & 0x7FFu, em = (tag >> 11) & 0xFFu;
++        if (prog == 0x7FFu && s.direct) return true;
++        for (uint32_t p : s.progs) if (p == prog) return true;
++        for (uint32_t e : s.ems) if (e == em) return true;
++        return false;
++    }
++
++    void onPresent()
++    {
++        static const double s_interval = []() { const char *e = std::getenv("PS2X_DRAWTAG_SEC"); const double v = e ? std::atof(e) : 0.0; return v > 0.0 ? v : 10.0; }();
++        static const uint64_t s_seqN = []() { const char *e = std::getenv("PS2X_DRAWTAG_SEQN"); const long v = e ? std::atol(e) : 0; return static_cast<uint64_t>(v > 0 ? v : 8); }();
++        static const double s_seqAt = []() { const char *e = std::getenv("PS2X_DRAWTAG_SEQ"); return e ? std::atof(e) : -1.0; }();
++        std::lock_guard<std::mutex> lk(g_m);
++        if (!g_started)
++            return;
++        ++g_presents;
++        ++g_intervalPresents;
++        const double t = secs();
++        if (s_seqAt >= 0.0)
++        {
++            if (g_seqState == 0 && t >= s_seqAt) { g_seqState = 1; }
++            else if (g_seqState == 1) { flushRunLocked(); g_run = Run{}; g_lastKey = {~0ull, ~0ull}; g_seqState = 2; g_seqPresent = g_presents; std::fprintf(stderr, "[drawtag:seq] ---- frame start t=%.2f present=%llu\n", t, (unsigned long long)g_presents); }
++            else if (g_seqState == 2 && g_presents >= g_seqPresent + s_seqN) { flushRunLocked(); g_seqState = 3; std::fprintf(stderr, "[drawtag:seq] ---- end (%llu presents)\n", (unsigned long long)s_seqN); }
++            else if (g_seqState == 2) { std::fprintf(stderr, "[drawtag:seq] ---- present %llu\n", (unsigned long long)g_presents); }
++        }
++        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - g_lastDump).count() >= s_interval)
++            dumpLocked(t);
++    }
++}
++extern "C" void ps2xDrawTagSetName(uint32_t id, const char *name)
++{
++    if (id < 256u && name)
++    {
++        std::lock_guard<std::mutex> lk(ps2x_drawtag::g_m);
++        ps2x_drawtag::g_names[id] = name;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_wshud.inl b/ps2xRuntime/src/lib/gs/gs_wshud.inl
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3a56dc9dc620e3ed234fbafaec694a64633020b
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_wshud.inl
+@@ -0,0 +1,192 @@
++// Widescreen HUD fix-up (PS2X_WS_HUD_SCALE=<s>, e.g. 0.75 for 4:3 content in a 16:9 picture; default off).
++// #included at the end of gs_frontend.cpp. Set by the game overrides (BLACKKAT_WIDESCREEN=1, BLACKKAT_WS_HUD!=0).
++// With a stretched 16:9 present the 3D uses a hor+ projection, but 2D HUD elements are drawn for 4:3 and would be
++// stretched by 1/s. This squeezes HUD primitives horizontally by s around an anchor (left edge, centre or right
++// edge, picked per element), so they keep their 4:3 proportions and stay pinned to the screen edges.
++//   HUD = (a) PATH2 (VIF DIRECT) primitives with Z test off/ALWAYS on the main frame buffer, not full-screen;
++//         (b) PATH1 (VU1) primitives on the main frame buffer after the end-of-frame marker: a full-screen untextured
++//             PATH2 sprite with constant Z > 0 (Black Kat: Z=16384), until the next PATH3 primitive (display blit).
++// Frames without any PATH1 (VU1 3D) draws for ~0.5 s (menus, loading text, FMVs) are presented at 4:3 with
++// pillarbox instead (g_ps2xPresentAspectDyn, read by the host present).
++//   PS2X_WS_HUD_LOG=1 : print a [wshud] line every 10 s (modes, markers, frames).
++#include <atomic>
++std::atomic<float> g_ps2xPresentAspectDyn{0.0f}; // 0 = use the static PS2X_PRESENT_ASPECT
++namespace ps2x_wshud
++{
++    namespace
++    {
++        std::atomic<uint64_t> g_p1Prims{0}, g_otherActivity{0};
++        std::atomic<bool> g_wide{true};
++        // stats
++        std::atomic<uint64_t> g_totalMarkers{0};
++        std::atomic<uint64_t> g_statMarkers{0}, g_statHud{0}, g_statBlits{0}, g_statP1Frames{0};
++        // GS-thread state
++        bool s_after = false, s_haveMain = false, s_inRun = false;
++        uint32_t s_mainFbp = 0;
++        int s_runPath = 0;
++        uint64_t s_runKey = 0;
++        float s_anchor = 0.0f;
++        float s_pb[4] = {0, 0, 0, 0};
++        bool s_p1SinceBlit = false;
++        float s_screenW = 640.0f, s_screenH = 448.0f;
++    }
++
++    float scale()
++    {
++        static const float s = []() {
++            const char *e = std::getenv("PS2X_WS_HUD_SCALE");
++            const float v = e ? std::strtof(e, nullptr) : 0.0f;
++            if (v > 0.2f && v < 1.0f)
++                std::fprintf(stderr, "[wshud] widescreen HUD fix-up on, x-scale %.4f (PS2X_WS_HUD_SCALE)\n", v);
++            return (v > 0.2f && v < 1.0f) ? v : 0.0f;
++        }();
++        return s;
++    }
++    bool on() { return scale() > 0.0f; }
++
++    void onImage() { g_otherActivity.fetch_add(1, std::memory_order_relaxed); }
++
++    void onPrim(GSPrimitiveBatch &b, int path)
++    {
++        const GSContext &c = b.state.context;
++        const auto &pr = b.state.prim;
++        const float ofx = static_cast<float>(c.xyoffset.ofx >> 4), ofy = static_cast<float>(c.xyoffset.ofy >> 4);
++        const int n = b.vertexCount;
++        if (n <= 0)
++            return;
++        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
++        bool constZ = true;
++        for (int i = 0; i < n; ++i)
++        {
++            const float sx = b.vertices[i].x - ofx, sy = b.vertices[i].y - ofy;
++            x0 = std::min(x0, sx); x1 = std::max(x1, sx); y0 = std::min(y0, sy); y1 = std::max(y1, sy);
++            if (b.vertices[i].z != b.vertices[0].z)
++                constZ = false;
++        }
++        const bool full = x0 <= 1.0f && y0 <= 1.0f && x1 >= 639.0f && y1 >= 447.0f;
++        if (path == 1)
++        {
++            g_p1Prims.fetch_add(1, std::memory_order_relaxed);
++            s_p1SinceBlit = true;
++        }
++        else
++            g_otherActivity.fetch_add(1, std::memory_order_relaxed);
++        if (path == 3)
++        {
++            if (full && c.frame.fbp != s_mainFbp && s_p1SinceBlit)
++            {
++                g_statBlits.fetch_add(1, std::memory_order_relaxed);
++                s_p1SinceBlit = false;
++            }
++            s_after = false;
++            s_inRun = false;
++            return;
++        }
++        if (path == 2 && pr.type == GS_PRIM_SPRITE && full)
++        {
++            if (!pr.tme && constZ && b.vertices[0].z > 0.0)
++            {
++                s_after = true;
++                s_mainFbp = c.frame.fbp;
++                s_screenW = x1;
++                s_screenH = y1;
++                s_haveMain = true;
++                g_statMarkers.fetch_add(1, std::memory_order_relaxed);
++                g_totalMarkers.fetch_add(1, std::memory_order_relaxed);
++            }
++            else if (constZ && b.vertices[0].z == 0.0)
++                s_after = false;
++            s_inRun = false;
++            return;
++        }
++        if (!g_wide.load(std::memory_order_relaxed))
++        {
++            s_inRun = false;
++            return;
++        }
++        bool hud = false;
++        if (path == 2)
++        {
++            const bool zte = ((c.test >> 16) & 1u) != 0u;
++            const unsigned ztst = static_cast<unsigned>((c.test >> 17) & 3u);
++            hud = (!zte || ztst == 1u) && s_haveMain && c.frame.fbp == s_mainFbp && (x1 - x0) < 600.0f;
++        }
++        else if (path == 1)
++            hud = s_after && s_haveMain && c.frame.fbp == s_mainFbp;
++        // Primitives outside the visible picture (the marker's rectangle, e.g. 640x448) must stay invisible: Black Kat
++        // draws mirrored text glyphs off-screen (x > 640) that a squeeze would pull into view.
++        if (hud && (x1 > s_screenW + 1.0f || x0 < -1.0f || y1 > s_screenH + 1.0f || y0 < -1.0f))
++            hud = false;
++        // Untextured sprites anchored in the top-left corner (e.g. two 256x256 rects after the HUD) are render-target
++        // maintenance for the water reflection, not HUD; squeezing them leaves stale HUD pixels that show up mirrored.
++        if (hud && path == 2 && !pr.tme && x0 <= 0.5f && y0 <= 0.5f && (x1 - x0) >= 64.0f && (y1 - y0) >= 64.0f)
++            hud = false;
++        if (!hud)
++        {
++            s_inRun = false;
++            return;
++        }
++        g_statHud.fetch_add(1, std::memory_order_relaxed);
++        const uint64_t key = (uint64_t)path | ((uint64_t)pr.type << 4) | ((uint64_t)pr.tme << 8) | ((uint64_t)c.tex0.psm << 9) |
++                             ((uint64_t)c.tex0.tbp0 << 16);
++        const float gap = path == 1 ? 64.0f : 48.0f;
++        const bool nearPrev = x0 <= s_pb[2] + gap && x1 >= s_pb[0] - gap && y0 <= s_pb[3] + gap && y1 >= s_pb[1] - gap;
++        const bool cont = s_inRun && s_runPath == path && (path == 1 || key == s_runKey) && nearPrev;
++        if (!cont)
++            s_anchor = x0 < s_screenW * 0.25f ? 0.0f : (x1 > s_screenW * 0.75f ? s_screenW : s_screenW * 0.5f);
++        s_inRun = true;
++        s_runPath = path;
++        s_runKey = key;
++        s_pb[0] = x0; s_pb[1] = y0; s_pb[2] = x1; s_pb[3] = y1;
++        {
++            static const bool dump = std::getenv("PS2X_WS_HUD_DUMP") != nullptr;
++            if (dump && g_totalMarkers.load(std::memory_order_relaxed) == 450)
++                std::fprintf(stderr, "[wshud-dump] path=%d prim=%d tme=%d tbp0=0x%x psm=0x%x tbw=%d fbp=0x%x n=%d bbox=(%.0f,%.0f)-(%.0f,%.0f) uv0=(%u,%u) anchor=%.0f new=%d\n",
++                             path, (int)pr.type, (int)pr.tme, (unsigned)c.tex0.tbp0, (unsigned)c.tex0.psm, (int)c.tex0.tbw,
++                             (unsigned)c.frame.fbp, n, x0, y0, x1, y1, (unsigned)b.vertices[0].u, (unsigned)b.vertices[0].v, s_anchor, cont ? 0 : 1);
++        }
++        const float s = scale();
++        for (int i = 0; i < n; ++i)
++        {
++            const float sx = b.vertices[i].x - ofx;
++            b.vertices[i].x = s_anchor + (sx - s_anchor) * s + ofx;
++        }
++    }
++
++    // Host thread, once per presented frame.
++    void onPresent()
++    {
++        static int s_noP1 = 0;
++        static const float s_narrow = []() {
++            const char *e = std::getenv("PS2X_PRESENT_ASPECT");
++            const float a = e ? std::strtof(e, nullptr) : 0.0f;
++            return a > 0.5f ? a * scale() : 4.0f / 3.0f;
++        }();
++        const uint64_t p1 = g_p1Prims.exchange(0, std::memory_order_relaxed);
++        const uint64_t other = g_otherActivity.exchange(0, std::memory_order_relaxed);
++        if (p1 > 0)
++        {
++            s_noP1 = 0;
++            g_statP1Frames.fetch_add(1, std::memory_order_relaxed);
++            if (!g_wide.exchange(true))
++                std::fprintf(stderr, "[wshud] 3D frames: present 16:9\n");
++        }
++        else if (other > 0 && ++s_noP1 >= 30 && g_wide.exchange(false))
++            std::fprintf(stderr, "[wshud] no VU1 3D for 30 presents: present 4:3 pillarbox (aspect %.4f)\n", s_narrow);
++        g_ps2xPresentAspectDyn.store(g_wide.load() ? 0.0f : s_narrow, std::memory_order_relaxed);
++
++        static const bool s_log = []() { const char *e = std::getenv("PS2X_WS_HUD_LOG"); return e && e[0] == '1'; }();
++        static auto s_t0 = std::chrono::steady_clock::now();
++        static uint64_t s_presents = 0;
++        ++s_presents;
++        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count();
++        if (s_log && el >= 10.0)
++        {
++            std::fprintf(stderr, "[wshud] %.1fs: presents/s=%.1f presents-with-3D/s=%.1f markers/s=%.1f display-blits-after-3D/s=%.1f hud-prims/s=%.0f mode=%s\n",
++                         el, s_presents / el, g_statP1Frames.exchange(0) / el, g_statMarkers.exchange(0) / el, g_statBlits.exchange(0) / el,
++                         g_statHud.exchange(0) / el, g_wide.load() ? "16:9" : "4:3");
++            s_presents = 0;
++            s_t0 = std::chrono::steady_clock::now();
++        }
++    }
 +}
