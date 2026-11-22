@@ -1445,3 +1445,56 @@ After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, hig
   1. An EE overclock mode: more guest cycles per vsync, i.e. scheduler vsync spacing and cycle pacing in EeScheduler.cpp / ps2_memory.cpp. kEeClockHz is in ee_scheduler.h, which is included by generated code, so it must not change there.
   2. Roughly 2x VU1 throughput.
   3. Patching all frame-timing variables consistently (the D6C/D70/D94/7233B4/72339C set above), then checking speed with a timed event.
+
+## Draw tagging, widescreen HUD, EE profiling, VU1 worker speed-up (2026-11-21/22, patches 0003/0004/0005)
+
+### Phase 0a draw tagging (diagnostic, default off)
+- `PS2X_DRAWTAG=1` (gs/gs_drawtag.inl, ps2_gif_arbiter.cpp, overrides): each GS primitive is tagged with its source. PATH1 primitives carry the VU1 program byte address (prog=0x....) and the EE emitter function that kicked it (em=..., 35 emitters bound in src/overrides). PATH2 and PATH3 are tagged too. A table is printed every `PS2X_DRAWTAG_SEC` seconds (default 10).
+- `PS2X_DRAWTAG_SEQ=<sec>` / `PS2X_DRAWTAG_SEQN=<n>`: print every draw run, in order, for n presents after t=sec.
+- `PS2X_DRAWTAG_SKIP=<list>`: drop draws. The list can hold programs (0x2c18), emitters (e12), p2, p3, untagged and direct.
+
+### Phase 1 widescreen HUD + live aspect switch
+- `PS2X_WS_HUD_SCALE=<s>` (gs/gs_wshud.inl): with a 16:9 present, the 2D HUD primitives are squeezed horizontally by s around a per-element anchor, so they keep their 4:3 proportions.
+  - The game sets it (0.75) when `BLACKKAT_WIDESCREEN=1`. `BLACKKAT_WS_HUD=0` turns it off.
+- Frames without VU1 3D draws for about 0.5 s (menus, loading text, FMVs) are presented at 4:3 with pillarbox. This goes through `g_ps2xPresentAspectDyn`, which the presenter in ps2_runtime.cpp reads.
+- `PS2X_WS_HUD_LOG=1` / `PS2X_WS_HUD_DUMP`: diagnostics.
+
+### EE profiling (diagnostic)
+- `BLACKKAT_FRAMELOG=1`: game fps (flip 0x15B3E8) plus `[eeprof]` EE thread CPU / pace-wait / cycles per frame.
+- `PS2X_EE_BACKEDGE_HIST=1`: EE loop back-edge histogram.
+- `PS2X_VU1_THREAD_STATS=1`: worker busy %, VU1 Mcycles per busy second, drain reasons.
+- Finding: the EE is clock-paced. The VU1 worker is the critical path, and the EE spends about 65 % of its time polling the VIF1 DMA channel (0x114378 / 0x114560 / 0x114748).
+
+### VU1 worker speed-up: `PS2X_VU1_OPT=<mask>`, default 16287
+- `PS2X_VU1_OPT=0` gives the old behaviour. `PS2X_VU1_OPT=1951` gives pass 1 only. To turn off one change, subtract its bit value from 16287.
+
+| bit value | change |
+|---|---|
+| 1 | flag-liveness proof follows static branches |
+| 2 | inline branch PC update in native blocks |
+| 4 | native block chaining |
+| 8 | fast VIF1 UNPACK loop (MODE 0, CL ≥ WL) |
+| 16 | static per-slot stall pruning |
+| 128 | no 64 KB memset per XGKICK |
+| 256 | getenv out of run() |
+| 512 | short live-flag path |
+| 1024 | CLIP slot from bitmask |
+| 2048 | native CLIP |
+| 4096 | DIV/SQRT/RSQRT called directly from blocks |
+| 8192 | bulk XGKICK copy |
+| 32, 64 | wider flag-liveness walk; no gain, not in the default |
+
+- Verification: `PS2X_VU1_BC_CHECK=1` had 0 mismatches (240k runs at sea, 240k on foot). `PS2X_VIF_FAST_CHECK=1` had 0 mismatches. Per-program draw shares (PS2X_DRAWTAG) match OPT=0 within ±0.05 points.
+- Result (3 runs each):
+
+| scene | fps | VU1 worker busy per frame | VU1 Mcycles per busy second |
+|---|---|---|---|
+| at sea | 15.2 → 20.2 | 40.7 → 29.1 ms (−28.5 %) | 76.7 → 107.5 |
+| on foot | 22.4 → 30.0 (cap) | 27.7 → 19.0 ms (−31 %) | 73.9 → 108.3 |
+
+- Diagnostics: `PS2X_VU1_OPT_STATS=1`, `PS2X_VU1_PERFMAP=1` (writes /tmp/perf-<pid>.map for perf), `PS2X_VU1_JITDUMP=<dir>`.
+
+### EE/VU1 overlap experiment: `PS2X_EEVU1_OVERLAP=<n>`, default OFF, do not use
+- A D1 CHCR poll reports idle while at most n VIF1 jobs are queued.
+- At sea: 20.2 → 14.6 fps, vsync about 37/s. The cause is synchronous drains on VIF1 register reads and privileged GS reads (about 1.9 s blocked per 5 s).
+- A working version needs shadow VIF1_STAT / CSR reads and EE cycle charging while blocked. It probably needs new PS2Memory members, which means a header change and a full rebuild.
