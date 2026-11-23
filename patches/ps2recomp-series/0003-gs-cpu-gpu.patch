@@ -471,7 +471,7 @@ index f0ad5070b42f89c6c697c906e93f59cebf2ba904..1085c7dc95b90055ebd1fd6fe5f11136
 +    return h;
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194e78d1d92 100644
+index 9281d5f51b809c4f755837ccf45e47604d539bf7..3218217cde95806e06da45e1a30bc48b88a48f3c 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -1,6 +1,8 @@
@@ -483,7 +483,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
  #include "runtime/ps2_memory.h"
  #include <atomic>
  #include <algorithm>
-@@ -111,6 +113,833 @@ GS::GS()
+@@ -111,6 +113,835 @@ GS::GS()
      reset();
  }
  
@@ -530,6 +530,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
 +    bool on();
 +    void onPrim(GSPrimitiveBatch &batch, int path);
 +    void onImage();
++    void onFullCopy();
 +    void onPresent();
 +}
 +#include <chrono>
@@ -545,8 +546,9 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
 +    {
 +        long lo = -1, hi = -1; int lines = 0;
 +        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-+        GsWatchBp() { if (const char *e = std::getenv("PS2X_GS_WATCHBP")) std::sscanf(e, "%lx,%lx", &lo, &hi); }
-+        bool on(long bp, long endBp) { return lo >= 0 && lines < 400 && bp < hi && endBp > lo; }
++        double tmin = 0.0; // PS2X_GS_WATCHT=<sec>: start logging after that many seconds
++        GsWatchBp() { if (const char *e = std::getenv("PS2X_GS_WATCHBP")) std::sscanf(e, "%lx,%lx", &lo, &hi); if (const char *e = std::getenv("PS2X_GS_WATCHT")) tmin = std::atof(e); }
++        bool on(long bp, long endBp) { return lo >= 0 && lines < 400 && bp < hi && endBp > lo && (tmin <= 0.0 || t() >= tmin); }
 +        double t() const { return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
 +    };
 +    GsWatchBp g_gsWatch;
@@ -1317,7 +1319,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
  void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  {
      m_localMemoryStorage = vram;
-@@ -118,6 +947,9 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+@@ -118,6 +949,9 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
      m_privRegs = privRegs;
      if (!m_backend)
          m_backend = std::make_unique<GSCpuBackend>();
@@ -1327,7 +1329,108 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
      m_backend->Initialize(vram, vramSize);
      reset();
  }
-@@ -548,6 +1380,12 @@ void GS::latchHostPresentationFrame()
+@@ -524,6 +1358,100 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+     return request;
+ }
+ 
++namespace
++{
++    // vk18 debug (PS2X_PRESSPIKE=1): find one-vsync flicker in the presented stream, any backend. Each latched
++    // frame is reduced to a 32x24 grid of mean luma; frame t-1 is a "spike" when >= PS2X_PRESSPIKE_CELLS cells
++    // (default 6) differ from both t-2 and t by > 20 while t-2 and t agree within 6 (A B A). Prints one line per
++    // spike (first 60) plus a summary every 600 presents; PS2X_PRESSPIKE_DUMP=prefix writes the three frames of the
++    // first 12 spikes as 160-wide PPMs.
++    struct PresSpike
++    {
++        bool on = std::getenv("PS2X_PRESSPIKE") != nullptr;
++        int minCells = std::getenv("PS2X_PRESSPIKE_CELLS") ? std::atoi(std::getenv("PS2X_PRESSPIKE_CELLS")) : 6;
++        const char *dump = std::getenv("PS2X_PRESSPIKE_DUMP");
++        static constexpr int GW = 32, GH = 24;
++        float g[3][GW * GH]{};
++        std::vector<uint8_t> small[3];
++        std::vector<uint8_t> hist[8]; uint32_t histPos = 0; // last 8 small frames
++        uint32_t sw = 0, sh = 0;
++        int have = 0; uint64_t n = 0, spikes = 0, printed = 0, dumped = 0, changes = 0;
++        void dumpSmall(int idx, uint64_t pn, const char *tag)
++        {
++            char path[512]; std::snprintf(path, sizeof(path), "%s_%llu_%s.ppm", dump, (unsigned long long)pn, tag);
++            if (FILE *f = std::fopen(path, "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", sw, sh); std::fwrite(small[idx].data(), 1, small[idx].size(), f); std::fclose(f); }
++        }
++        void feed(const std::vector<uint8_t> &px, uint32_t w, uint32_t h, uint32_t dfbp, uint32_t sfbp)
++        {
++            if (!on || w == 0 || h == 0) return;
++            const size_t stride = static_cast<size_t>(std::max<uint32_t>(kHostFrameWidth, w)) * 4u;
++            const size_t pstride = (px.size() >= stride * h) ? stride : static_cast<size_t>(w) * 4u;
++            if (px.size() < pstride * h) return;
++            // shift history
++            std::memmove(g[0], g[1], sizeof(g[0])); std::memmove(g[1], g[2], sizeof(g[0]));
++            small[0].swap(small[1]); small[1].swap(small[2]);
++            float *c = g[2]; float cnt[GW * GH]{};
++            for (int i = 0; i < GW * GH; ++i) c[i] = 0;
++            const uint32_t step = std::max<uint32_t>(1u, w / 320u);
++            for (uint32_t y = 0; y < h; y += step)
++            {
++                const uint8_t *row = px.data() + y * pstride;
++                const int cy = static_cast<int>(static_cast<uint64_t>(y) * GH / h);
++                for (uint32_t x = 0; x < w; x += step)
++                {
++                    const uint8_t *p = row + x * 4u;
++                    const int cx = static_cast<int>(static_cast<uint64_t>(x) * GW / w);
++                    c[cy * GW + cx] += 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2]; cnt[cy * GW + cx] += 1.f;
++                }
++            }
++            for (int i = 0; i < GW * GH; ++i) c[i] = cnt[i] > 0 ? c[i] / cnt[i] : 0;
++            if (dump)
++            {
++                sw = 160; sh = static_cast<uint32_t>(160ull * h / w);
++                small[2].resize(static_cast<size_t>(sw) * sh * 3u);
++                for (uint32_t y = 0; y < sh; ++y)
++                    for (uint32_t x = 0; x < sw; ++x)
++                    {
++                        const uint8_t *p = px.data() + (static_cast<size_t>(y) * h / sh) * pstride + (static_cast<size_t>(x) * w / sw) * 4u;
++                        uint8_t *d = &small[2][(static_cast<size_t>(y) * sw + x) * 3u]; d[0] = p[0]; d[1] = p[1]; d[2] = p[2];
++                    }
++            }
++            if (dump) { hist[histPos % 8u] = small[2]; ++histPos; }
++            ++n; if (have < 3) ++have;
++            if (have == 3)
++            {
++                int spikeCells = 0, ch = 0; float mx = 0;
++                for (int i = 0; i < GW * GH; ++i)
++                {
++                    const float a = g[0][i], b = g[1][i], z = g[2][i];
++                    if (std::fabs(b - z) > 20.f) ++ch;
++                    if (std::fabs(b - a) > 20.f && std::fabs(b - z) > 20.f && std::fabs(a - z) < 6.f) { ++spikeCells; mx = std::max(mx, std::fabs(b - a)); }
++                }
++                if (ch) ++changes;
++                if (spikeCells >= minCells)
++                {
++                    ++spikes;
++                    if (printed < 60) { ++printed; std::fprintf(stderr, "[presspike] present %llu: %d cells (max %.0f) dfbp %x sfbp %x %ux%u\n", (unsigned long long)(n - 1), spikeCells, mx, dfbp, sfbp, w, h); }
++                    if (dump && dumped < 12)
++                    {   // the spike and the 7 frames before/after it in the ring: h0 (oldest) .. h7 (= c)
++                        ++dumped;
++                        for (uint32_t k = 0; k < 8u && k < histPos; ++k)
++                        {
++                            const std::vector<uint8_t> &hv = hist[(histPos - 8u + k) % 8u];
++                            if (hv.empty()) continue;
++                            char tag[8]; std::snprintf(tag, sizeof(tag), "h%u", k);
++                            char path[512]; std::snprintf(path, sizeof(path), "%s_%llu_%s.ppm", dump, (unsigned long long)(n - 1), tag);
++                            if (FILE *f = std::fopen(path, "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", sw, sh); std::fwrite(hv.data(), 1, hv.size(), f); std::fclose(f); }
++                        }
++                    }
++                }
++            }
++            if (n % 600u == 0u) std::fprintf(stderr, "[presspike] %llu presents: %llu spikes, %llu changed\n", (unsigned long long)n, (unsigned long long)spikes, (unsigned long long)changes);
++        }
++    };
++    PresSpike g_presSpike;
++}
++
+ void GS::latchHostPresentationFrame()
+ {
+     GSPresentationRequest request{};
+@@ -548,9 +1476,17 @@ void GS::latchHostPresentationFrame()
              m_backend->Flush();
              m_backend->Sync(GSSyncReason::Presentation);
              frame = m_backend->Present(request);
@@ -1340,7 +1443,12 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          }
      }
  
-@@ -610,7 +1448,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
++    if (g_presSpike.on && frame)
++        g_presSpike.feed(frame.pixels, frame.width, frame.height, frame.displayFbp, frame.sourceFbp);
+     const bool hasFrame = static_cast<bool>(frame);
+     const uint32_t displayFbp = frame.displayFbp;
+     const uint32_t sourceFbp = frame.sourceFbp;
+@@ -610,7 +1546,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
      outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
      if (outWidth != 0u && outHeight != 0u)
      {
@@ -1350,7 +1458,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          for (uint32_t y = 0; y < outHeight; ++y)
          {
              const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
-@@ -640,6 +1479,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -640,6 +1577,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -1358,7 +1466,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16 || !m_backend)
          return;
-@@ -930,7 +1770,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -930,7 +1868,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(x) / 16.0f;
          vtx.y = static_cast<float>(y) / 16.0f;
@@ -1367,7 +1475,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -967,7 +1807,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -967,7 +1905,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(x) / 16.0f;
          vtx.y = static_cast<float>(y) / 16.0f;
@@ -1376,7 +1484,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -1001,7 +1841,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1001,7 +1939,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
          vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
@@ -1385,7 +1493,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -1032,7 +1872,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1032,7 +1970,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
          vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
@@ -1394,7 +1502,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -1062,6 +1902,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1062,6 +2000,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
  
  void GS::writeRegister(uint8_t regAddr, uint64_t value)
  {
@@ -1402,7 +1510,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      writeRegisterUnlocked(regAddr, value);
  }
-@@ -1240,6 +2081,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1240,6 +2179,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
          t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
          t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
          t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
@@ -1411,7 +1519,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          m_backend->LoadClut(t, m_texclut);
          break;
      }
-@@ -1271,6 +2114,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1271,6 +2212,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
          t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
          t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
          t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
@@ -1420,7 +1528,16 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          m_backend->LoadClut(t, m_texclut);
          break;
      }
-@@ -1392,6 +2237,19 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1384,6 +2327,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     case GS_REG_TRXDIR:
+     {
+         m_trxdir = static_cast<uint32_t>(value & 0x3);
++        if (m_trxdir == 2u && m_trxreg.rrw >= 640u && m_trxreg.rrh >= 448u && ps2x_wshud::on())
++            ps2x_wshud::onFullCopy();
+ 
+         if (m_backend)
+         {
+@@ -1392,6 +2337,19 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
              command.trxpos = m_trxpos;
              command.trxreg = m_trxreg;
              command.direction = m_trxdir;
@@ -1440,7 +1557,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
              m_backend->BeginTransfer(command);
          }
          recordTransferDebugEventUnlocked();
-@@ -1413,6 +2271,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1413,6 +2371,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
          m_fogB = static_cast<uint8_t>((value >> 16) & 0xFFu);
          break;
      case GS_REG_TEXFLUSH:
@@ -1449,7 +1566,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          if (m_backend)
              m_backend->TextureFlush();
          break;
-@@ -1477,6 +2337,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1477,6 +2437,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      }
      case GS_REG_FINISH:
      {
@@ -1458,7 +1575,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          if (m_backend)
          {
              m_backend->Flush();
-@@ -1525,10 +2387,73 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1525,10 +2487,73 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      recordRegisterDebugEventUnlocked(regAddr, value);
  }
  
@@ -1532,7 +1649,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
  
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);
-@@ -1576,10 +2501,186 @@ void GS::vertexKick(bool drawing)
+@@ -1576,10 +2601,186 @@ void GS::vertexKick(bool drawing)
      if (drawing && m_backend)
      {
          GSPrimitiveBatch batch = buildDrawBatch(needed);
@@ -1719,7 +1836,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
  
      switch (m_prim.type)
      {
-@@ -1608,9 +2709,26 @@ void GS::vertexKick(bool drawing)
+@@ -1608,9 +2809,26 @@ void GS::vertexKick(bool drawing)
      }
  }
  
@@ -1746,7 +1863,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
          m_backend->UploadImage(data, sizeBytes);
  }
  
-@@ -1629,6 +2747,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
+@@ -1629,6 +2847,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
  
  uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -1754,7 +1871,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
  }
-@@ -1698,7 +2817,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+@@ -1698,7 +2917,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
      const uint64_t tex1 = batch.state.context.tex1;
      const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
      const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
@@ -1769,7 +1886,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194
      return batch;
  }
  
-@@ -1734,3 +2859,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
+@@ -1734,3 +2959,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
          m_hasPreferredDisplaySource = true;
      }
  }
@@ -4215,10 +4332,10 @@ index 0000000000000000000000000000000000000000..02b63fb9dc5d8410871f70ab8ed6b21c
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_drawtag.inl b/ps2xRuntime/src/lib/gs/gs_drawtag.inl
 new file mode 100644
-index 0000000000000000000000000000000000000000..82df9c76c1a3bd3e633dbdf3f4d9a420ee469a08
+index 0000000000000000000000000000000000000000..4b4349b20667c701c9e54d6ec909a9a6905f296a
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_drawtag.inl
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,235 @@
 +// Phase 0a draw tagging, GS side (PS2X_DRAWTAG=1; diagnostic, default off). #included at the end of gs_frontend.cpp.
 +// Aggregates every GS primitive by (GIF path, draw tag, prim, texture format, frame buffer, Z test) and prints
 +// a table every PS2X_DRAWTAG_SEC seconds (default 10) as [drawtag] lines on stderr. The tag (g_ps2xDrawTag, set by
@@ -4240,6 +4357,7 @@ index 0000000000000000000000000000000000000000..82df9c76c1a3bd3e633dbdf3f4d9a420
 +            uint64_t runs = 0, prims = 0, verts = 0, constZ = 0;
 +            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
 +            double z0 = 1e18, z1 = -1e18;
++            double sdx = 0.0; // sum over prims of |centre x - 320| (projection checks)
 +            std::set<uint32_t> tbp;
 +        };
 +        std::mutex g_m;
@@ -4330,9 +4448,9 @@ index 0000000000000000000000000000000000000000..82df9c76c1a3bd3e633dbdf3f4d9a420
 +            for (auto &e : v)
 +            {
 +                const Val &x = *e.second;
-+                std::fprintf(stderr, "[drawtag] %s | runs=%llu prims=%llu verts=%llu constZ=%llu ntex=%zu bbox=(%.0f,%.0f)-(%.0f,%.0f) z=%.0f..%.0f\n",
++                std::fprintf(stderr, "[drawtag] %s | runs=%llu prims=%llu verts=%llu constZ=%llu ntex=%zu bbox=(%.0f,%.0f)-(%.0f,%.0f) z=%.0f..%.0f mdx=%.1f\n",
 +                             keyDesc(e.first).c_str(), (unsigned long long)x.runs, (unsigned long long)x.prims, (unsigned long long)x.verts,
-+                             (unsigned long long)x.constZ, x.tbp.size(), x.x0, x.y0, x.x1, x.y1, x.z0, x.z1);
++                             (unsigned long long)x.constZ, x.tbp.size(), x.x0, x.y0, x.x1, x.y1, x.z0, x.z1, x.prims ? x.sdx / (double)x.prims : 0.0);
 +            }
 +            ps2xDrawTagVifReport(stderr);
 +            g_agg.clear();
@@ -4401,6 +4519,13 @@ index 0000000000000000000000000000000000000000..82df9c76c1a3bd3e633dbdf3f4d9a420
 +                if (i && vx.z != batch.vertices[0].z)
 +                    cz = false;
 +            }
++            if (batch.vertexCount > 0)
++            {
++                float cx = 0.0f;
++                for (int i = 0; i < batch.vertexCount; ++i)
++                    cx += batch.vertices[i].x - ofx;
++                v.sdx += std::fabs(cx / (float)batch.vertexCount - 320.0f);
++            }
 +            if (cz)
 +                ++v.constZ;
 +        }
@@ -4448,10 +4573,10 @@ index 0000000000000000000000000000000000000000..82df9c76c1a3bd3e633dbdf3f4d9a420
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_wshud.inl b/ps2xRuntime/src/lib/gs/gs_wshud.inl
 new file mode 100644
-index 0000000000000000000000000000000000000000..49357c3d832f976145579b806d7c8afd50c1649a
+index 0000000000000000000000000000000000000000..1f61c59250090a9a5da734afc58fb0e492afb701
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_wshud.inl
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,257 @@
 +// Widescreen HUD fix-up (PS2X_WS_HUD_SCALE=<s>, e.g. 0.75 for 4:3 content in a 16:9 picture; default off).
 +// #included at the end of gs_frontend.cpp. Set by the game overrides (BLACKKAT_WIDESCREEN=1, BLACKKAT_WS_HUD!=0).
 +// With a stretched 16:9 present the 3D uses a hor+ projection, but 2D HUD elements are drawn for 4:3 and would be
@@ -4471,6 +4596,8 @@ index 0000000000000000000000000000000000000000..49357c3d832f976145579b806d7c8afd
 +    {
 +        std::atomic<uint64_t> g_p1Prims{0}, g_otherActivity{0};
 +        std::atomic<bool> g_wide{true};
++        std::atomic<bool> g_seen3D{false};
++        std::atomic<uint64_t> g_fullCopies{0};
 +        // stats
 +        std::atomic<uint64_t> g_totalMarkers{0};
 +        std::atomic<uint64_t> g_statMarkers{0}, g_statHud{0}, g_statBlits{0}, g_statP1Frames{0};
@@ -4504,6 +4631,9 @@ index 0000000000000000000000000000000000000000..49357c3d832f976145579b806d7c8afd
 +    bool on() { return scale() > 0.0f; }
 +
 +    void onImage() { g_otherActivity.fetch_add(1, std::memory_order_relaxed); }
++    // A full-screen (>= 640x448) local->local GS copy: Black Kat's full-screen 2D menus (page map, world map, save)
++    // restore their 4:3 background picture into the frame buffer this way every frame.
++    void onFullCopy() { g_fullCopies.fetch_add(1, std::memory_order_relaxed); }
 +
 +    void onPrim(GSPrimitiveBatch &b, int path)
 +    {
@@ -4523,6 +4653,24 @@ index 0000000000000000000000000000000000000000..49357c3d832f976145579b806d7c8afd
 +                constZ = false;
 +        }
 +        const bool full = x0 <= 1.0f && y0 <= 1.0f && x1 >= 639.0f && y1 >= 447.0f;
++        {
++            // PS2X_WS_HUD_MLOG=<n>: print the first n primitives drawn while presenting 4:3 (2D-only frames)
++            static const int s_mlog = []() { const char *e = std::getenv("PS2X_WS_HUD_MLOG"); return e ? std::atoi(e) : 0; }();
++            static int s_mn = 0;
++            static const long s_mfb = []() { const char *e = std::getenv("PS2X_WS_HUD_MLOGFB"); return e ? std::strtol(e, nullptr, 16) : -1L; }();
++            static const double s_mt = []() { const char *e = std::getenv("PS2X_WS_HUD_MLOGT"); return e ? std::atof(e) : 0.0; }();
++            static const auto s_mt0 = std::chrono::steady_clock::now();
++            if (s_mlog > 0 && g_seen3D.load(std::memory_order_relaxed) && s_mn < s_mlog &&
++                std::chrono::duration<double>(std::chrono::steady_clock::now() - s_mt0).count() >= s_mt &&
++                (s_mfb >= 0 ? (long)c.frame.fbp == s_mfb : !g_wide.load(std::memory_order_relaxed)))
++            {
++                ++s_mn;
++                std::fprintf(stderr, "[wsm] g%d p%d t%d tme%d fbp=%x tbp=%x psm=%x tw=%d z=%u zt=%u n=%d (%.0f,%.0f)-(%.0f,%.0f) uv0=(%u,%u) uv1=(%u,%u)\n",
++                             g_wide.load() ? 1 : 0, path, (int)pr.type, (int)pr.tme, (unsigned)c.frame.fbp, (unsigned)c.tex0.tbp0, (unsigned)c.tex0.psm,
++                             (int)c.tex0.tw, (unsigned)b.vertices[0].z, (unsigned)((c.test >> 16) & 7u), n, x0, y0, x1, y1,
++                             (unsigned)b.vertices[0].u, (unsigned)b.vertices[0].v, (unsigned)b.vertices[n - 1].u, (unsigned)b.vertices[n - 1].v);
++            }
++        }
 +        if (path == 1)
 +        {
 +            g_p1Prims.fetch_add(1, std::memory_order_relaxed);
@@ -4587,6 +4735,22 @@ index 0000000000000000000000000000000000000000..49357c3d832f976145579b806d7c8afd
 +            return;
 +        }
 +        g_statHud.fetch_add(1, std::memory_order_relaxed);
++        {
++            // PS2X_WS_HUD_PROGLOG=1 (with PS2X_DRAWTAG=1): count HUD primitives per VU1 program, printed every 4000
++            static const bool s_pl = []() { const char *e = std::getenv("PS2X_WS_HUD_PROGLOG"); return e && e[0] == '1'; }();
++            if (s_pl && path == 1)
++            {
++                static std::map<uint32_t, uint64_t> s_m;
++                static uint64_t s_n = 0;
++                ++s_m[(g_ps2xDrawTag & 0x7FFu) * 8u];
++                if (++s_n % 4000u == 0u)
++                {
++                    std::string o;
++                    for (const auto &kv : s_m) { char b[40]; std::snprintf(b, sizeof(b), " %x:%llu", kv.first, (unsigned long long)kv.second); o += b; }
++                    std::fprintf(stderr, "[wshud] hud path1 prims by program:%s\n", o.c_str());
++                }
++            }
++        }
 +        static const bool s_panelOn = []() { const char *e = std::getenv("PS2X_WS_HUD_PANEL"); return !(e && e[0] == '0'); }();
 +        if (s_panelOn && (x1 - x0) >= 360.0f && (y1 - y0) >= 200.0f)
 +            s_panelCur = true;
@@ -4619,6 +4783,8 @@ index 0000000000000000000000000000000000000000..49357c3d832f976145579b806d7c8afd
 +        }
 +    }
 +
++    double wsT() { static const auto t0 = std::chrono::steady_clock::now(); return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
++
 +    // Host thread, once per presented frame.
 +    void onPresent()
 +    {
@@ -4633,12 +4799,24 @@ index 0000000000000000000000000000000000000000..49357c3d832f976145579b806d7c8afd
 +        if (p1 > 0)
 +        {
 +            s_noP1 = 0;
++            g_seen3D.store(true, std::memory_order_relaxed);
 +            g_statP1Frames.fetch_add(1, std::memory_order_relaxed);
 +            if (!g_wide.exchange(true))
-+                std::fprintf(stderr, "[wshud] 3D frames: present 16:9\n");
++                std::fprintf(stderr, "[wshud] t=%.2f 3D frames: present 16:9\n", wsT());
 +        }
 +        else if (other > 0 && ++s_noP1 >= 30 && g_wide.exchange(false))
-+            std::fprintf(stderr, "[wshud] no VU1 3D for 30 presents: present 4:3 pillarbox (aspect %.4f)\n", s_narrow);
++            std::fprintf(stderr, "[wshud] t=%.2f no VU1 3D for 30 presents: present 4:3 pillarbox (aspect %.4f)\n", wsT(), s_narrow);
++        // Full-screen 2D menus are pictures drawn for 4:3 (no 3D behind them): switch to the pillarbox after 3 presents
++        // that restore a full-screen background without any VU1 3D, instead of showing them stretched for 0.5 s first.
++        // PS2X_WS_HUD_MENUFAST=0: old behaviour (30 presents).
++        {
++            static const bool s_fast = []() { const char *e = std::getenv("PS2X_WS_HUD_MENUFAST"); return !(e && e[0] == '0'); }();
++            static int s_menuRun = 0;
++            const uint64_t fc = g_fullCopies.exchange(0, std::memory_order_relaxed);
++            s_menuRun = (p1 == 0 && fc > 0) ? s_menuRun + 1 : (p1 > 0 ? 0 : s_menuRun);
++            if (s_fast && s_menuRun >= 3 && g_wide.exchange(false))
++                std::fprintf(stderr, "[wshud] t=%.2f full-screen 2D menu (background restore, no VU1 3D): present 4:3 pillarbox (aspect %.4f)\n", wsT(), s_narrow);
++        }
 +        g_ps2xPresentAspectDyn.store(g_wide.load() ? 0.0f : s_narrow, std::memory_order_relaxed);
 +
 +        static const bool s_log = []() { const char *e = std::getenv("PS2X_WS_HUD_LOG"); return e && e[0] == '1'; }();

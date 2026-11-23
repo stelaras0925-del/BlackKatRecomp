@@ -1219,7 +1219,7 @@ index 37b6a4decc5865c7e51fbe9209ce46eafa6ccb27..cdad411790f0bf0f5a3d0f01edf4e0d8
 +    uint64_t dispfbWrites() { return g_dispfbWrites.load(std::memory_order_relaxed); }
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..7b9fb3a7393dcb1cab07fdf4d2058a90dc4bf43b 100644
+index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c545069acd74d4 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -7,6 +7,7 @@
@@ -1314,7 +1314,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..7b9fb3a7393dcb1cab07fdf4d2058a90
          const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
          for (uint32_t y = 0; y < copyHeight; ++y)
          {
-@@ -668,42 +714,77 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,42 +714,121 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -1362,6 +1362,44 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..7b9fb3a7393dcb1cab07fdf4d2058a90
 +                                     const uint32_t fbrst = vu1OnWorker ? ps2x_vu1async::workerFbrst() : cpuContext->vu0_fbrst;
 +                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
 +                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
++                                     // Widescreen hor+ for VU1 programs whose matrix is built with the 4:3 projection
++                                     // (PS2X_WS_VU1_PROGS=<hex byte addresses>, PS2X_WS_VU1_XSCALE=<s>; set by the game
++                                     // overrides). The programs read their matrix from VU1 data rows 16..19 and a sprite
++                                     // half-size from vf14: the x column and vf14.x are scaled by s for this run only, so
++                                     // they project like the widened 3D (Black Kat: particles, smoke, cannonballs).
++                                     struct WsVu1 { std::vector<uint32_t> progs; float s = 0.0f; };
++                                     static const WsVu1 s_ws = []() {
++                                         WsVu1 w;
++                                         const char *e = std::getenv("PS2X_WS_VU1_PROGS");
++                                         const char *x = std::getenv("PS2X_WS_VU1_XSCALE");
++                                         const float s = x ? std::strtof(x, nullptr) : 0.0f;
++                                         if (!e || !(s > 0.2f && s < 1.0f))
++                                             return w;
++                                         for (const char *q = e; *q;)
++                                         {
++                                             char *en = nullptr;
++                                             const unsigned long v = std::strtoul(q, &en, 16);
++                                             if (en == q)
++                                                 break;
++                                             w.progs.push_back(static_cast<uint32_t>(v));
++                                             q = (*en == ',') ? en + 1 : en;
++                                         }
++                                         w.s = s;
++                                         std::fprintf(stderr, "[ws] VU1 programs %s: matrix x-scale %.4f\n", e, s);
++                                         return w;
++                                     }();
++                                     float *wsRows = nullptr, wsSave[5] = {0, 0, 0, 0, 0};
++                                     if (s_ws.s > 0.0f && std::find(s_ws.progs.begin(), s_ws.progs.end(), startPC) != s_ws.progs.end())
++                                     {
++                                         wsRows = reinterpret_cast<float *>(m_memory.getVU1Data()) + 16 * 4;
++                                         for (int r = 0; r < 4; ++r)
++                                         {
++                                             wsSave[r] = wsRows[r * 4];
++                                             wsRows[r * 4] *= s_ws.s;
++                                         }
++                                         wsSave[4] = m_vu1.state().vf[14][0];
++                                         m_vu1.state().vf[14][0] *= s_ws.s;
++                                     }
                                       m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                     m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                     m_gs, &m_memory, startPC, top, itop, 65536);
@@ -1369,6 +1407,12 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..7b9fb3a7393dcb1cab07fdf4d2058a90
 -                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
 -                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
 -                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
++                                     if (wsRows)
++                                     {
++                                         for (int r = 0; r < 4; ++r)
++                                             wsRows[r * 4] = wsSave[r];
++                                         m_vu1.state().vf[14][0] = wsSave[4];
++                                     }
 +                                     const uint32_t stopBits = (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
 +                                                               (m_vu1.state().stoppedByT ? 0x0400u : 0u);
 +                                     if (vu1OnWorker)
@@ -1410,7 +1454,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..7b9fb3a7393dcb1cab07fdf4d2058a90
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -731,10 +812,100 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,10 +856,100 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -1515,7 +1559,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..7b9fb3a7393dcb1cab07fdf4d2058a90
  #endif
          SetTargetFPS(60);
          if (m_debugUiInitCallback)
-@@ -1396,6 +1567,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,6 +1611,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -1523,7 +1567,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..7b9fb3a7393dcb1cab07fdf4d2058a90
      targetFn(rdram, ctx, this);
  
      if (isStopRequested() || ctx->pc == 0u)
-@@ -1403,7 +1575,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,7 +1619,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -1538,7 +1582,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..7b9fb3a7393dcb1cab07fdf4d2058a90
      {
          ctx->pc = fallthroughPc;
      }
-@@ -2388,51 +2566,171 @@ void PS2Runtime::run()
+@@ -2388,51 +2610,171 @@ void PS2Runtime::run()
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
@@ -1740,7 +1784,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..7b9fb3a7393dcb1cab07fdf4d2058a90
          const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
          const Rectangle dstRect{
              (screenWidth - dstWidth) * 0.5f,
-@@ -2440,6 +2738,18 @@ void PS2Runtime::run()
+@@ -2440,6 +2782,18 @@ void PS2Runtime::run()
              dstWidth,
              dstHeight};
          DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
