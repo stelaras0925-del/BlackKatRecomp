@@ -10,9 +10,10 @@ built and tested with. Each patch owns a set of files; no file appears in two pa
 |---|---|
 | `0001-recompiler-codegen.patch` | `control_flow_emitter.cpp` (REGIMM 64-bit branches), `ps2_runtime_macros.h` |
 | `0002-iop-sound.patch` | IOP emulator/kernel/memory (SPU2 ADMA output, hardware voices, Gaussian interpolation, native SNDDRV mixer, quantum 32, ADMA pacing) |
-| `0003-gs-cpu-gpu.patch` | GS frontend, CPU backend, GPU backend (`gs_gpu_backend.inl`), GIF arbiter, draw tagging (`gs_drawtag.inl`), widescreen HUD (`gs_wshud.inl`) |
+| `0003-gs-cpu-gpu.patch` | GS frontend (incl. the Vulkan backend selection and draw-list hooks), CPU backend, GPU backend (`gs_gpu_backend.inl`), GIF arbiter, draw tagging (`gs_drawtag.inl`), widescreen HUD (`gs_wshud.inl`, with menu-panel centring) |
 | `0004-vu1-vif1.patch` | VU1 core/JIT (`ps2_vu1_native.inl`, M3), async VU1 thread, VIF1 interpreter |
 | `0005-ee-core-ipu-sched.patch` | EE scheduler, `ps2_memory.cpp` (IPU glue, SPR chain DMA, timer batching), `ps2_runtime.cpp`, `ps2_pad.cpp`, `ps2_ipu.inl` |
+| `0006-vulkan.patch` | Vulkan GS backend (`PS2X_GS_BACKEND=vulkan`): `gs_vk_backend.cpp`, `gs_vk_render.inl`, `gs_vk_vram.inl`, `gs_drawlist.inl`, shaders `shaders/gs_vk_*` (compiled with glslangValidator), `ps2xRuntime/CMakeLists.txt`, `gs_backend.h`, `gs_types.h` |
 
 ```bash
 tools/apply_patches.sh            # apply (skips patches that are already applied)

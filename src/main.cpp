@@ -496,6 +496,8 @@ int main(int argc, char *argv[])
                 else if (a == "--elf") set.elf = next();
                 else if (a == "--gpu") set.gpu = true;
                 else if (a == "--cpu") set.gpu = false;
+                else if (a == "--vulkan") { set.gpu = true; set.vulkan = true; }
+                else if (a == "--opengl" || a == "--gl") { set.gpu = true; set.vulkan = false; }
                 else if (a == "--scale") set.scale = std::clamp(std::atoi(next().c_str()), 1, 4);
                 else if (a == "--fullscreen") set.fullscreen = true;
                 else if (a.rfind("--windowed", 0) == 0) { set.fullscreen = false; int w = 0, h = 0; if (std::sscanf(a.c_str(), "--windowed=%dx%d", &w, &h) == 2) { set.winW = w; set.winH = h; } }
@@ -509,7 +511,7 @@ int main(int argc, char *argv[])
                 else if (a == "--no-movies") set.movies = false;
                 else if (a == "--help" || a == "-h")
                 {
-                    std::cout << "Usage: blackkat [--launcher|--play] [--iso P] [--elf P] [--gpu|--cpu] [--scale 1-4]\n"
+                    std::cout << "Usage: blackkat [--launcher|--play] [--iso P] [--elf P] [--gpu|--cpu] [--opengl|--vulkan] [--scale 1-4]\n"
                                  "                [--fullscreen|--windowed[=WxH]] [--monitor NAME|INDEX|primary]\n"
                                  "                [--widescreen|--aspect=4:3|--aspect=16:9]\n"
                                  "                [--audio|--no-audio] [--movies|--no-movies]\n"
@@ -539,7 +541,7 @@ int main(int argc, char *argv[])
                 }
                 bklaunch::applyToEnv(set);
                 cliElf = set.elf.empty() ? std::filesystem::path("game") / "SLUS_203.65" : std::filesystem::path(set.elf);
-                std::cerr << "[blackkat] launcher settings: iso=" << set.iso << " elf=" << set.elf << " gpu=" << set.gpu
+                std::cerr << "[blackkat] launcher settings: iso=" << set.iso << " elf=" << set.elf << " gpu=" << set.gpu << " vulkan=" << set.vulkan
                           << " scale=" << set.scale << " audio=" << set.audio << " movies=" << set.movies
                           << " fullscreen=" << set.fullscreen << " window=" << set.winW << "x" << set.winH
                           << " monitor=" << (set.monitor.empty() ? "primary" : set.monitor)

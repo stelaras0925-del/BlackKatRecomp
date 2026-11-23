@@ -277,7 +277,7 @@ static void parseSettings(std::istream &f, Settings &s)
         auto b = [&]() { return v == "1" || v == "true" || v == "yes" || v == "on"; };
         if (k == "iso") s.iso = v;
         else if (k == "elf") s.elf = v;
-        else if (k == "renderer") s.gpu = (v != "cpu");
+        else if (k == "renderer") { s.gpu = (v != "cpu"); s.vulkan = (v == "vulkan"); }
         else if (k == "scale") s.scale = std::clamp(std::atoi(v.c_str()), 1, 4);
         else if (k == "audio") s.audio = b();
         else if (k == "movies") s.movies = b();
@@ -298,7 +298,7 @@ static std::string serializeSettings(const Settings &s)
     std::ostringstream f;
     f << "iso=" << s.iso << "\n"
       << "elf=" << s.elf << "\n"
-      << "renderer=" << (s.gpu ? "gpu" : "cpu") << "\n"
+      << "renderer=" << (!s.gpu ? "cpu" : s.vulkan ? "vulkan" : "gpu") << "\n"
       << "scale=" << s.scale << "\n"
       << "audio=" << (s.audio ? 1 : 0) << "\n"
       << "movies=" << (s.movies ? 1 : 0) << "\n"
@@ -390,7 +390,10 @@ void applyToEnv(const Settings &s)
     auto set = [](const char *k, const std::string &v) { ::setenv(k, v.c_str(), 0); };
     if (!s.iso.empty()) set("BLACKKAT_ISO", s.iso);
     set("PS2X_GS_GPU", s.gpu ? "1" : "0");
-    set("PS2X_GS_SCALE", std::to_string(s.gpu ? std::clamp(s.scale, 1, 4) : 1));
+    set("PS2X_GS_BACKEND", !s.gpu ? "cpu" : s.vulkan ? "vulkan" : "gl");
+    set("PS2X_GS_SCALE", std::to_string(s.gpu && !s.vulkan ? std::clamp(s.scale, 1, 4) : 1));
+    // Vulkan renders at its own scale (PS2X_VK_SCALE); its OpenGL reference stays at 1x
+    set("PS2X_VK_SCALE", std::to_string(s.gpu && s.vulkan ? std::clamp(s.scale, 1, 4) : 1));
     if (!s.audio) set("PS2X_HOST_AUDIO", "0");
     set("BLACKKAT_PLAY_FMV", s.movies ? "1" : "0");
     set("PS2X_FULLSCREEN", s.fullscreen ? "1" : "0");
@@ -884,7 +887,7 @@ static bool runLauncherUi(Settings &s, const char *argv0)
     const int winSizes[][2] = {{640, 448}, {960, 672}, {1280, 896}, {1600, 1120}, {1920, 1344}};
     const char *winNames[] = {"640 x 448", "960 x 672", "1280 x 896", "1600 x 1120", "1920 x 1344", "Custom"};
     const char *scaleLabels[] = {"1x", "2x", "3x", "4x"};
-    const char *rendererLabels[] = {"GPU (OpenGL)", "CPU (software)"};
+    const char *rendererLabels[] = {"OpenGL", "Vulkan", "CPU (software)"};
     const char *modeLabels[] = {"Windowed", "Fullscreen"};
     const char *promptLabels[] = {"PS2  (original)", "Xbox  (A B X Y)", "Auto"};
     bool gpB = false;
@@ -1079,8 +1082,10 @@ static bool runLauncherUi(Settings &s, const char *argv0)
         sectionHeader(fonts, "Display");
         const float segW = std::min(420.0f, innerW - col);
         rowLabel("Renderer", col);
-        int r = s.gpu ? 0 : 1;
-        if (segmented("renderer", rendererLabels, 2, &r, segW)) s.gpu = (r == 0);
+        int r = !s.gpu ? 2 : s.vulkan ? 1 : 0;
+        if (segmented("renderer", rendererLabels, 3, &r, segW)) { s.gpu = (r != 2); s.vulkan = (r == 1); }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("OpenGL is the default. Vulkan is experimental and falls back to OpenGL if it fails.");
         rowLabel("Resolution", col);
         ImGui::BeginDisabled(!s.gpu);
         int si = std::clamp(s.scale, 1, 4) - 1;
@@ -1091,7 +1096,7 @@ static bool runLauncherUi(Settings &s, const char *argv0)
         if (s.gpu)
             ImGui::TextColored(kParchDim, "%d x %d", 640 * s.scale, 448 * s.scale);
         else
-            ImGui::TextDisabled("640 x 448 (GPU only)");
+            ImGui::TextDisabled(s.vulkan && s.gpu ? "640 x 448 (OpenGL only)" : "640 x 448 (GPU only)");
         rowLabel("Aspect ratio", col);
         {
             const char *aspectLabels[] = {"4:3  (original)", "16:9  (widescreen)"};
