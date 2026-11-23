@@ -1613,6 +1613,17 @@ namespace
                 ::setenv("PS2X_WS_HUD_SCALE", sc, 0);
                 std::cerr << "[blackkat] widescreen HUD fix-up on (BLACKKAT_WS_HUD=0 to turn off), scale " << sc << std::endl;
             }
+            // BLACKKAT_WS_SPRITES (default 1): the sprite VU1 programs (particles, smoke, splashes, cannonballs;
+            // 0x1840/0x19D0 from the sprite emitter 0x15CF80, 0x1B60) get their matrix from a 4:3 projection that
+            // does not go through 0x1530D8, so they were drawn at x/0.75 from the centre (offset from their 3D
+            // source, worse away from the centre). The runtime scales that matrix's x column the same way.
+            if (const char *wsp = std::getenv("BLACKKAT_WS_SPRITES"); !(wsp && wsp[0] == '0'))
+            {
+                char sc[32];
+                std::snprintf(sc, sizeof(sc), "%.6f", g_wsXScale);
+                ::setenv("PS2X_WS_VU1_PROGS", "1840,19d0,1b60", 0);
+                ::setenv("PS2X_WS_VU1_XSCALE", sc, 0);
+            }
             g_origPerspective = runtime.lookupFunction(kPerspective);
             const bool ok = g_origPerspective && runtime.replaceFunction(kPerspective, &blackkatPerspective);
             std::cerr << "[blackkat] widescreen 16:9: perspective@0x1530D8 x-scale " << g_wsXScale << " "

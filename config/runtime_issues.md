@@ -1503,8 +1503,8 @@ After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, hig
 
 ### Use
 - `PS2X_GS_BACKEND=vulkan` (launcher: Renderer = Vulkan). It draws on its own GPU renderer. Textures are read from a
-  4 MB VRAM mirror swizzled on the GPU. The OpenGL backend runs alongside as a reference for metadata (present size, source fbp),
-  refreshed every 30 presents.
+  4 MB VRAM mirror swizzled on the GPU. The OpenGL backend runs alongside as a reference that no longer draws by default
+  (it gets transfers/CLUT and a metadata present every 30 presents; `PS2X_VK_REF=1` keeps it drawing).
 - `PS2X_VK_SCALE=1..4` (launcher: Resolution, now enabled for Vulkan): internal resolution. Targets and depth are N x, write-back to the
   mirror is a nearest downsample, and seeds are upsampled. Render-to-texture reads of a CT32/CT24 target are sampled from the scaled image
   (`PS2X_VK_SCALE_RTT=0` turns this off). 4x holds 60 fps on an RX 9070. Compare/dump/VRAM-check modes force 1x. The GL reference stays at 1x.
@@ -1517,6 +1517,9 @@ After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, hig
 `PS2X_VK_PRESLOG=1|2`, `PS2X_VK_VRAM_CHECK=N` + `PS2X_VK_DUMPVRAM`/`PS2X_VK_DUMPREG=fbp,fbw,psm,w,h`, `PS2X_VK_L2LLOG=1`,
 `PS2X_VK_SKIPA`/`PS2X_VK_SKIPT`, `PS2X_VK_VALIDATE=1` (validation layers), `PS2X_VK_STALEMETA`, `PS2X_VK_NOPRESSYNC`,
 `PS2X_VK_REFPRES`, `PS2X_VK_ALIAS|WB|WB16|SEED|XSYNC|CLUT=0` (turn off individual mechanisms).
+`PS2X_VK_PROF=1` (per-stage timings), `PS2X_VK_L2HCHECK=1` / `PS2X_VK_L2HDUMP=prefix` (GS->host reads vs the reference),
+`PS2X_VK_STALELOG=1` (stale-target reseeds; slows the run), `PS2X_PRESSPIKE=1` (+`PS2X_PRESSPIKE_CELLS`, `PS2X_PRESSPIKE_DUMP=prefix`:
+flags single presented frames that differ from both neighbours, 32x24 luma grid, works on GL too).
 
 ### Widescreen menu panels
 - `gs_wshud.inl`: a HUD frame that has a big panel (at least 360x200) squeezes all of its elements around the centre, so menus such as
@@ -1524,6 +1527,31 @@ After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, hig
   Gameplay HUD is unchanged.
 
 ### Known gaps
-- Points/lines are 1 hi-res pixel at N x. The CT16 write-back alpha bit differs from GL (not visible). There is still a rare menu
-  frame spike when menu draws are split across a vsync.
+- Points/lines are 1 hi-res pixel at N x. The CT16 write-back alpha bit differs from GL (not visible).
+
+### Performance (vk17, 2026-11-24)
+- Two command buffers / fences: frame N+1 is recorded while the GPU runs frame N (vertex ring and staging split per slot).
+  `PS2X_VK_FRAMES=1` = single slot.
+- GS -> host reads (TRXDIR 1, e.g. the 64x64 shadow map read every frame) come from the Vulkan mirror instead of a sync on the
+  GL thread (8.6 ms -> ~1.4 ms at 4x). `PS2X_VK_L2H=0` = from the reference.
+- The reference no longer draws (see Use). endFrame copies the readback outside the mirror lock.
+- Foot 4x 16:9: 25.5-27.1 -> 28.6-29.4 fps (30 cap); sea stays at 19.9 (3-vsync lock from the EE/VU1 critical path, not the renderer).
+
+### Menu text flicker (vk18, 2026-11-24): FIXED
+- Symptom: menu text (front-end save/load list, other menus) showed a single darker or older frame now and then on Vulkan only.
+- Cause: the menus keep both buffers (fbp 0 and 0x8c) in one target (0x01400, 896 rows). Every frame's texture uploads overlap
+  that target somewhere, which marked the whole target stale; the reseed then reloaded all 896 rows from VRAM, overwriting the
+  other buffer's freshly drawn rows that had not been written back yet with an older image.
+- Fix (gs_vk_render.inl): a stale mark records the page-row range the upload overlapped, and the reseed reloads only those rows.
+  `PS2X_VK_STALEFULL=1` = old whole-target reseed.
+- Evidence (PS2X_PRESSPIKE, front end, 4x): before 6 single-frame spikes per 24 s run on VK (GL: 0 besides load fades);
+  after 0-1 (the 1 is the fade at ~present 716-720, which GL has too). Pause menu and map: 0 on VK after; validation 0 errors.
+
+### Widescreen sprites and map menus (vk16, 2026-11-23)
+- Sprite VU1 programs 0x1840/0x19D0/0x1B60 (particles, smoke, splashes, cannonballs) use a 4:3 projection that never goes through
+  0x1530D8, so in 16:9 they were drawn at x/0.75 from the centre. ps2_runtime.cpp scales the x column of their matrix (VU1 rows
+  16..19) and the sprite half-width for those programs (`PS2X_WS_VU1_PROGS`, `PS2X_WS_VU1_XSCALE`); the overrides set them with
+  BLACKKAT_WIDESCREEN=1, `BLACKKAT_WS_SPRITES=0` turns it off.
+- Map / world map / save menus are finished 4:3 pictures (L2L copy from 0x1a40 + 2D sprites), so they stay pillarboxed by design.
+  The switch to 4:3 now happens within 3 presents instead of 30 (`PS2X_WS_HUD_MENUFAST=0` = old).
 

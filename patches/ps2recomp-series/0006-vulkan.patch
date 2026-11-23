@@ -407,10 +407,10 @@ index 0000000000000000000000000000000000000000..42fa046e8150a270837769e6eaa68566
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_vk_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vk_backend.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..5897b19e75698a41c73aa67a873397d0cf7e6c91
+index 0000000000000000000000000000000000000000..ddfbb78076f524b09e54a2d44ebc998093d32b2d
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_vk_backend.cpp
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,584 @@
 +// Vulkan GS backend, Phase 3 skeleton (PS2X_GS_BACKEND=vulkan; default renderer stays GL/CPU).
 +//
 +// Stage 0 (this file): instance (+ VK_LAYER_KHRONOS_validation and a debug messenger when PS2X_VK_VALIDATE=1),
@@ -616,13 +616,90 @@ index 0000000000000000000000000000000000000000..5897b19e75698a41c73aa67a873397d0
 +            m_pRef += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
 +        }
 +        void LoadClut(const GSTex0Reg &t, const GSTexClutReg &c) override { if (m_vramOn) m_vram.loadClut(t, c); m_ref->LoadClut(t, c); }
-+        void BeginTransfer(const GSTransferCommand &c) override { if (m_vramOn) m_vram.beginTransfer(c); m_ref->BeginTransfer(c); }
++        void BeginTransfer(const GSTransferCommand &c) override
++        {
++            if (m_prof && c.direction == 1u && m_l2hLog < 6u)
++            {   // vk17 prof: what the game reads back (GS -> host)
++                ++m_l2hLog;
++                std::fprintf(stderr, "[gs:vk:prof] l2h src sbp %x sbw %u spsm %x at %u,%u size %ux%u\n", c.bitbltbuf.sbp, c.bitbltbuf.sbw, c.bitbltbuf.spsm,
++                             c.trxpos.ssax, c.trxpos.ssay, c.trxreg.rrw, c.trxreg.rrh);
++            }
++            if (m_vramOn) m_vram.beginTransfer(c);
++            m_ref->BeginTransfer(c);
++            // vk17: GS -> host reads come from the Vulkan mirror when it renders (no wait for the reference renderer's
++            // GL thread: it cost ~8.6 ms per read on foot). PS2X_VK_L2H=0: from the reference as before.
++            m_l2hOwn = false;
++            if (c.direction == 1u && m_l2hVk && m_vramOn && m_vram.renderOn() && !m_vram.comparing())
++            {
++                std::vector<uint32_t> px;
++                if (m_vram.readRect(c, px))
++                {
++                    const uint8_t sp = c.bitbltbuf.spsm; // transfer size per pixel (as GSCpuBackend::PerformLocalToHostTransfer)
++                    const uint32_t bpp = (sp == GS_PSM_CT24 || sp == GS_PSM_Z24) ? 24u
++                                       : (sp == GS_PSM_CT16 || sp == GS_PSM_CT16S || sp == GS_PSM_Z16 || sp == GS_PSM_Z16S) ? 16u
++                                       : (sp == GS_PSM_T8 || sp == GS_PSM_T8H) ? 8u
++                                       : (sp == GS_PSM_T4 || sp == GS_PSM_T4HL || sp == GS_PSM_T4HH) ? 4u : 32u;
++                    m_l2hBuf.clear(); m_l2hPos = 0;
++                    m_l2hBuf.reserve((px.size() * bpp + 7u) / 8u);
++                    for (size_t i = 0; i < px.size(); ++i)
++                    {
++                        const uint32_t v = px[i];
++                        if (bpp == 32) { m_l2hBuf.push_back(uint8_t(v)); m_l2hBuf.push_back(uint8_t(v >> 8)); m_l2hBuf.push_back(uint8_t(v >> 16)); m_l2hBuf.push_back(uint8_t(v >> 24)); }
++                        else if (bpp == 24) { m_l2hBuf.push_back(uint8_t(v)); m_l2hBuf.push_back(uint8_t(v >> 8)); m_l2hBuf.push_back(uint8_t(v >> 16)); }
++                        else if (bpp == 16) { m_l2hBuf.push_back(uint8_t(v)); m_l2hBuf.push_back(uint8_t(v >> 8)); }
++                        else if (bpp == 8) m_l2hBuf.push_back(uint8_t(v));
++                        else if ((i & 1u) == 0u) m_l2hBuf.push_back(uint8_t((v & 0x0Fu) | (((i + 1 < px.size()) ? (px[i + 1] & 0x0Fu) : 0u) << 4)));
++                    }
++                    m_l2hOwn = true;
++                }
++            }
++        }
 +        void UploadImage(const uint8_t *d, uint32_t n) override { if (m_vramOn) m_vram.upload(d, n); m_ref->UploadImage(d, n); }
 +        void Flush() override { m_ref->Flush(); }
 +        void TextureFlush() override { m_ref->TextureFlush(); }
 +        void Sync(GSSyncReason r) override { m_ref->Sync(r); }
 +        bool ClearFramebuffer(const GSContext &c, uint32_t rgba) override { if (m_vramOn) m_vram.draw(c); return m_ref->ClearFramebuffer(c, rgba); }
-+        uint32_t ConsumeLocalToHostBytes(uint8_t *d, uint32_t n) override { if (n) ++m_pL2h; return m_ref->ConsumeLocalToHostBytes(d, n); }
++        uint32_t ConsumeLocalToHostBytes(uint8_t *d, uint32_t n) override
++        {
++            if (n) ++m_pL2h;
++            const auto t0 = std::chrono::steady_clock::now();
++            uint32_t r = 0;
++            if (m_l2hOwn)
++            {   // vk17: served from the Vulkan mirror (see BeginTransfer)
++                if (d && n && m_l2hPos < m_l2hBuf.size())
++                {
++                    r = static_cast<uint32_t>(std::min<size_t>(n, m_l2hBuf.size() - m_l2hPos));
++                    std::memcpy(d, m_l2hBuf.data() + m_l2hPos, r);
++                    m_l2hPos += r;
++                }
++                if (m_l2hCheck && r)
++                {   // PS2X_VK_L2HCHECK=1: compare with the reference renderer's bytes (debug, costs its sync)
++                    std::vector<uint8_t> ref(r);
++                    const uint32_t rn = m_ref->ConsumeLocalToHostBytes(ref.data(), r);
++                    uint64_t bad = 0; int mx = 0;
++                    for (uint32_t i = 0; i < std::min(r, rn); ++i) { const int dd = std::abs(int(d[i]) - int(ref[i])); mx = std::max(mx, dd); if (dd > 24) { ++bad; ++m_l2hCh[(m_l2hPos - r + i) & 3u]; } m_l2hSum[(m_l2hPos - r + i) & 3u][0] += d[i]; m_l2hSum[(m_l2hPos - r + i) & 3u][1] += ref[i]; }
++                    m_l2hCmpN += r; m_l2hCmpBad += bad + (rn != r ? 1u : 0u); m_l2hCmpMax = std::max(m_l2hCmpMax, mx);
++                    if (const char *dp = std::getenv("PS2X_VK_L2HDUMP"); dp && m_l2hCmpCalls >= 600u && m_l2hCmpCalls < 606u)
++                    {   // debug: raw vk / ref bytes of a few reads
++                        char path[512]; std::snprintf(path, sizeof(path), "%s_%llu.bin", dp, (unsigned long long)m_l2hCmpCalls);
++                        if (FILE *fp = std::fopen(path, "wb")) { std::fwrite(d, 1, r, fp); std::fwrite(ref.data(), 1, rn, fp); std::fclose(fp); }
++                    }
++                    if (++m_l2hCmpCalls % 50u == 0u)
++                        std::fprintf(stderr, "[gs:vk:l2h] check: %llu bytes, %llu off by >24 (per byte 0-3: %llu %llu %llu %llu), max diff %d | mean vk/ref per byte: %.1f/%.1f %.1f/%.1f %.1f/%.1f %.1f/%.1f\n", (unsigned long long)m_l2hCmpN, (unsigned long long)m_l2hCmpBad,
++                                     (unsigned long long)m_l2hCh[0], (unsigned long long)m_l2hCh[1], (unsigned long long)m_l2hCh[2], (unsigned long long)m_l2hCh[3], m_l2hCmpMax,
++                                     m_l2hSum[0][0] * 4.0 / m_l2hCmpN, m_l2hSum[0][1] * 4.0 / m_l2hCmpN, m_l2hSum[1][0] * 4.0 / m_l2hCmpN, m_l2hSum[1][1] * 4.0 / m_l2hCmpN,
++                                     m_l2hSum[2][0] * 4.0 / m_l2hCmpN, m_l2hSum[2][1] * 4.0 / m_l2hCmpN, m_l2hSum[3][0] * 4.0 / m_l2hCmpN, m_l2hSum[3][1] * 4.0 / m_l2hCmpN);
++                }
++            }
++            else
++            {
++                r = m_ref->ConsumeLocalToHostBytes(d, n);
++                if (r) ++m_pL2hRef;
++            }
++            m_pL2hMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++            m_pL2hBytes += r;
++            return r;
++        }
 +        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override { ++m_pRv; return m_ref->ReadVram(psm, base, bw, x, y); }
 +        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t v) override { if (m_vramOn) m_vram.disownAll(); m_ref->WriteVram(psm, base, bw, x, y, v); }
 +        void SnapshotVram(std::vector<uint8_t> &out) const override { ++m_pSnap; m_ref->SnapshotVram(out); }
@@ -641,8 +718,10 @@ index 0000000000000000000000000000000000000000..5897b19e75698a41c73aa67a873397d0
 +            const bool fast = m_vramOn && m_vram.renderOn() && !m_vram.comparing() && !m_refPresAll;
 +            // The cached source fbp goes stale when the game flips buffers between refreshes (menus flickered: every
 +            // other frame showed the buffer being drawn), so shift it by how far DISPFB's fbp has moved since.
++            // vk17: also without reference draws (the default now) the metadata refresh stays: it comes from the request
++            // registers, not from drawn pixels (GSCpuBackend::Present), and keeps size/mode changes current.
 +            const auto dfbpOf = [](const GSPresentationRequest &r) { return static_cast<uint32_t>(((r.pmode & 1u) ? r.dispfb1 : r.dispfb2) & 0x1FFu); };
-+            if (!fast || m_pN % 30u == 0u || !m_haveMeta) { if (!skipRef() || !m_haveMeta) { frame = m_ref->Present(req); m_meta = frame; m_meta.pixels.clear(); m_haveMeta = true; m_metaDfbp = dfbpOf(req); } }
++            if (!fast || m_pN % 30u == 0u || !m_haveMeta) { { frame = m_ref->Present(req); m_meta = frame; m_meta.pixels.clear(); m_haveMeta = true; m_metaDfbp = dfbpOf(req); } }
 +            if (fast && frame.pixels.empty() && m_haveMeta)
 +            {
 +                std::vector<uint8_t> keep; keep.swap(frame.pixels); frame = m_meta;
@@ -654,7 +733,7 @@ index 0000000000000000000000000000000000000000..5897b19e75698a41c73aa67a873397d0
 +                std::vector<uint8_t> vk;
 +                uint32_t vw = 0, vh = 0;
 +                m_vram.endFrame(m_ref.get(), &req, &frame, &vk, &vw, &vh);
-+                if (fast && vk.empty()) frame = m_ref->Present(req); // nothing from Vulkan: fall back
++                if (fast && vk.empty()) { frame = m_ref->Present(req); ++m_pFb; } // nothing from Vulkan: fall back
 +                if (m_presDump && !vk.empty() && m_pN % 60u == 0u && m_pN >= 600u)
 +                {   // debug (PS2X_VK_PRESDUMP=prefix): the presented Vulkan frame as PPM every 60 presents
 +                    char path[512]; std::snprintf(path, sizeof(path), "%s_%llu.ppm", m_presDump, (unsigned long long)m_pN);
@@ -671,10 +750,10 @@ index 0000000000000000000000000000000000000000..5897b19e75698a41c73aa67a873397d0
 +                if (++m_pN % 300u == 0u && m_prof)
 +                {
 +                    const double now = std::chrono::duration<double, std::milli>(t2.time_since_epoch()).count();
-+                    std::fprintf(stderr, "[gs:vk:prof] per present over 300: wall %.2f ms | vk draws %.2f ref draws %.2f | ref present %.2f vk endFrame %.2f | l2h %llu readvram %llu snap %llu noref %d\n",
++                    std::fprintf(stderr, "[gs:vk:prof] per present over 300: wall %.2f ms | vk draws %.2f ref draws %.2f | ref present %.2f vk endFrame %.2f | l2h %llu (%.3f ms, %llu B, %llu from ref) readvram %llu snap %llu noref %d fallback %llu\n",
 +                                 m_pWall0 ? (now - m_pWall0) / 300.0 : 0.0, m_pVk / 300.0, m_pRef / 300.0, m_pRefP / 300.0, m_pVkP / 300.0,
-+                                 (unsigned long long)m_pL2h, (unsigned long long)m_pRv, (unsigned long long)m_pSnap, skipRef() ? 1 : 0);
-+                    m_pWall0 = now; m_pVk = m_pRef = m_pRefP = m_pVkP = 0; m_pL2h = m_pRv = m_pSnap = 0;
++                                 (unsigned long long)m_pL2h, m_pL2hMs / std::max<double>(1.0, (double)m_pL2h), (unsigned long long)m_pL2hBytes, (unsigned long long)m_pL2hRef, (unsigned long long)m_pRv, (unsigned long long)m_pSnap, skipRef() ? 1 : 0, (unsigned long long)m_pFb);
++                    m_pWall0 = now; m_pVk = m_pRef = m_pRefP = m_pVkP = 0; m_pL2h = m_pRv = m_pSnap = 0; m_pL2hMs = 0; m_pL2hBytes = 0; m_pL2hRef = 0; m_pFb = 0;
 +                }
 +                if (m_vram.renderOn())
 +                {
@@ -852,12 +931,21 @@ index 0000000000000000000000000000000000000000..5897b19e75698a41c73aa67a873397d0
 +        }
 +
 +        std::unique_ptr<GSRasterBackend> m_ref;
-+        // profiling (PS2X_VK_PROF=1) and PS2X_VK_NOREF=1: Vulkan alone, the wrapped reference renderer only gets
-+        // transfers/CLUT (no draws, no present), so its VRAM lacks drawn pixels (counters show if the game reads it back)
++        // Vulkan alone (default since vk17 when Vulkan renders and serves GS -> host reads; PS2X_VK_REF=1 turns it off):
++        // the wrapped reference renderer only gets transfers/CLUT and a metadata present every 30 frames (no draws), so
++        // its VRAM lacks drawn pixels. The prof line counts reads that still went to it ("from ref") and fallbacks.
 +        bool skipRef() const { return m_noRef && m_vramOn && m_vram.renderOn() && !m_vram.comparing(); }
 +        uint32_t m_metaDfbp = 0;
 +        bool m_staleMeta = std::getenv("PS2X_VK_STALEMETA") != nullptr; // debug: old behaviour (cached source fbp)
-+        bool m_prof = std::getenv("PS2X_VK_PROF") != nullptr, m_noRef = std::getenv("PS2X_VK_NOREF") != nullptr;
++        double m_pL2hMs = 0; unsigned long long m_pL2hBytes = 0, m_pL2hRef = 0, m_pFb = 0; unsigned m_l2hLog = 0;
++        bool m_l2hVk = !(std::getenv("PS2X_VK_L2H") && std::getenv("PS2X_VK_L2H")[0] == '0'), m_l2hOwn = false;
++        bool m_l2hCheck = std::getenv("PS2X_VK_L2HCHECK") != nullptr;
++        std::vector<uint8_t> m_l2hBuf; size_t m_l2hPos = 0;
++        uint64_t m_l2hCmpN = 0, m_l2hCmpBad = 0, m_l2hCmpCalls = 0, m_l2hCh[4]{}, m_l2hSum[4][2]{}; int m_l2hCmpMax = 0;
++        bool m_prof = std::getenv("PS2X_VK_PROF") != nullptr,
++             // vk17: with GS -> host reads served by Vulkan the reference renderer no longer gets draws by default
++             // (its GL thread cost ~45% of a core at 4x). PS2X_VK_REF=1 (or PS2X_VK_L2H=0) keeps it drawing.
++             m_noRef = std::getenv("PS2X_VK_NOREF") != nullptr || (m_l2hVk && !m_l2hCheck && !(std::getenv("PS2X_VK_REF") && std::getenv("PS2X_VK_REF")[0] == '1'));
 +        double m_pVk = 0, m_pRef = 0, m_pRefP = 0, m_pVkP = 0, m_pWall0 = 0;
 +        uint64_t m_pN = 0;
 +        bool m_refPresAll = std::getenv("PS2X_VK_REFPRES") && std::getenv("PS2X_VK_REFPRES")[0] == '1', m_haveMeta = false;
@@ -909,10 +997,10 @@ index 0000000000000000000000000000000000000000..5897b19e75698a41c73aa67a873397d0
 +#endif
 diff --git a/ps2xRuntime/src/lib/gs/gs_vk_render.inl b/ps2xRuntime/src/lib/gs/gs_vk_render.inl
 new file mode 100644
-index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15e3847b47
+index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175eae6ecdc7
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_vk_render.inl
-@@ -0,0 +1,1062 @@
+@@ -0,0 +1,1097 @@
 +// Vulkan GS renderer (Phase 3 steps 3-6). Textually #included INSIDE class VkVramMirror (gs_vk_vram.inl) so it
 +// shares the VRAM buffer, LUTs, descriptor set, command buffer and mutex: uploads (compute) and draws (graphics)
 +// are recorded into one command stream in GS event order.
@@ -930,7 +1018,9 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +    void drawList(const GSDrawList &l)
 +    {
 +        if (!m_rOn) return;
++        const auto lt0 = std::chrono::steady_clock::now();
 +        std::lock_guard<std::mutex> lk(m_m);
++        m_pLockMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lt0).count();
 +        waitInFlight();
 +        for (const GSDrawListBatch &b : l.batches)
 +            drawBatchLocked(b, l.vertices.data() + b.firstVertex, static_cast<size_t>(b.primCount) * b.vertsPerPrim);
@@ -948,8 +1038,11 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +    }
 +
 +private:
-+    struct RTarget { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; uint32_t w = 0, h = 0; bool depth = false; uint64_t lastF = 0, draws = 0; uint32_t dirtyRows = 0, hiRows = 0, dirtyLo = 0xFFFFFFFFu, loRows = 0xFFFFFFFFu; bool stale = false; uint64_t seq = 0; };
++    struct RTarget { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; uint32_t w = 0, h = 0; bool depth = false; uint64_t lastF = 0, draws = 0; uint32_t dirtyRows = 0, hiRows = 0, dirtyLo = 0xFFFFFFFFu, loRows = 0xFFFFFFFFu; bool stale = false; uint64_t seq = 0; uint32_t staleLo = 0xFFFFFFFFu, staleHi = 0; };
 +    static constexpr uint32_t kRing = 64u * 1024u * 1024u;
++    static constexpr uint32_t kRingHalf = (kRing / 2u / 768u) * 768u; // slot 1's ring base: whole vertices, 256-aligned
++    size_t ringLo() const { return m_two ? m_slot * kRingHalf : 0u; }
++    size_t ringHi() const { return m_two ? (m_slot ? kRing : kRingHalf) : kRing; }
 +    static constexpr uint32_t kRows = 1024u;
 +    static constexpr uint32_t kFloats = 12u;
 +
@@ -1050,9 +1143,9 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +        const Fmt f = fmt(psm);
 +        if (!f.ok) return;
 +        const uint32_t bytes = t.w * rows * 4u, alloc = (bytes + 255u) & ~255u;
-+        if (alloc > kStaging) return;
++        if (alloc > stageCap()) return;
 +        endRenderingLocked();
-+        if (m_stageUsed + alloc > kStaging) { if (m_begun) submitWait(); m_stageUsed = 0; }
++        if (m_stageUsed + alloc > stageHi()) { if (m_begun) submitWait(); m_stageUsed = stageLo(); }
 +        ensureCompute();
 +        VkBufferImageCopy cp{};
 +        cp.bufferOffset = m_stageUsed;
@@ -1092,9 +1185,9 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +        rows = std::min(rows, t.h);
 +        if (!f.ok || rows <= y0) return;
 +        const uint32_t bytes = t.w * (rows - y0) * 4u, alloc = (bytes + 255u) & ~255u;
-+        if (alloc > kStaging) return;
++        if (alloc > stageCap()) return;
 +        endRenderingLocked();
-+        if (m_stageUsed + alloc > kStaging) { if (m_begun) submitWait(); m_stageUsed = 0; }
++        if (m_stageUsed + alloc > stageHi()) { if (m_begun) submitWait(); m_stageUsed = stageLo(); }
 +        ensureCompute();
 +        PC pc{};
 +        pc.ioBitBase = static_cast<uint32_t>(m_stageUsed / 4u);
@@ -1130,6 +1223,16 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +    // A host->local transfer into memory covered by a colour target: write the target back first (so it can't clobber
 +    // the upload later), then re-seed it after the upload.
 +    void preUploadLocked(uint64_t b, uint64_t e) { if (m_rOn && !m_noWb) writeBackRangeLocked(b, e); }
++    // vk18: reseed a stale target: only the uploaded rows (PS2X_VK_STALEFULL=1: whole target, old behaviour)
++    void reseedStaleLocked(uint64_t key, RTarget &t)
++    {
++        static const bool s_full = std::getenv("PS2X_VK_STALEFULL") && std::getenv("PS2X_VK_STALEFULL")[0] == '1';
++        t.stale = false;
++        const uint32_t lo = t.staleLo, hi = t.staleHi;
++        t.staleLo = 0xFFFFFFFFu; t.staleHi = 0;
++        if (s_full || lo >= hi) seedLocked(key, t, t.hiRows);
++        else seedLocked(key, t, hi, lo);
++    }
 +    void postUploadLocked(uint64_t b, uint64_t e)
 +    {
 +        if (!m_rOn || m_noSeed) return;
@@ -1139,7 +1242,21 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +            if (!t.hiRows) continue;
 +            const uint32_t kp = (kv.first >> 15) & 0x3Fu, bpp = (kp == GS_PSM_CT16 || kp == GS_PSM_CT16S) ? 2u : 4u;
 +            const uint64_t tb = static_cast<uint64_t>(kv.first & 0x1FFu) * 8192u, te = tb + static_cast<uint64_t>(t.w) * t.hiRows * bpp;
-+            if (b < te && tb < e) t.stale = true; // re-seeded lazily before the next draw into it or present
++            if (b < te && tb < e)
++            {
++                static const bool s_sl = std::getenv("PS2X_VK_STALELOG") != nullptr; // debug (vk18)
++                if (s_sl) std::fprintf(stderr, "[gs:vk:stale] f%llu up %llx-%llx marks %05llx w%u hi%u dirty %u..%u seq %llu\n", (unsigned long long)(m_rFrames + 1), (unsigned long long)b, (unsigned long long)e,
++                                       (unsigned long long)kv.first, t.w, t.hiRows, t.dirtyLo, t.dirtyRows, (unsigned long long)t.seq);
++                t.stale = true; // re-seeded lazily before the next draw into it or present
++                // vk18: remember which rows the upload touched. Only those were written back before it (preUpload
++                // writes back dirty spans overlapping the upload), so only those may be reseeded from VRAM: a full
++                // reseed replaced the other rows (e.g. the displayed menu buffer, drawn but not written back) with
++                // older VRAM content -> one-frame menu flicker. Rounded out to whole page rows.
++                const uint64_t rowB = static_cast<uint64_t>(t.w) * bpp, ph = bpp == 2u ? 64u : 32u, band = rowB * ph;
++                const uint64_t lo = b > tb ? ((b - tb) / band) * ph : 0u, hi = ((std::min(e, te) - tb + band - 1u) / band) * ph;
++                t.staleLo = std::min<uint32_t>(t.staleLo, static_cast<uint32_t>(lo));
++                t.staleHi = std::max<uint32_t>(t.staleHi, static_cast<uint32_t>(std::min<uint64_t>(hi, t.hiRows)));
++            }
 +        }
 +    }
 +    static uint32_t texBits(uint32_t psm)
@@ -1207,7 +1324,7 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +        vkCmdCopyImageToBuffer(m_cmd, t.img, VK_IMAGE_LAYOUT_GENERAL, m_rb, 1, &cp);
 +        barrier(true);
 +        submitWait();
-+        m_stageUsed = 0;
++        m_stageUsed = stageLo();
 +        const uint32_t *mv = static_cast<const uint32_t *>(m_rbMap);
 +        const uint8_t *im = static_cast<const uint8_t *>(m_rbMap) + kVram;
 +        const Fmt f = fmt(GS_PSM_CT32);
@@ -1608,13 +1725,13 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +        // vertices -> ring
 +        const uint32_t outVerts = static_cast<uint32_t>(b.primCount) * (cls == 3 ? 6u : need);
 +        const size_t bytes = static_cast<size_t>(outVerts) * kFloats * 4u;
-+        if (m_ringUsed + bytes > kRing)
++        if (m_ringUsed + bytes > ringHi())
 +        {
 +            endRenderingLocked();
 +            submitWait();
-+            m_ringUsed = 0;
-+            m_stageUsed = 0;
-+            if (bytes > kRing) { ++m_rs.skipped; return; }
++            m_ringUsed = ringLo();
++            m_stageUsed = stageLo();
++            if (bytes > ringHi() - ringLo()) { ++m_rs.skipped; return; }
 +        }
 +        float *out = reinterpret_cast<float *>(static_cast<uint8_t *>(m_ringMap) + m_ringUsed);
 +        const uint32_t first = static_cast<uint32_t>(m_ringUsed / (kFloats * 4u));
@@ -1669,7 +1786,7 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +        RTarget *ct = target(ckey, W, false);
 +        RTarget *zt = target(zkey, W, true);
 +        if (!ct || !zt) { ++m_rs.skipped; return; }
-+        if (ct->stale) { ct->stale = false; seedLocked(ckey, *ct, ct->hiRows); }
++        if (ct->stale) reseedStaleLocked(ckey, *ct);
 +        if (!m_noSeed && !m_noWb && !m_noXsync && (m_curC != ckey || !m_rendering))
 +        {   // another target (different width/format) drew into this target's memory since: merge through VRAM
 +            const uint32_t kp = (ckey >> 15) & 0x3Fu, bpp = (kp == GS_PSM_CT16 || kp == GS_PSM_CT16S) ? 2u : 4u;
@@ -1872,7 +1989,7 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +            const uint64_t want = (dispfb & 0xFFFFFull & ~0x1FFull) | fbp;
 +            const uint64_t k = aliasKey(want, false, off);
 +            auto it = m_colorT.find(k);
-+            if (it != m_colorT.end() && it->second.stale) { it->second.stale = false; seedLocked(k, it->second, it->second.hiRows); it->second.lastF = m_rFrames + 1; }
++            if (it != m_colorT.end() && it->second.stale) { static const bool s_sl2 = std::getenv("PS2X_VK_STALELOG") != nullptr; if (s_sl2) std::fprintf(stderr, "[gs:vk:stale] f%llu present reseeds %05llx\n", (unsigned long long)(m_rFrames + 1), (unsigned long long)k); reseedStaleLocked(k, it->second); it->second.lastF = m_rFrames + 1; }
 +            if (it != m_colorT.end() && (!m_presRecent || it->second.lastF + 2 >= m_rFrames + 1)) { t = &it->second; dby += off; m_presKey = k; }
 +            else
 +            {   // fall back to the most recently drawn target at this base pointer
@@ -1919,6 +2036,12 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +                if (!(ob < hi && lo < oe)) continue;
 +                y0 = std::min<uint32_t>(y0, static_cast<uint32_t>((std::max(ob, lo) - base) / rb));
 +                y1 = std::max<uint32_t>(y1, static_cast<uint32_t>((std::min(oe, hi) - base + rb - 1) / rb));
++            }
++            if (y1 > y0 && s_presLog)
++            {   // debug: which other targets the present-time merge pulls in
++                std::fprintf(stderr, "[gs:vk:pmerge] f%llu disp %llx seq %llu rows %u-%u dby %u:", (unsigned long long)(m_rFrames + 1), (unsigned long long)ckey, (unsigned long long)t->seq, y0, y1, dby);
++                for (const DrawRec &d : m_drawLog) if (d.key != ckey && d.seq > t->seq) std::fprintf(stderr, " %llx/%u-%u/s%llu", (unsigned long long)d.key, d.y0, d.y1, (unsigned long long)d.seq);
++                std::fprintf(stderr, "\n");
 +            }
 +            if (y1 > y0)
 +            {
@@ -1977,10 +2100,10 @@ index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15
 +    VkPipelineCache m_pcache = VK_NULL_HANDLE;
 diff --git a/ps2xRuntime/src/lib/gs/gs_vk_vram.inl b/ps2xRuntime/src/lib/gs/gs_vk_vram.inl
 new file mode 100644
-index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f796001ee7a1ef
+index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f54674838
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_vk_vram.inl
-@@ -0,0 +1,848 @@
+@@ -0,0 +1,930 @@
 +// Vulkan PS2 VRAM mirror (Phase 3 step 2), #included by gs_vk_backend.cpp inside its anonymous namespace.
 +// 4 MB device-local buffer = GS local memory. Host->local uploads are swizzled on the GPU by gs_vk_swizzle.comp;
 +// an "own" buffer (same size) records which bits were last written by an upload. Draws, clears, local->local
@@ -2108,10 +2231,16 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
 +        cai.commandPool = m_pool;
 +        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-+        cai.commandBufferCount = 1;
-+        if (vkAllocateCommandBuffers(m_dev, &cai, &m_cmd) != VK_SUCCESS) return false;
++        // vk17: two command buffers / fences. With async presents (m_two) frame N+1 is recorded while the GPU still
++        // runs frame N; CPU-written ring/staging memory is split into one half per slot. PS2X_VK_FRAMES=1: one slot.
++        m_two = !(std::getenv("PS2X_VK_FRAMES") && std::getenv("PS2X_VK_FRAMES")[0] == '1') && !m_checkEvery &&
++                !std::getenv("PS2X_VK_CMP") && !std::getenv("PS2X_VK_DUMP") && !(std::getenv("PS2X_VK_SYNCPRES") && std::getenv("PS2X_VK_SYNCPRES")[0] == '1');
++        cai.commandBufferCount = 2;
++        if (vkAllocateCommandBuffers(m_dev, &cai, m_cmdB) != VK_SUCCESS) return false;
 +        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-+        if (vkCreateFence(m_dev, &fci, nullptr, &m_fence) != VK_SUCCESS) return false;
++        if (vkCreateFence(m_dev, &fci, nullptr, &m_fenceB[0]) != VK_SUCCESS || vkCreateFence(m_dev, &fci, nullptr, &m_fenceB[1]) != VK_SUCCESS) return false;
++        m_slot = 0; m_cmd = m_cmdB[0]; m_fence = m_fenceB[0];
++        m_stageUsed = stageLo();
 +        // zero VRAM + ownership (matches the reference's zeroed memory)
 +        begin();
 +        vkCmdFillBuffer(m_cmd, m_vram, 0, VK_WHOLE_SIZE, 0u);
@@ -2143,7 +2272,8 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +        renderDestroy();
 +        auto kill = [&](VkBuffer &b, VkDeviceMemory &m) { if (b) vkDestroyBuffer(m_dev, b, nullptr); if (m) vkFreeMemory(m_dev, m, nullptr); b = VK_NULL_HANDLE; m = VK_NULL_HANDLE; };
 +        kill(m_vram, m_vramMem); kill(m_own, m_ownMem); kill(m_lutBuf, m_lutMem); kill(m_stage, m_stageMem); kill(m_rb, m_rbMem);
-+        if (m_fence) vkDestroyFence(m_dev, m_fence, nullptr);
++        for (VkFence &f : m_fenceB) { if (f) vkDestroyFence(m_dev, f, nullptr); f = VK_NULL_HANDLE; }
++        m_fence = VK_NULL_HANDLE;
 +        if (m_pool) vkDestroyCommandPool(m_dev, m_pool, nullptr);
 +        if (m_pipe) vkDestroyPipeline(m_dev, m_pipe, nullptr);
 +        if (m_pl) vkDestroyPipelineLayout(m_dev, m_pl, nullptr);
@@ -2226,7 +2356,8 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +                  std::vector<uint8_t> *vkPix = nullptr, uint32_t *vkW = nullptr, uint32_t *vkH = nullptr)
 +    {
 +        if (!m_ok) return;
-+        std::lock_guard<std::mutex> lk(m_m);
++        std::unique_lock<std::mutex> lk(m_m);
++        const auto eft0 = std::chrono::steady_clock::now();
 +        waitInFlight();
 +        flushTxLocked(false);
 +        endRenderingLocked();
@@ -2239,7 +2370,7 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +        const bool check = m_checkEvery && ref && (m_frames % m_checkEvery) == 0u;
 +        if (!m_begun && !check)
 +        {
-+            m_stageUsed = 0;
++            m_stageUsed = stageLo();
 +            return;
 +        }
 +        ensureCompute();
@@ -2258,26 +2389,33 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +        const uint32_t prevW = m_presW, prevH = m_presH;
 +        const void *prevMap = m_presMapB[m_presCur ^ 1u];
 +        if (async) submitAsync(); else submitWait();
++        if (async && prevPres) waitSlot(m_slot); // two slots: the previous frame (which wrote prevMap) is in this slot now
 +        m_presHave = havePres; m_presW = pw; m_presH = ph;
-+        m_stageUsed = 0;
-+        m_ringUsed = 0;
++        m_stageUsed = stageLo();
++        m_ringUsed = ringLo();
 +        if (async)
 +        {
 +            if (m_rOn && frame) ++m_rFrames;
++            static const bool s_profA = std::getenv("PS2X_VK_PROF") != nullptr;
++            if (s_profA && m_rFrames % 300u == 0u)
++            {
++                std::fprintf(stderr, "[gs:vk:prof] per frame (async): submits %.2f wait %.2f ms | lock held %.2f ms, copy %.2f ms, draw lock wait %.2f ms\n", m_pSubs / 300.0, m_pWaitMs / 300.0, m_pHeldMs / 300.0, m_pCopyMs / 300.0, m_pLockMs / 300.0);
++                m_pSubs = 0; m_pWaitMs = 0; m_pHeldMs = 0; m_pCopyMs = 0; m_pLockMs = 0;
++            }
++            // vk17: the previous frame's readback buffer is only rewritten by the next endFrame (this thread), so the
++            // copy runs after the lock is released and no longer blocks the GS stage's draws (4x: ~18 MB per frame).
++            m_pHeldMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - eft0).count();
++            lk.unlock();
 +            if (prevPres && vkPix)
 +            {   // one pass from (cached) readback memory, alpha forced to 255
++                const auto ct0 = std::chrono::steady_clock::now();
 +                const size_t n = static_cast<size_t>(prevW) * prevH;
 +                vkPix->resize(n * 4u);
 +                const uint32_t *s32 = static_cast<const uint32_t *>(prevMap);
 +                uint32_t *d32 = reinterpret_cast<uint32_t *>(vkPix->data());
 +                for (size_t i = 0; i < n; ++i) d32[i] = s32[i] | 0xFF000000u;
 +                *vkW = prevW; *vkH = prevH;
-+            }
-+            static const bool s_profA = std::getenv("PS2X_VK_PROF") != nullptr;
-+            if (s_profA && m_rFrames % 300u == 0u)
-+            {
-+                std::fprintf(stderr, "[gs:vk:prof] per frame (async): submits %.2f wait %.2f ms\n", m_pSubs / 300.0, m_pWaitMs / 300.0);
-+                m_pSubs = 0; m_pWaitMs = 0;
++                m_pCopyMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ct0).count();
 +            }
 +            return;
 +        }
@@ -2516,13 +2654,13 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +        const uint32_t rrw = c.trxreg.rrw, rrh = c.trxreg.rrh;
 +        if (!fs.ok || !fd.ok || rrw == 0 || rrh == 0) return false;
 +        const uint64_t n = static_cast<uint64_t>(rrw) * rrh, alloc = (n * 4u + 255u) & ~255ull;
-+        if (alloc > kStaging) return false;
++        if (alloc > stageCap()) return false;
 +        const uint32_t sbw = std::max<uint32_t>(c.bitbltbuf.sbw, 1u), dbw = std::max<uint32_t>(c.bitbltbuf.dbw, 1u);
 +        const uint64_t sB = static_cast<uint64_t>(c.bitbltbuf.sbp) * 256u, sE = sB + static_cast<uint64_t>(sbw) * 64u * (c.trxpos.ssay + rrh) * texBits(c.bitbltbuf.spsm) / 8u;
 +        const uint64_t dB = static_cast<uint64_t>(c.bitbltbuf.dbp) * 256u, dE = dB + static_cast<uint64_t>(dbw) * 64u * (c.trxpos.dsay + rrh) * texBits(c.bitbltbuf.dpsm) / 8u;
 +        preUploadLocked(sB, sE);
 +        preUploadLocked(dB, dE);
-+        if (m_stageUsed + alloc > kStaging) { if (m_begun) submitWait(); m_stageUsed = 0; }
++        if (m_stageUsed + alloc > stageHi()) { if (m_begun) submitWait(); m_stageUsed = stageLo(); }
 +        ensureCompute();
 +        PC pc{};
 +        pc.ioBitBase = static_cast<uint32_t>(m_stageUsed / 4u);
@@ -2556,6 +2694,49 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +        m_ownedSinceDraw = true;
 +        return true;
 +    }
++public:
++    // vk17: GS -> host transfer (TRXDIR 1) served from the mirror. Drawn targets over the source are written back,
++    // the rect is unswizzled into staging (compute mode 1, as for local -> local) and read after a wait. out gets one
++    // 32-bit word per pixel, the raw value ReadVram would return. Call after beginTransfer(c).
++    bool readRect(const GSTransferCommand &c, std::vector<uint32_t> &out)
++    {
++        if (!m_ok || !m_rOn) return false;
++        std::lock_guard<std::mutex> lk(m_m);
++        waitInFlight();
++        const Fmt fs = fmt(c.bitbltbuf.spsm);
++        const uint32_t rrw = c.trxreg.rrw, rrh = c.trxreg.rrh;
++        if (!fs.ok || rrw == 0 || rrh == 0) return false;
++        const uint64_t n = static_cast<uint64_t>(rrw) * rrh, alloc = (n * 4u + 255u) & ~255ull;
++        if (alloc > stageCap()) return false;
++        const uint32_t sbw = std::max<uint32_t>(c.bitbltbuf.sbw, 1u);
++        const uint64_t sB = static_cast<uint64_t>(c.bitbltbuf.sbp) * 256u, sE = sB + static_cast<uint64_t>(sbw) * 64u * (c.trxpos.ssay + rrh) * texBits(c.bitbltbuf.spsm) / 8u;
++        if (m_txActive && m_txBytes.size() > m_txFlushedBytes) { endRenderingLocked(); flushTxLocked(false); }
++        preUploadLocked(sB, sE);
++        if (m_stageUsed + alloc > stageHi()) { if (m_begun) submitWait(); m_stageUsed = stageLo(); }
++        ensureCompute();
++        const uint32_t at = m_stageUsed;
++        PC pc{};
++        pc.ioBitBase = at / 4u;
++        pc.firstPixel = 0; pc.count = static_cast<uint32_t>(n);
++        pc.srcBits = 32; pc.lutBase = fs.lut; pc.pw = fs.pw; pc.ph = fs.ph;
++        pc.ppr = std::max<uint32_t>(1u, sbw * 64u / fs.pw);
++        pc.baseBits = (c.bitbltbuf.sbp * 256u * 8u) & 0x1FFFFFFu;
++        pc.dsax = c.trxpos.ssax; pc.dsay = c.trxpos.ssay; pc.rrw = rrw;
++        pc.nbits = fs.nbits; pc.shift = fs.shift; pc.mode = 1;
++        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
++        vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pl, 0, 1, &m_set, 0, nullptr);
++        vkCmdPushConstants(m_cmd, m_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
++        vkCmdDispatch(m_cmd, (pc.count + 63u) / 64u, 1, 1);
++        barrier(true);
++        m_stageUsed += static_cast<uint32_t>(alloc);
++        ++m_dispatches;
++        submitWait();
++        out.resize(static_cast<size_t>(n));
++        std::memcpy(out.data(), static_cast<const uint8_t *>(m_stageMap) + at, static_cast<size_t>(n) * 4u);
++        m_stageUsed = stageLo();
++        return true;
++    }
++private:
 +    void flushTxLocked(bool finish = true)
 +    {
 +        if (!m_txActive) return;
@@ -2576,12 +2757,12 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +            preUploadLocked(txB, txE);
 +            if (m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8)
 +                std::fprintf(stderr, "[gs:vk:tx] f%llu dbp %x dbw %u dpsm %x y %u h %u\n", (unsigned long long)(m_rFrames + 1), m_tx.bitbltbuf.dbp, m_tx.bitbltbuf.dbw, m_tx.bitbltbuf.dpsm, m_tx.trxpos.dsay, rrh);
-+            if (m_stageUsed + alloc > kStaging)
++            if (m_stageUsed + alloc > stageHi())
 +            {
 +                if (m_begun) submitWait();
-+                m_stageUsed = 0;
++                m_stageUsed = stageLo();
 +            }
-+            if (alloc <= kStaging)
++            if (alloc <= stageCap())
 +            {
 +                uint8_t *dst = static_cast<uint8_t *>(m_stageMap) + m_stageUsed;
 +                std::memcpy(dst, m_txBytes.data() + startByte, len);
@@ -2646,7 +2827,7 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +        pc.count = static_cast<uint32_t>(m_rtExpect.size());
 +        pc.mode = 1;
 +        const uint32_t outByte = (m_stageUsed + 255u) & ~255u;
-+        if (outByte + pc.count * 4u > kStaging) return 0;
++        if (outByte + pc.count * 4u > stageHi()) return 0;
 +        m_rtOutWord = outByte / 4u;
 +        pc.ioBitBase = m_rtOutWord;
 +        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
@@ -2660,16 +2841,36 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +    void ensureCompute() { endRenderingLocked(); ensureBegun(); }
 +    // async present (default when rendering and not comparing; PS2X_VK_SYNCPRES=1 turns it off): the frame's command
 +    // buffer is submitted without waiting; the next locked call (or begin/submitWait) waits for the fence first.
-+    bool m_inFlight = false;
++    bool m_inFlight = false; // any slot pending (kept for readers of the old flag)
++    double m_pHeldMs = 0, m_pCopyMs = 0, m_pLockMs = 0; // vk17 prof: endFrame time under m_m / readback copy outside it
++    VkCommandBuffer m_cmdB[2]{};
++    VkFence m_fenceB[2]{};
++    bool m_pendB[2]{};
++    uint32_t m_slot = 0;
++    bool m_two = false;
++    uint32_t stageLo() const { return m_two ? m_slot * (kStaging / 2u) : 0u; }
++    uint32_t stageHi() const { return m_two ? stageLo() + kStaging / 2u : kStaging; }
++    uint32_t stageCap() const { return m_two ? kStaging / 2u : kStaging; }
++    void waitSlot(uint32_t i)
++    {
++        if (!m_pendB[i]) return;
++        const auto pt0 = std::chrono::steady_clock::now();
++        vkWaitForFences(m_dev, 1, &m_fenceB[i], VK_TRUE, UINT64_MAX);
++        m_pWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pt0).count();
++        vkResetFences(m_dev, 1, &m_fenceB[i]);
++        m_pendB[i] = false;
++        m_inFlight = m_pendB[0] || m_pendB[1];
++        probePrint();
++    }
++    void waitAllLocked() { waitSlot(m_slot ^ 1u); waitSlot(m_slot); }
++    // Called first by every locked entry point. One slot: wait for the submitted frame (as before). Two slots: only
++    // when no command buffer is open, wait for the current slot's previous use (two frames back), so its half of the
++    // ring/staging memory can be written by the CPU again.
 +    void waitInFlight()
 +    {
 +        if (!m_inFlight) return;
-+        const auto pt0 = std::chrono::steady_clock::now();
-+        vkWaitForFences(m_dev, 1, &m_fence, VK_TRUE, UINT64_MAX);
-+        m_pWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pt0).count();
-+        vkResetFences(m_dev, 1, &m_fence);
-+        m_inFlight = false;
-+        probePrint();
++        if (!m_two) { waitAllLocked(); return; }
++        if (!m_begun) waitSlot(m_slot);
 +    }
 +    void submitAsync()
 +    {
@@ -2680,18 +2881,21 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +        si.commandBufferCount = 1;
 +        si.pCommandBuffers = &m_cmd;
 +        ++m_pSubs;
-+        if (vkQueueSubmit(m_q, 1, &si, m_fence) == VK_SUCCESS) m_inFlight = true;
++        if (vkQueueSubmit(m_q, 1, &si, m_fence) == VK_SUCCESS) { m_pendB[m_slot] = true; m_inFlight = true; }
 +        m_begun = false;
 +        m_clutPending = 0;
++        if (m_two) { m_slot ^= 1u; m_cmd = m_cmdB[m_slot]; m_fence = m_fenceB[m_slot]; }
 +    }
 +    void begin()
 +    {
-+        waitInFlight();
++        waitSlot(m_slot);
++        if (!m_two) waitAllLocked();
 +        vkResetCommandBuffer(m_cmd, 0);
 +        VkCommandBufferBeginInfo bb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 +        bb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 +        vkBeginCommandBuffer(m_cmd, &bb);
 +        m_begun = true;
++        if (m_two) barrier(); // order this frame's GPU work after the other slot's (it may still be running)
 +    }
 +    void barrier(bool toHost = false)
 +    {
@@ -2704,7 +2908,7 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +    }
 +    void submitWait()
 +    {
-+        waitInFlight();
++        waitAllLocked();
 +        if (!m_begun) return;
 +        endRenderingLocked();
 +        vkEndCommandBuffer(m_cmd);
@@ -2720,6 +2924,7 @@ index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f79600
 +            vkResetFences(m_dev, 1, &m_fence);
 +            probePrint();
 +        }
++        m_inFlight = m_pendB[0] || m_pendB[1];
 +        m_begun = false;
 +        m_clutPending = 0;
 +    }
