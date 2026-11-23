@@ -471,7 +471,7 @@ index f0ad5070b42f89c6c697c906e93f59cebf2ba904..1085c7dc95b90055ebd1fd6fe5f11136
 +    return h;
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed4373f023887 100644
+index 9281d5f51b809c4f755837ccf45e47604d539bf7..868119e5c7b71ac45a7f8a39d4ef8194e78d1d92 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -1,6 +1,8 @@
@@ -483,7 +483,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
  #include "runtime/ps2_memory.h"
  #include <atomic>
  #include <algorithm>
-@@ -111,6 +113,537 @@ GS::GS()
+@@ -111,6 +113,833 @@ GS::GS()
      reset();
  }
  
@@ -501,6 +501,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
 +#include <memory>
 +#include <vector>
 +#include <string>
++#include <cctype>
 +#include <deque>
 +#include <mutex>
 +#include <thread>
@@ -510,6 +511,17 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
 +{
 +    bool on();
 +    bool onPrim(const GSPrimitiveBatch &batch, int path);
++    void onPresent();
++}
++// Phase 2 draw list, record-only (PS2X_DRAWLIST=1), implemented in gs_drawlist.inl.
++namespace ps2x_drawlist
++{
++    bool on();
++    void onPrim(const GSPrimitiveBatch &batch);
++    void onTransfer(uint32_t dir);
++    void onClut();
++    void onTexFlush();
++    void onFinish();
 +    void onPresent();
 +}
 +// Widescreen HUD fix-up (PS2X_WS_HUD_SCALE), implemented in gs_wshud.inl.
@@ -524,6 +536,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
 +#include <cstdio>
 +
 +extern int g_ps2xGifCurPath;
++extern uint32_t g_ps2xDrawTag;
 +namespace
 +{
 +    // PS2X_GS_WATCHBP="lo,hi" (hex block addresses): debug, log transfers and draws that write
@@ -566,6 +579,8 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
 +            for (int i = 0; i < m_n; ++i)
 +                m_workers[i].th = std::thread([this, i]() { workerLoop(i); });
 +        }
++        GSBackendKind Kind() const override { return GSBackendKind::CpuThreaded; }
++        const char *Name() const override { return "cpu-threaded"; }
 +        ~GSThreadedBackend() override
 +        {
 +            drain(0);
@@ -994,13 +1009,294 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
 +        return on;
 +    }
 +
++    // ---- Phase 3 step 1: real draw list (PS2X_DRAWLIST=2) ---------------------------------------------------
++    // Sits in front of the chosen backend: Submit() appends to a GSDrawList (new batch on ANY GSDrawState byte
++    // difference or vertex-count change), every other backend call first hands the pending list over with
++    // SubmitList(). So ordering is exactly the per-primitive order. PS2X_DRAWLIST_CHECK=1 hashes every primitive
++    // as submitted and as reconstructed from the lists (default-replay rules) and reports any divergence.
++    class GSListBackend final : public GSRasterBackend
++    {
++    public:
++        explicit GSListBackend(std::unique_ptr<GSRasterBackend> inner) : m_inner(std::move(inner))
++        {
++            m_check = []() { const char *e = std::getenv("PS2X_DRAWLIST_CHECK"); return e && e[0] == '1'; }();
++            m_flushEach = []() { const char *e = std::getenv("PS2X_DRAWLIST_FLUSHEACH"); return e && e[0] == '1'; }();
++            m_list.vertices.reserve(kMaxVerts + 3);
++        }
++        ~GSListBackend() override
++        {
++            flush(GSDrawListCut::Reset);
++        }
++        static constexpr size_t kMaxVerts = 49152;
++
++        void Submit(const GSPrimitiveBatch &b) override
++        {
++            std::lock_guard<std::recursive_mutex> lk(m_m);
++            const uint8_t n = b.vertexCount > 3u ? 3u : b.vertexCount;
++            if (m_check)
++                m_hIn = hashPrim(m_hIn, b.state, b.vertices.data(), n);
++            const uint32_t tag = g_ps2xDrawTag;
++            const uint8_t path = static_cast<uint8_t>(g_ps2xGifCurPath);
++            GSDrawListBatch *cur = m_list.batches.empty() ? nullptr : &m_list.batches.back();
++            const StateKey key = canon(b.state);
++            if (m_check && cur && cur->vertsPerPrim == n && key != m_curKey)
++                for (size_t i = 0; i < key.size(); ++i)
++                    if (key[i] != m_curKey[i]) { ++m_diffAt[i]; break; }
++            if (!cur || cur->vertsPerPrim != n || key != m_curKey)
++            {
++                m_curKey = key;
++                GSDrawListBatch nb;
++                nb.state = b.state;
++                nb.firstVertex = static_cast<uint32_t>(m_list.vertices.size());
++                nb.vertsPerPrim = n;
++                nb.path = path;
++                nb.tag = tag;
++                nb.clutGen = m_clutGen;
++                nb.bbox[0] = nb.bbox[1] = INT32_MAX;
++                nb.bbox[2] = nb.bbox[3] = INT32_MIN;
++                m_list.batches.push_back(nb);
++                cur = &m_list.batches.back();
++                ++m_statBatches;
++            }
++            for (uint8_t i = 0; i < n; ++i)
++            {
++                const GSVertex &v = b.vertices[i];
++                m_list.vertices.push_back(v);
++                const int x = static_cast<int>(v.x), y = static_cast<int>(v.y);
++                cur->bbox[0] = std::min(cur->bbox[0], x); cur->bbox[1] = std::min(cur->bbox[1], y);
++                cur->bbox[2] = std::max(cur->bbox[2], x); cur->bbox[3] = std::max(cur->bbox[3], y);
++            }
++            ++cur->primCount;
++            ++m_statPrims;
++            if (m_flushEach || m_list.vertices.size() >= kMaxVerts)
++                flushLocked(GSDrawListCut::Full);
++        }
++        void SubmitList(const GSDrawList &l) override { flush(GSDrawListCut::Sync); m_inner->SubmitList(l); }
++
++        void Initialize(uint8_t *vram, uint32_t vramSize) override { flush(GSDrawListCut::Reset); m_inner->Initialize(vram, vramSize); }
++        void Reset() override { flush(GSDrawListCut::Reset); m_inner->Reset(); }
++        void LoadClut(const GSTex0Reg &t, const GSTexClutReg &c) override { flush(GSDrawListCut::Clut); ++m_clutGen; m_inner->LoadClut(t, c); }
++        void BeginTransfer(const GSTransferCommand &c) override
++        {
++            flush(c.direction == 0u ? GSDrawListCut::Transfer : c.direction == 1u ? GSDrawListCut::Readback : GSDrawListCut::LocalCopy);
++            m_inner->BeginTransfer(c);
++        }
++        void UploadImage(const uint8_t *d, uint32_t n) override { flush(GSDrawListCut::Transfer); m_inner->UploadImage(d, n); }
++        void Flush() override { flush(GSDrawListCut::Sync); m_inner->Flush(); }
++        void TextureFlush() override { flush(GSDrawListCut::TexFlush); m_inner->TextureFlush(); }
++        void Sync(GSSyncReason r) override { flush(r == GSSyncReason::Finish ? GSDrawListCut::Finish : GSDrawListCut::Sync); m_inner->Sync(r); }
++        PresentationFrame Present(const GSPresentationRequest &r) override
++        {
++            report();
++            return m_inner->Present(r);
++        }
++        bool ClearFramebuffer(const GSContext &c, uint32_t rgba) override { flush(GSDrawListCut::Clear); return m_inner->ClearFramebuffer(c, rgba); }
++        uint32_t ConsumeLocalToHostBytes(uint8_t *d, uint32_t n) override { flush(GSDrawListCut::Readback); return m_inner->ConsumeLocalToHostBytes(d, n); }
++        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
++        {
++            const_cast<GSListBackend *>(this)->flush(GSDrawListCut::Readback);
++            return m_inner->ReadVram(psm, base, bw, x, y);
++        }
++        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t v) override
++        {
++            flush(GSDrawListCut::Transfer);
++            m_inner->WriteVram(psm, base, bw, x, y, v);
++        }
++        void SnapshotVram(std::vector<uint8_t> &out) const override
++        {
++            const_cast<GSListBackend *>(this)->flush(GSDrawListCut::Readback);
++            m_inner->SnapshotVram(out);
++        }
++        GSTransferSnapshot GetTransferSnapshot() const override
++        {
++            const_cast<GSListBackend *>(this)->flush(GSDrawListCut::Readback);
++            return m_inner->GetTransferSnapshot();
++        }
++        GSBackendKind Kind() const override { return m_inner->Kind(); }
++        const char *Name() const override { return m_inner->Name(); }
++        uint32_t Capabilities() const override { return m_inner->Capabilities() | kGSCapDrawList; }
++        bool AttachHostPresentTarget(const GSHostPresentTarget &t) override { flush(GSDrawListCut::Sync); return m_inner->AttachHostPresentTarget(t); }
++        void DetachHostPresentTarget() override { flush(GSDrawListCut::Sync); m_inner->DetachHostPresentTarget(); }
++        void ResizeHostPresentTarget(uint32_t w, uint32_t h) override { m_inner->ResizeHostPresentTarget(w, h); }
++        void SetResolutionScale(uint32_t s) override { flush(GSDrawListCut::Sync); m_inner->SetResolutionScale(s); }
++        void OnHostFrameEnd(uint64_t f) override { m_inner->OnHostFrameEnd(f); }
++        bool DebugCommand(const char *c) override { return m_inner->DebugCommand(c); }
++
++    private:
++        // Canonical (padding-free) image of every GSDrawState member; compare/hash this, never raw struct bytes.
++        using StateKey = std::array<uint64_t, 20>;
++        static StateKey canon(const GSDrawState &st)
++        {
++            const GSContext &c = st.context;
++            const GSPrimReg &p = st.prim;
++            StateKey k{};
++            k[0] = (uint64_t)c.frame.fbp | ((uint64_t)c.frame.fbw << 32);
++            k[1] = (uint64_t)c.frame.psm | ((uint64_t)c.frame.fbmsk << 32);
++            k[2] = (uint64_t)c.scissor.x0 | ((uint64_t)c.scissor.x1 << 16) | ((uint64_t)c.scissor.y0 << 32) | ((uint64_t)c.scissor.y1 << 48);
++            k[3] = (uint64_t)c.tex0.tbp0 | ((uint64_t)c.tex0.tbw << 32) | ((uint64_t)c.tex0.psm << 40) | ((uint64_t)c.tex0.tw << 48) | ((uint64_t)c.tex0.th << 56);
++            k[4] = (uint64_t)c.tex0.tcc | ((uint64_t)c.tex0.tfx << 8) | ((uint64_t)c.tex0.cpsm << 16) | ((uint64_t)c.tex0.csm << 24) |
++                   ((uint64_t)c.tex0.csa << 32) | ((uint64_t)c.tex0.cld << 40);
++            k[5] = (uint64_t)c.tex0.cbp | ((uint64_t)c.xyoffset.ofx << 32) | ((uint64_t)c.xyoffset.ofy << 48);
++            k[6] = (uint64_t)c.zbuf.zbp | ((uint64_t)c.zbuf.psm << 32) | ((uint64_t)(c.zbuf.zmask ? 1 : 0) << 40);
++            k[7] = c.tex1; k[8] = c.miptbp1; k[9] = c.miptbp2; k[10] = c.clamp; k[11] = c.alpha; k[12] = c.test; k[13] = c.fba;
++            k[14] = (uint64_t)p.type | ((uint64_t)p.iip << 8) | ((uint64_t)p.tme << 9) | ((uint64_t)p.fge << 10) | ((uint64_t)p.abe << 11) |
++                    ((uint64_t)p.aa1 << 12) | ((uint64_t)p.fst << 13) | ((uint64_t)p.ctxt << 14) | ((uint64_t)p.fix << 15) |
++                    ((uint64_t)st.texa.ta0 << 16) | ((uint64_t)(st.texa.aem ? 1 : 0) << 24) | ((uint64_t)st.texa.ta1 << 32) |
++                    ((uint64_t)(st.pabe ? 1 : 0) << 40) | ((uint64_t)(st.linearFilter ? 1 : 0) << 41);
++            k[15] = (uint64_t)st.texclut.cbw | ((uint64_t)st.texclut.cou << 8) | ((uint64_t)st.texclut.cov << 16) |
++                    ((uint64_t)st.fogR << 32) | ((uint64_t)st.fogG << 40) | ((uint64_t)st.fogB << 48);
++            k[16] = st.scanmsk; k[17] = st.dimx; k[18] = st.dthe ^ (st.colclamp << 1);
++            k[19] = (uint64_t)st.textureWidth | ((uint64_t)st.textureHeight << 16) | ((uint64_t)st.colclamp << 32);
++            return k;
++        }
++        static uint64_t hashBytes(uint64_t h, const void *p, size_t n)
++        {
++            const uint8_t *b = static_cast<const uint8_t *>(p);
++            for (size_t i = 0; i < n; ++i)
++                h = (h ^ b[i]) * 0x100000001B3ull;
++            return h;
++        }
++        static uint64_t hashPrim(uint64_t h, const GSDrawState &st, const GSVertex *v, uint8_t n)
++        {
++            const StateKey k = canon(st);
++            h = hashBytes(h, k.data(), sizeof(k));
++            h = hashBytes(h, &n, 1);
++            for (uint8_t i = 0; i < n; ++i)
++            {
++                // fields only (GSVertex has padding)
++                const GSVertex &x = v[i];
++                h = hashBytes(h, &x.x, sizeof(x.x)); h = hashBytes(h, &x.y, sizeof(x.y)); h = hashBytes(h, &x.z, sizeof(x.z));
++                const uint8_t c[4] = {x.r, x.g, x.b, x.a};
++                h = hashBytes(h, c, 4);
++                h = hashBytes(h, &x.q, sizeof(x.q)); h = hashBytes(h, &x.s, sizeof(x.s)); h = hashBytes(h, &x.t, sizeof(x.t));
++                h = hashBytes(h, &x.u, sizeof(x.u)); h = hashBytes(h, &x.v, sizeof(x.v)); h = hashBytes(h, &x.fog, sizeof(x.fog));
++            }
++            return h;
++        }
++        void flush(GSDrawListCut why)
++        {
++            std::lock_guard<std::recursive_mutex> lk(m_m);
++            flushLocked(why);
++        }
++        void flushLocked(GSDrawListCut why)
++        {
++            if (m_list.batches.empty() || m_inFlush)
++                return;
++            m_inFlush = true;
++            m_list.cut = why;
++            m_list.listId = ++m_listId;
++            m_list.frameId = m_frameId;
++            if (m_check)
++                for (const GSDrawListBatch &b : m_list.batches)
++                    for (uint32_t p = 0; p < b.primCount; ++p)
++                        m_hOut = hashPrim(m_hOut, b.state, &m_list.vertices[b.firstVertex + static_cast<size_t>(p) * b.vertsPerPrim], b.vertsPerPrim);
++            ++m_statLists;
++            ++m_statCut[static_cast<size_t>(why) < 16 ? static_cast<size_t>(why) : 0];
++            m_inner->SubmitList(m_list);
++            m_list.clear();
++            m_inFlush = false;
++        }
++        void report()
++        {
++            std::lock_guard<std::recursive_mutex> lk(m_m);
++            flushLocked(GSDrawListCut::Present);
++            ++m_frameId;
++            const auto now = std::chrono::steady_clock::now();
++            if (now - m_last < std::chrono::seconds(5))
++                return;
++            const double secs = std::chrono::duration<double>(now - m_last).count();
++            m_last = now;
++            std::fprintf(stderr, "[drawlist2] %.1fs prims=%llu batches=%llu lists=%llu (prims/batch %.1f, batches/list %.1f) cuts: transfer=%llu readback=%llu clut=%llu finish=%llu present=%llu sync=%llu full=%llu%s\n",
++                         secs, (unsigned long long)m_statPrims, (unsigned long long)m_statBatches, (unsigned long long)m_statLists,
++                         m_statBatches ? double(m_statPrims) / m_statBatches : 0.0, m_statLists ? double(m_statBatches) / m_statLists : 0.0,
++                         (unsigned long long)m_statCut[(size_t)GSDrawListCut::Transfer], (unsigned long long)m_statCut[(size_t)GSDrawListCut::Readback],
++                         (unsigned long long)m_statCut[(size_t)GSDrawListCut::Clut], (unsigned long long)m_statCut[(size_t)GSDrawListCut::Finish],
++                         (unsigned long long)m_statCut[(size_t)GSDrawListCut::Present], (unsigned long long)m_statCut[(size_t)GSDrawListCut::Sync],
++                         (unsigned long long)m_statCut[(size_t)GSDrawListCut::Full],
++                         m_check ? (m_hIn == m_hOut ? " | check: in==out OK" : " | check: MISMATCH") : "");
++            if (m_check && m_hIn != m_hOut)
++                std::fprintf(stderr, "[drawlist2] CHECK MISMATCH in=%016llx out=%016llx\n", (unsigned long long)m_hIn, (unsigned long long)m_hOut);
++            if (m_check)
++            {
++                std::string d;
++                for (size_t i = 0; i < 512; ++i)
++                    if (m_diffAt[i]) { d += " @" + std::to_string(i) + "=" + std::to_string(m_diffAt[i]); m_diffAt[i] = 0; }
++                std::fprintf(stderr, "[drawlist2] batch breaks by first differing key word (0-1 frame,2 scissor,3-5 tex0/xyoff,6 zbuf,7 tex1,10 clamp,11 alpha,12 test,14 prim/texa,15 clut/fog):%s\n", d.c_str());
++            }
++            m_statPrims = m_statBatches = m_statLists = 0;
++            for (auto &c : m_statCut) c = 0;
++        }
++
++        std::unique_ptr<GSRasterBackend> m_inner;
++        mutable std::recursive_mutex m_m;
++        GSDrawList m_list;
++        bool m_check = false, m_inFlush = false, m_flushEach = false;
++        uint32_t m_clutGen = 0;
++        uint64_t m_listId = 0, m_frameId = 0, m_hIn = 0xCBF29CE484222325ull, m_hOut = 0xCBF29CE484222325ull;
++        uint64_t m_statPrims = 0, m_statBatches = 0, m_statLists = 0, m_statCut[16] = {};
++        uint64_t m_diffAt[512] = {};
++        StateKey m_curKey{};
++        std::chrono::steady_clock::time_point m_last = std::chrono::steady_clock::now();
++    };
++
++    std::unique_ptr<GSRasterBackend> maybeWrapDrawList(std::unique_ptr<GSRasterBackend> b)
++    {
++        const char *e = std::getenv("PS2X_DRAWLIST");
++        if (!b || ((!e || e[0] != '2') && b->Kind() != GSBackendKind::Vulkan) || (e && e[0] == '0'))
++            return b;
++        std::fprintf(stderr, "[gs] draw list path on (PS2X_DRAWLIST=2) in front of the %s backend\n", b->Name());
++        return std::make_unique<GSListBackend>(std::move(b));
++    }
++
 +    // Opt-in OpenGL GS renderer (PS2X_GS_GPU=1), defined in gs_gpu_backend.inl (included at the end of this file).
 +    std::unique_ptr<GSRasterBackend> createGsGpuBackend();
 +    bool isGsGpuBackend(const GSRasterBackend *backend);
 +
++    // PS2X_GS_BACKEND=cpu|gl|vulkan; PS2X_GS_GPU=1 is the legacy spelling of gl.
++    std::string gsBackendChoice()
++    {
++        std::string v;
++        if (const char *e = std::getenv("PS2X_GS_BACKEND"))
++            for (const char *c = e; *c; ++c)
++                v += static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
++        if (v == "opengl" || v == "gpu")
++            v = "gl";
++        if (v == "vk")
++            v = "vulkan";
++        if (v.empty())
++        {
++            const char *g = std::getenv("PS2X_GS_GPU");
++            v = (g && g[0] == '1') ? "gl" : "cpu";
++        }
++        return v;
++    }
++
++    std::unique_ptr<GSRasterBackend> makeCpuOrGlBackend(std::unique_ptr<GSRasterBackend> inner, bool wantGl);
++
 +    std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend(std::unique_ptr<GSRasterBackend> inner)
 +    {
-+        if (const char *g = std::getenv("PS2X_GS_GPU"); g && g[0] == '1')
++        const std::string choice = gsBackendChoice();
++        if (choice == "vulkan")
++        {
++            // Skeleton stage: the Vulkan backend wraps the usual renderer (GL if PS2X_GS_GPU=1, else CPU) as its
++            // VRAM-accurate reference and owns presentation.
++            const char *g = std::getenv("PS2X_GS_GPU");
++            std::unique_ptr<GSRasterBackend> ref = makeCpuOrGlBackend(std::move(inner), g && g[0] == '1');
++            if (auto vk = gsCreateVulkanBackend(ref))
++            {
++                std::fprintf(stderr, "[gs] Vulkan GS backend selected (PS2X_GS_BACKEND=vulkan), reference renderer inside\n");
++                return vk;
++            }
++            std::fprintf(stderr, "[gs] PS2X_GS_BACKEND=vulkan but Vulkan is %s; using %s\n",
++                         gsVulkanCompiledIn() ? "unavailable/failed" : "not compiled in", ref ? ref->Name() : "?");
++            return ref;
++        }
++        return makeCpuOrGlBackend(std::move(inner), choice == "gl");
++    }
++
++    std::unique_ptr<GSRasterBackend> makeCpuOrGlBackend(std::unique_ptr<GSRasterBackend> inner, bool wantGl)
++    {
++        if (wantGl)
 +        {
 +            if (auto gpu = createGsGpuBackend())
 +            {
@@ -1021,27 +1317,30 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
  void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
  {
      m_localMemoryStorage = vram;
-@@ -118,6 +651,8 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+@@ -118,6 +947,9 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
      m_privRegs = privRegs;
      if (!m_backend)
          m_backend = std::make_unique<GSCpuBackend>();
-+    if (!dynamic_cast<GSThreadedBackend *>(m_backend.get()) && !isGsGpuBackend(m_backend.get()))
-+        m_backend = makeDefaultRasterBackend(std::move(m_backend));
++    if (!dynamic_cast<GSThreadedBackend *>(m_backend.get()) && !isGsGpuBackend(m_backend.get()) &&
++        m_backend->Kind() == GSBackendKind::Cpu && (m_backend->Capabilities() & kGSCapDrawList) == 0u)
++        m_backend = maybeWrapDrawList(makeDefaultRasterBackend(std::move(m_backend)));
      m_backend->Initialize(vram, vramSize);
      reset();
  }
-@@ -548,6 +1083,10 @@ void GS::latchHostPresentationFrame()
+@@ -548,6 +1380,12 @@ void GS::latchHostPresentationFrame()
              m_backend->Flush();
              m_backend->Sync(GSSyncReason::Presentation);
              frame = m_backend->Present(request);
 +            if (ps2x_drawtag::on())
 +                ps2x_drawtag::onPresent();
++            if (ps2x_drawlist::on())
++                ps2x_drawlist::onPresent();
 +            if (ps2x_wshud::on())
 +                ps2x_wshud::onPresent();
          }
      }
  
-@@ -610,7 +1149,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -610,7 +1448,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
      outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
      if (outWidth != 0u && outHeight != 0u)
      {
@@ -1051,7 +1350,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
          for (uint32_t y = 0; y < outHeight; ++y)
          {
              const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
-@@ -640,6 +1180,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+@@ -640,6 +1479,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
  
  void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -1059,7 +1358,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (!data || sizeBytes < 16 || !m_backend)
          return;
-@@ -930,7 +1471,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -930,7 +1770,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(x) / 16.0f;
          vtx.y = static_cast<float>(y) / 16.0f;
@@ -1068,7 +1367,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -967,7 +1508,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -967,7 +1807,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(x) / 16.0f;
          vtx.y = static_cast<float>(y) / 16.0f;
@@ -1077,7 +1376,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -1001,7 +1542,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1001,7 +1841,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
          vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
@@ -1086,7 +1385,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -1032,7 +1573,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1032,7 +1872,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
          GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
          vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
          vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
@@ -1095,7 +1394,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
          vtx.r = m_curR;
          vtx.g = m_curG;
          vtx.b = m_curB;
-@@ -1062,6 +1603,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+@@ -1062,6 +1902,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
  
  void GS::writeRegister(uint8_t regAddr, uint64_t value)
  {
@@ -1103,7 +1402,25 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      writeRegisterUnlocked(regAddr, value);
  }
-@@ -1392,6 +1934,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1240,6 +2081,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
+         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
+         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
++        if (ps2x_drawlist::on())
++            ps2x_drawlist::onClut();
+         m_backend->LoadClut(t, m_texclut);
+         break;
+     }
+@@ -1271,6 +2114,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
+         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
+         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
++        if (ps2x_drawlist::on())
++            ps2x_drawlist::onClut();
+         m_backend->LoadClut(t, m_texclut);
+         break;
+     }
+@@ -1392,6 +2237,19 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
              command.trxpos = m_trxpos;
              command.trxreg = m_trxreg;
              command.direction = m_trxdir;
@@ -1118,10 +1435,30 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
 +                                 m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh, m_bitbltbuf.sbp, m_bitbltbuf.spsm, g_ps2xGifCurPath);
 +                }
 +            }
++            if (ps2x_drawlist::on())
++                ps2x_drawlist::onTransfer(m_trxdir);
              m_backend->BeginTransfer(command);
          }
          recordTransferDebugEventUnlocked();
-@@ -1525,10 +2078,73 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+@@ -1413,6 +2271,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         m_fogB = static_cast<uint8_t>((value >> 16) & 0xFFu);
+         break;
+     case GS_REG_TEXFLUSH:
++        if (ps2x_drawlist::on())
++            ps2x_drawlist::onTexFlush();
+         if (m_backend)
+             m_backend->TextureFlush();
+         break;
+@@ -1477,6 +2337,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     }
+     case GS_REG_FINISH:
+     {
++        if (ps2x_drawlist::on())
++            ps2x_drawlist::onFinish();
+         if (m_backend)
+         {
+             m_backend->Flush();
+@@ -1525,10 +2387,73 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
      recordRegisterDebugEventUnlocked(regAddr, value);
  }
  
@@ -1195,7 +1532,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
  
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);
-@@ -1576,10 +2192,184 @@ void GS::vertexKick(bool drawing)
+@@ -1576,10 +2501,186 @@ void GS::vertexKick(bool drawing)
      if (drawing && m_backend)
      {
          GSPrimitiveBatch batch = buildDrawBatch(needed);
@@ -1206,6 +1543,8 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
 +        }
 +        if (ps2x_wshud::on())
 +            ps2x_wshud::onPrim(batch, g_ps2xGifCurPath);
++        if (ps2x_drawlist::on())
++            ps2x_drawlist::onPrim(batch);
 +        if (g_gsDrawLog.enabled && g_gsDrawLog.active())
 +        {
 +            auto &L = g_gsDrawLog;
@@ -1380,13 +1719,14 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
  
      switch (m_prim.type)
      {
-@@ -1608,9 +2398,25 @@ void GS::vertexKick(bool drawing)
+@@ -1608,9 +2709,26 @@ void GS::vertexKick(bool drawing)
      }
  }
  
 +#include "gs_texrep.inl"
 +#include "gs_drawtag.inl"
 +#include "gs_wshud.inl"
++#include "gs_drawlist.inl"
 +
  void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -1406,7 +1746,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
          m_backend->UploadImage(data, sizeBytes);
  }
  
-@@ -1629,6 +2435,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
+@@ -1629,6 +2747,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
  
  uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -1414,7 +1754,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
  }
-@@ -1698,7 +2505,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+@@ -1698,7 +2817,13 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
      const uint64_t tex1 = batch.state.context.tex1;
      const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
      const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
@@ -1429,7 +1769,7 @@ index 9281d5f51b809c4f755837ccf45e47604d539bf7..2386b43686f885d84051d673ef7ed437
      return batch;
  }
  
-@@ -1734,3 +2547,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
+@@ -1734,3 +2859,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
          m_hasPreferredDisplaySource = true;
      }
  }
@@ -1481,10 +1821,10 @@ index c0507c73c38a188543d30109ab2506ac4dbc83e6..8a29591d804e09f619620939d7abe4ab
      m_queue.clear();
 diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_backend.inl b/ps2xRuntime/src/lib/gs/gs_gpu_backend.inl
 new file mode 100644
-index 0000000000000000000000000000000000000000..a8f05f2d9445f90f61352115eed25935a40613bf
+index 0000000000000000000000000000000000000000..69bf03d54ed46d0486c9bae701a57399b47ae4fe
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gpu_backend.inl
-@@ -0,0 +1,2224 @@
+@@ -0,0 +1,2265 @@
 +// gs_gpu_backend.inl - opt-in OpenGL 3.3 GS renderer (PS2X_GS_GPU=1), stage one.
 +//
 +// Included at the end of gs_frontend.cpp (instead of being its own translation unit) so
@@ -1905,6 +2245,9 @@ index 0000000000000000000000000000000000000000..a8f05f2d9445f90f61352115eed25935
 +public:
 +    GSGpuBackend() = default;
 +    ~GSGpuBackend() override { stop(); }
++    GSBackendKind Kind() const override { return GSBackendKind::OpenGL; }
++    const char *Name() const override { return "gl"; }
++    uint32_t Capabilities() const override { return kGSCapGpu | kGSCapDrawList; }
 +
 +    bool start()
 +    {
@@ -1945,6 +2288,20 @@ index 0000000000000000000000000000000000000000..a8f05f2d9445f90f61352115eed25935
 +        Cmd c;
 +        c.isDraw = true;
 +        c.batch = batch;
++        push(std::move(c));
++    }
++
++    // Native draw list: one queue command per list instead of one per primitive. The worker rebuilds the exact
++    // per-primitive batches (same rules as the default replay) and feeds appendDraw, so GL output is unchanged.
++    void SubmitList(const GSDrawList &list) override
++    {
++        if (list.batches.empty())
++            return;
++        auto shared = std::make_shared<GSDrawList>(list);
++        Cmd c;
++        c.isDraw = false;
++        c.isList = true;
++        c.list = std::move(shared);
 +        push(std::move(c));
 +    }
 +
@@ -2268,9 +2625,31 @@ index 0000000000000000000000000000000000000000..a8f05f2d9445f90f61352115eed25935
 +    struct Cmd
 +    {
 +        bool isDraw = false;
++        bool isList = false;
 +        GSPrimitiveBatch batch{};
 +        std::function<void()> fn;
++        std::shared_ptr<GSDrawList> list;
 +    };
++
++    void appendList(const GSDrawList &list)
++    {
++        GSPrimitiveBatch prim{};
++        for (const GSDrawListBatch &b : list.batches)
++        {
++            prim.state = b.state;
++            prim.vertexCount = b.vertsPerPrim;
++            const uint32_t n = b.vertsPerPrim > 3u ? 3u : b.vertsPerPrim;
++            for (uint32_t p = 0; p < b.primCount; ++p)
++            {
++                const size_t base = static_cast<size_t>(b.firstVertex) + static_cast<size_t>(p) * b.vertsPerPrim;
++                if (base + n > list.vertices.size())
++                    break;
++                for (uint32_t v = 0; v < n; ++v)
++                    prim.vertices[v] = list.vertices[base + v];
++                appendDraw(prim);
++            }
++        }
++    }
 +
 +    struct Stats
 +    {
@@ -2359,6 +2738,8 @@ index 0000000000000000000000000000000000000000..a8f05f2d9445f90f61352115eed25935
 +            {
 +                if (c.isDraw)
 +                    appendDraw(c.batch);
++                else if (c.isList)
++                    appendList(*c.list);
 +                else
 +                {
 +                    flushDraws();
@@ -4067,10 +4448,10 @@ index 0000000000000000000000000000000000000000..82df9c76c1a3bd3e633dbdf3f4d9a420
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_wshud.inl b/ps2xRuntime/src/lib/gs/gs_wshud.inl
 new file mode 100644
-index 0000000000000000000000000000000000000000..c3a56dc9dc620e3ed234fbafaec694a64633020b
+index 0000000000000000000000000000000000000000..49357c3d832f976145579b806d7c8afd50c1649a
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_wshud.inl
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,204 @@
 +// Widescreen HUD fix-up (PS2X_WS_HUD_SCALE=<s>, e.g. 0.75 for 4:3 content in a 16:9 picture; default off).
 +// #included at the end of gs_frontend.cpp. Set by the game overrides (BLACKKAT_WIDESCREEN=1, BLACKKAT_WS_HUD!=0).
 +// With a stretched 16:9 present the 3D uses a hor+ projection, but 2D HUD elements are drawn for 4:3 and would be
@@ -4102,6 +4483,11 @@ index 0000000000000000000000000000000000000000..c3a56dc9dc620e3ed234fbafaec694a6
 +        float s_pb[4] = {0, 0, 0, 0};
 +        bool s_p1SinceBlit = false;
 +        float s_screenW = 640.0f, s_screenH = 448.0f;
++        // menu panels (shop, save, status): a HUD frame with a big panel is laid out as one 4:3 screen, so all of
++        // its elements are squeezed around the centre instead of each one snapping to the nearest edge (the shop
++        // panel used to stay at the left while its text went to the centre). Decided from the previous frame,
++        // whose marker ended it; PS2X_WS_HUD_PANEL=0 turns it off.
++        bool s_panelCur = false, s_panelPrev = false;
 +    }
 +
 +    float scale()
@@ -4160,6 +4546,7 @@ index 0000000000000000000000000000000000000000..c3a56dc9dc620e3ed234fbafaec694a6
 +            if (!pr.tme && constZ && b.vertices[0].z > 0.0)
 +            {
 +                s_after = true;
++                s_panelPrev = s_panelCur; s_panelCur = false;
 +                s_mainFbp = c.frame.fbp;
 +                s_screenW = x1;
 +                s_screenH = y1;
@@ -4200,12 +4587,18 @@ index 0000000000000000000000000000000000000000..c3a56dc9dc620e3ed234fbafaec694a6
 +            return;
 +        }
 +        g_statHud.fetch_add(1, std::memory_order_relaxed);
++        static const bool s_panelOn = []() { const char *e = std::getenv("PS2X_WS_HUD_PANEL"); return !(e && e[0] == '0'); }();
++        if (s_panelOn && (x1 - x0) >= 360.0f && (y1 - y0) >= 200.0f)
++            s_panelCur = true;
++        const bool panel = s_panelOn && (s_panelCur || s_panelPrev);
 +        const uint64_t key = (uint64_t)path | ((uint64_t)pr.type << 4) | ((uint64_t)pr.tme << 8) | ((uint64_t)c.tex0.psm << 9) |
 +                             ((uint64_t)c.tex0.tbp0 << 16);
 +        const float gap = path == 1 ? 64.0f : 48.0f;
 +        const bool nearPrev = x0 <= s_pb[2] + gap && x1 >= s_pb[0] - gap && y0 <= s_pb[3] + gap && y1 >= s_pb[1] - gap;
 +        const bool cont = s_inRun && s_runPath == path && (path == 1 || key == s_runKey) && nearPrev;
-+        if (!cont)
++        if (panel)
++            s_anchor = s_screenW * 0.5f;
++        else if (!cont)
 +            s_anchor = x0 < s_screenW * 0.25f ? 0.0f : (x1 > s_screenW * 0.75f ? s_screenW : s_screenW * 0.5f);
 +        s_inRun = true;
 +        s_runPath = path;

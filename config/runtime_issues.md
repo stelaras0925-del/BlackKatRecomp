@@ -1498,3 +1498,32 @@ After the fix: hidden run via the launcher logs screen=framebuffer=1280x896, hig
 - A D1 CHCR poll reports idle while at most n VIF1 jobs are queued.
 - At sea: 20.2 → 14.6 fps, vsync about 37/s. The cause is synchronous drains on VIF1 register reads and privileged GS reads (about 1.9 s blocked per 5 s).
 - A working version needs shadow VIF1_STAT / CSR reads and EE cycle charging while blocked. It probably needs new PS2Memory members, which means a header change and a full rebuild.
+
+## Vulkan GS backend (2026-11, patch 0006; frontend/wshud parts in 0003)
+
+### Use
+- `PS2X_GS_BACKEND=vulkan` (launcher: Renderer = Vulkan). It draws on its own GPU renderer. Textures are read from a
+  4 MB VRAM mirror swizzled on the GPU. The OpenGL backend runs alongside as a reference for metadata (present size, source fbp),
+  refreshed every 30 presents.
+- `PS2X_VK_SCALE=1..4` (launcher: Resolution, now enabled for Vulkan): internal resolution. Targets and depth are N x, write-back to the
+  mirror is a nearest downsample, and seeds are upsampled. Render-to-texture reads of a CT32/CT24 target are sampled from the scaled image
+  (`PS2X_VK_SCALE_RTT=0` turns this off). 4x holds 60 fps on an RX 9070. Compare/dump/VRAM-check modes force 1x. The GL reference stays at 1x.
+- Local-to-local GS copies (TRXDIR 2) are done in the mirror (`PS2X_VK_L2L=0` = old disown-only path). Menus restore
+  their background this way every frame. Without it, menu text smeared/doubled and a tile band showed on Vulkan.
+- TEX1 linear filtering is bilinear (`PS2X_VK_NEAREST=1` turns it off). Async present, unless comparing (`PS2X_VK_SYNCPRES=1`).
+
+### Debug flags
+`PS2X_VK_CMP=N` (compare with GL every N frames), `PS2X_VK_DUMP=prefix` (+`PS2X_VK_DUMPMIN`), `PS2X_VK_TRACE=frame`,
+`PS2X_VK_PRESLOG=1|2`, `PS2X_VK_VRAM_CHECK=N` + `PS2X_VK_DUMPVRAM`/`PS2X_VK_DUMPREG=fbp,fbw,psm,w,h`, `PS2X_VK_L2LLOG=1`,
+`PS2X_VK_SKIPA`/`PS2X_VK_SKIPT`, `PS2X_VK_VALIDATE=1` (validation layers), `PS2X_VK_STALEMETA`, `PS2X_VK_NOPRESSYNC`,
+`PS2X_VK_REFPRES`, `PS2X_VK_ALIAS|WB|WB16|SEED|XSYNC|CLUT=0` (turn off individual mechanisms).
+
+### Widescreen menu panels
+- `gs_wshud.inl`: a HUD frame that has a big panel (at least 360x200) squeezes all of its elements around the centre, so menus such as
+  the shop stay one centred 4:3 layout (the panel used to stick to the left edge). `PS2X_WS_HUD_PANEL=0` = old behaviour.
+  Gameplay HUD is unchanged.
+
+### Known gaps
+- Points/lines are 1 hi-res pixel at N x. The CT16 write-back alpha bit differs from GL (not visible). There is still a rare menu
+  frame spike when menu draws are split across a vsync.
+

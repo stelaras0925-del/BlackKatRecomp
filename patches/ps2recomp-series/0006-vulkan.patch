@@ -1,0 +1,3105 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d76850a7e3c9b99eea17d66ba0a8cad7d3f24..cff32ecd18d5b988a448853d01e3b0b2d724f053 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -383,6 +383,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
++    src/lib/gs/gs_vk_backend.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+@@ -507,6 +508,40 @@ target_include_directories(ps2_runtime PUBLIC
+ )
+ 
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++
++# Optional Vulkan GS backend (PS2X_GS_BACKEND=vulkan at run time). Builds without Vulkan: the factory is a stub.
++find_package(Vulkan QUIET)
++option(PS2X_VULKAN "Build the Vulkan GS backend (needs Vulkan headers + loader)" ${Vulkan_FOUND})
++if(PS2X_VULKAN AND Vulkan_FOUND)
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_VULKAN=1)
++    target_link_libraries(ps2_runtime PUBLIC Vulkan::Vulkan)
++    find_program(PS2X_GLSLANG_VALIDATOR glslangValidator)
++    if(PS2X_GLSLANG_VALIDATOR)
++        set(_vk_spv_dir ${CMAKE_CURRENT_BINARY_DIR}/gs_vk_shaders)
++        file(MAKE_DIRECTORY ${_vk_spv_dir})
++        foreach(_sh IN ITEMS "gs_vk_swizzle.comp|kGsVkSwizzleSpv|gs_vk_swizzle.spv.h"
++                              "gs_vk_draw.vert|kGsVkDrawVertSpv|gs_vk_draw_vert.spv.h"
++                              "gs_vk_draw.frag|kGsVkDrawFragSpv|gs_vk_draw_frag.spv.h")
++            string(REPLACE "|" ";" _shl "${_sh}")
++            list(GET _shl 0 _src)
++            list(GET _shl 1 _var)
++            list(GET _shl 2 _out)
++            add_custom_command(
++                OUTPUT ${_vk_spv_dir}/${_out}
++                COMMAND ${PS2X_GLSLANG_VALIDATOR} -V --target-env vulkan1.3 --vn ${_var}
++                        -o ${_vk_spv_dir}/${_out} ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/shaders/${_src}
++                DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/shaders/${_src}
++                COMMENT "SPIR-V ${_src}"
++                VERBATIM)
++            target_sources(ps2_runtime PRIVATE ${_vk_spv_dir}/${_out})
++        endforeach()
++        target_include_directories(ps2_runtime PRIVATE ${_vk_spv_dir})
++        target_compile_definitions(ps2_runtime PRIVATE PS2X_HAVE_VK_SHADERS=1)
++    endif()
++    message(STATUS "ps2xRuntime: Vulkan GS backend enabled (${Vulkan_INCLUDE_DIRS})")
++else()
++    message(STATUS "ps2xRuntime: Vulkan GS backend disabled (PS2X_VULKAN=${PS2X_VULKAN}, Vulkan_FOUND=${Vulkan_FOUND})")
++endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
+diff --git a/ps2xRuntime/include/runtime/gs/gs_backend.h b/ps2xRuntime/include/runtime/gs/gs_backend.h
+index 3f00d01b5f4c6ba0cf2c2dd4bfab1cdc46391480..d8f14a1b6bfe37613fc73d5c5ff52b3fbf318238 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_backend.h
+@@ -3,8 +3,105 @@
+ #include "runtime/gs/gs_types.h"
+ 
+ #include <cstdint>
++#include <memory>
+ #include <vector>
+ 
++// ---- Phase 2 draw list -------------------------------------------------------------------------------------
++// A run of primitives in GIF chain order that share one complete GSDrawState (the frontend opens a new batch on
++// ANY state difference, so replaying it through Submit() is bit-identical to per-primitive submission).
++// Non-draw backend calls (LoadClut, BeginTransfer, UploadImage, Flush, Sync, Present, ClearFramebuffer, ReadVram,
++// ...) are ordering points: the frontend submits the pending list before making any of them.
++struct GSDrawListBatch
++{
++    GSDrawState state{};
++    uint32_t firstVertex = 0;  // into GSDrawList::vertices
++    uint32_t primCount = 0;
++    uint8_t vertsPerPrim = 3;  // 1 point, 2 line/sprite, 3 triangle (strips/fans are already expanded)
++    uint8_t path = 0;          // GIF path (g_ps2xGifCurPath)
++    uint8_t flags = 0;         // GSDrawListBatchFlags
++    uint8_t reserved = 0;
++    uint32_t tag = 0;          // Phase 0a draw tag (bit31 tagged, prog = tag & 0x7FF, em = (tag >> 11) & 0xFF)
++    uint32_t clutGen = 0;      // bumped by every CLUT load; part of the texture identity
++    int32_t bbox[4] = {0, 0, 0, 0}; // x0, y0, x1, y1 in frame pixels (after XYOFFSET), inclusive
++};
++
++enum GSDrawListBatchFlags : uint8_t
++{
++    kGSBatchSamplesTarget = 1u << 0, // texture pages overlap a target written since the last present (RTT)
++    kGSBatchFeedback = 1u << 1,      // texture pages overlap this batch's own FRAME/ZBUF (needs barrier/copy)
++    kGSBatchHud = 1u << 2,           // marked by the wshud rules
++};
++
++enum class GSDrawListCut : uint8_t
++{
++    None,
++    Full,      // vertex arena limit
++    Transfer,  // host->local upload / FMV
++    Readback,  // local->host
++    LocalCopy, // local->local
++    Clut,
++    TexFlush,
++    Finish,
++    Present,
++    Clear,
++    Sync,
++    Reset,
++};
++
++struct GSDrawList
++{
++    std::vector<GSVertex> vertices;
++    std::vector<GSDrawListBatch> batches;
++    uint64_t listId = 0;  // monotonically increasing
++    uint64_t frameId = 0; // present interval the list belongs to
++    GSDrawListCut cut = GSDrawListCut::None; // why the list was submitted
++
++    bool empty() const { return batches.empty(); }
++    void clear()
++    {
++        vertices.clear();
++        batches.clear();
++        cut = GSDrawListCut::None;
++    }
++};
++
++// ---- backend identity / host presentation -------------------------------------------------------------------
++enum class GSBackendKind : uint8_t
++{
++    Cpu,
++    CpuThreaded,
++    OpenGL,
++    Vulkan,
++};
++
++enum GSBackendCaps : uint32_t
++{
++    kGSCapDrawList = 1u << 0,      // SubmitList is native (not the per-primitive replay)
++    kGSCapGpu = 1u << 1,           // renders on the GPU (VRAM mirror kept in sync on readback)
++    kGSCapNativePresent = 1u << 2, // can present to a host window itself (AttachHostPresentTarget/PresentNative)
++    kGSCapUpscale = 1u << 3,       // honours SetResolutionScale
++    kGSCapAsyncReadback = 1u << 4, // local->host readbacks do not stall the producer
++};
++
++// Native window the host presenter owns; filled by the host layer for backends with kGSCapNativePresent.
++struct GSHostPresentTarget
++{
++    enum Platform : uint32_t
++    {
++        None = 0,
++        X11 = 1,     // display = Display*, window = Window (as uintptr)
++        Wayland = 2, // display = wl_display*, window = wl_surface*
++        Win32 = 3,   // display = HINSTANCE, window = HWND
++        Android = 4, // window = ANativeWindow*
++    };
++    uint32_t platform = None;
++    void *display = nullptr;
++    void *window = nullptr;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    bool vsync = true;
++};
++
+ class GSRasterBackend
+ {
+ public:
+@@ -31,4 +128,46 @@ public:
+     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
+     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
+     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
++
++    // ---- Phase 2/3 extensions (all have defaults, so existing backends are unchanged) ------------------------
++    // Draw list: default replays every primitive through Submit() in order.
++    virtual void SubmitList(const GSDrawList &list)
++    {
++        for (const GSDrawListBatch &b : list.batches)
++        {
++            GSPrimitiveBatch prim{};
++            prim.state = b.state;
++            prim.vertexCount = b.vertsPerPrim;
++            const uint32_t n = b.vertsPerPrim > 3u ? 3u : b.vertsPerPrim;
++            for (uint32_t p = 0; p < b.primCount; ++p)
++            {
++                const size_t base = static_cast<size_t>(b.firstVertex) + static_cast<size_t>(p) * b.vertsPerPrim;
++                if (base + n > list.vertices.size())
++                    break;
++                for (uint32_t v = 0; v < n; ++v)
++                    prim.vertices[v] = list.vertices[base + v];
++                Submit(prim);
++            }
++        }
++    }
++    virtual GSBackendKind Kind() const { return GSBackendKind::Cpu; }
++    virtual const char *Name() const { return "cpu"; }
++    virtual uint32_t Capabilities() const { return 0u; }
++    // Native presentation (swapchain on the host window). Return false = not supported, host keeps using pixels.
++    virtual bool AttachHostPresentTarget(const GSHostPresentTarget &target) { (void)target; return false; }
++    virtual void DetachHostPresentTarget() {}
++    virtual void ResizeHostPresentTarget(uint32_t width, uint32_t height) { (void)width; (void)height; }
++    // Internal resolution multiplier for GPU backends (1 = native PS2 resolution).
++    virtual void SetResolutionScale(uint32_t scale) { (void)scale; }
++    // Called once per host frame after presentation (stats, deferred deletion, pipeline-cache saves).
++    virtual void OnHostFrameEnd(uint64_t frameId) { (void)frameId; }
++    // Free-form debug/diagnostic hook (e.g. "stats", "capture"); returns true if handled.
++    virtual bool DebugCommand(const char *command) { (void)command; return false; }
+ };
++
++// Backend selection: PS2X_GS_BACKEND=cpu|gl|vulkan (PS2X_GS_GPU=1 still means gl). Vulkan factory is defined in
++// gs_vk_backend.cpp; it returns nullptr (and leaves `inner` untouched) when Vulkan is unavailable or fails.
++// On success it takes ownership of `inner` (used as the VRAM-accurate reference until the Vulkan renderer is
++// complete).
++std::unique_ptr<GSRasterBackend> gsCreateVulkanBackend(std::unique_ptr<GSRasterBackend> &inner);
++bool gsVulkanCompiledIn();
+diff --git a/ps2xRuntime/include/runtime/gs/gs_types.h b/ps2xRuntime/include/runtime/gs/gs_types.h
+index 836a3ff49043d936ef666f09f5e141c69d431735..04a9654daf06805d9c17ffdda4c8aeba18fc0b7a 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -298,6 +298,11 @@ struct PresentationFrame
+     uint32_t displayFbp = 0;
+     uint32_t sourceFbp = 0;
+     bool usedPreferred = false;
++    // Phase 3 (GPU backends presenting on their own): set when the backend already put this frame on screen
++    // (swapchain) so the host presenter must not upload/draw `pixels`; gpuImage is an opaque backend handle
++    // (e.g. a shared VkImage/GL texture id) the host may sample instead of `pixels`. Both default to "not used".
++    bool nativePresented = false;
++    uint64_t gpuImage = 0;
+ 
+     explicit operator bool() const
+     {
+diff --git a/ps2xRuntime/src/lib/gs/gs_drawlist.inl b/ps2xRuntime/src/lib/gs/gs_drawlist.inl
+new file mode 100644
+index 0000000000000000000000000000000000000000..42fa046e8150a270837769e6eaa68566058cd985
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_drawlist.inl
+@@ -0,0 +1,175 @@
++// Phase 2 draw list, record-only (PS2X_DRAWLIST=1; diagnostic, default off). #included at the end of gs_frontend.cpp.
++// Builds the batched draw list the frontend would hand a backend (one batch = consecutive primitives with the same
++// full GS state key, the same key the GL backend batches on) and counts per 5 s: batches, prims per batch, why each
++// batch ended (state change by field group, or a hard event: transfer, CLUT load, TEXFLUSH, FINISH, present,
++// render-to-texture), and an ideal bound: distinct keys per target segment (batches left if primitives could be
++// regrouped freely between hard events). Rendering is not changed.
++#include <array>
++#include <unordered_set>
++extern uint32_t g_ps2xDrawTag;
++namespace ps2x_drawlist
++{
++    namespace
++    {
++        enum Why { kTarget, kTexture, kBlend, kZTest, kScissor, kPrim, kUpload, kReadback, kLocalCopy, kClut, kTexFlush,
++                   kFinish, kPresent, kRtt, kFull, kWhyN };
++        const char *const kWhyName[kWhyN] = {"target", "texture", "blend", "ztest", "scissor", "prim", "upload", "readback",
++                                             "l2l", "clut", "texflush", "finish", "present", "rtt", "full"};
++        struct Key
++        {
++            uint64_t g[6]; // target, texture, blend, ztest, scissor, prim
++            bool operator==(const Key &o) const { return std::memcmp(g, o.g, sizeof(g)) == 0; }
++        };
++        struct KeyHash
++        {
++            size_t operator()(const Key &k) const
++            {
++                uint64_t h = 0x9E3779B97F4A7C15ull;
++                for (uint64_t v : k.g) h = (h ^ v) * 0xFF51AFD7ED558CCDull;
++                return static_cast<size_t>(h ^ (h >> 29));
++            }
++        };
++        std::mutex g_m;
++        bool g_open = false;
++        Key g_key{};
++        uint32_t g_tag = 0;
++        uint64_t g_batchPrims = 0;
++        std::unordered_set<Key, KeyHash> g_segKeys; // distinct keys since the last hard event / target change
++        std::unordered_set<uint32_t> g_targetsThisPresent; // FRAME.FBP (in 2048-byte pages -> block address *32)
++        struct Acc
++        {
++            uint64_t prims = 0, batches = 0, presents = 0, idealBatches = 0, tagChanges = 0, keyOnlyTag = 0;
++            uint64_t why[kWhyN] = {};
++            uint64_t hist[6] = {}; // prims per batch: 1, 2-3, 4-15, 16-63, 64-255, 256+
++        } g_acc;
++        std::chrono::steady_clock::time_point g_last = std::chrono::steady_clock::now();
++
++        Key makeKey(const GSPrimitiveBatch &b)
++        {
++            const GSDrawState &st = b.state;
++            const auto &c = st.context;
++            const auto &p = st.prim;
++            const uint8_t cls = (p.type == GS_PRIM_POINT) ? 0 : (p.type == GS_PRIM_LINE || p.type == GS_PRIM_LINESTRIP) ? 1 : 2;
++            Key k{};
++            k.g[0] = (uint64_t)c.frame.fbp | ((uint64_t)c.frame.fbw << 9) | ((uint64_t)c.frame.psm << 15) | ((uint64_t)c.zbuf.zbp << 21) |
++                     ((uint64_t)c.zbuf.psm << 30) | ((uint64_t)c.zbuf.zmask << 36) | ((uint64_t)c.frame.fbmsk << 37 ^ ((uint64_t)c.frame.fbmsk >> 27));
++            if (p.tme)
++            {
++                const auto &t = c.tex0;
++                k.g[1] = (uint64_t)t.tbp0 | ((uint64_t)t.tbw << 14) | ((uint64_t)t.psm << 20) | ((uint64_t)t.tw << 26) | ((uint64_t)t.th << 30) |
++                         ((uint64_t)t.tcc << 34) | ((uint64_t)t.tfx << 35) | ((uint64_t)t.cbp << 37) | ((uint64_t)t.cpsm << 51) |
++                         ((uint64_t)t.csm << 55) | ((uint64_t)t.csa << 56) | (1ull << 63);
++                k.g[1] ^= (uint64_t)c.clamp * 0x9E3779B97F4A7C15ull;
++                k.g[1] ^= ((uint64_t)st.texa.ta0 | ((uint64_t)st.texa.aem << 8) | ((uint64_t)st.texa.ta1 << 16) | ((uint64_t)st.linearFilter << 24)) << 3;
++            }
++            k.g[2] = (p.abe ? ((uint64_t)c.alpha | 1ull << 63) : 0ull) ^ ((uint64_t)c.fba << 62) ^ ((uint64_t)st.colclamp << 61) ^ ((uint64_t)st.pabe << 60);
++            k.g[3] = (uint64_t)c.test;
++            k.g[4] = (uint64_t)c.scissor.x0 | ((uint64_t)c.scissor.x1 << 16) | ((uint64_t)c.scissor.y0 << 32) | ((uint64_t)c.scissor.y1 << 48);
++            k.g[5] = (uint64_t)cls | ((uint64_t)((cls == 2 && p.type != GS_PRIM_SPRITE) ? p.iip : 0) << 2) | ((uint64_t)p.fge << 3) |
++                     (p.fge ? ((uint64_t)st.fogR << 8 | (uint64_t)st.fogG << 16 | (uint64_t)st.fogB << 24) : 0ull);
++            return k;
++        }
++        void closeLocked(Why why)
++        {
++            if (!g_open)
++                return;
++            g_open = false;
++            ++g_acc.batches;
++            ++g_acc.why[why];
++            const uint64_t n = g_batchPrims;
++            ++g_acc.hist[n <= 1 ? 0 : n <= 3 ? 1 : n <= 15 ? 2 : n <= 63 ? 3 : n <= 255 ? 4 : 5];
++            g_batchPrims = 0;
++        }
++        void segmentEndLocked()
++        {
++            g_acc.idealBatches += g_segKeys.size();
++            g_segKeys.clear();
++        }
++        void maybePrintLocked()
++        {
++            const auto now = std::chrono::steady_clock::now();
++            const double span = std::chrono::duration<double>(now - g_last).count();
++            if (span < 5.0)
++                return;
++            g_last = now;
++            Acc &a = g_acc;
++            const double pres = a.presents ? (double)a.presents : 1.0, bat = a.batches ? (double)a.batches : 1.0;
++            std::string why;
++            char buf[64];
++            for (int i = 0; i < kWhyN; ++i)
++                if (a.why[i])
++                {
++                    std::snprintf(buf, sizeof buf, " %s=%.1f", kWhyName[i], a.why[i] / pres);
++                    why += buf;
++                }
++            std::fprintf(stderr,
++                         "[drawlist] %.1fs presents=%llu | per present: prims=%.0f batches=%.1f ideal=%.1f tagChanges=%.1f | prims/batch=%.1f | "
++                         "batch size 1:%llu 2-3:%llu 4-15:%llu 16-63:%llu 64-255:%llu 256+:%llu | batch ends per present:%s\n",
++                         span, (unsigned long long)a.presents, a.prims / pres, a.batches / pres, a.idealBatches / pres, a.tagChanges / pres,
++                         a.prims / bat, (unsigned long long)a.hist[0], (unsigned long long)a.hist[1], (unsigned long long)a.hist[2],
++                         (unsigned long long)a.hist[3], (unsigned long long)a.hist[4], (unsigned long long)a.hist[5], why.c_str());
++            a = Acc{};
++        }
++    }
++
++    bool on()
++    {
++        static const bool v = []() { const char *e = std::getenv("PS2X_DRAWLIST"); return e && e[0] == '1'; }();
++        return v;
++    }
++
++    void onPrim(const GSPrimitiveBatch &batch)
++    {
++        const Key k = makeKey(batch);
++        const auto &c = batch.state.context;
++        std::lock_guard<std::mutex> lk(g_m);
++        ++g_acc.prims;
++        // render-to-texture: sampling a buffer that was a render target since the last present
++        const bool rtt = batch.state.prim.tme && g_targetsThisPresent.count(c.tex0.tbp0) != 0u;
++        if (g_open && !(k == g_key))
++        {
++            Why why = kPrim;
++            for (int gi = 0; gi < 6; ++gi)
++                if (k.g[gi] != g_key.g[gi]) { why = static_cast<Why>(gi); break; }
++            if (rtt && why == kTexture)
++                why = kRtt;
++            closeLocked(why);
++            if (why == kTarget || why == kRtt)
++                segmentEndLocked();
++        }
++        if (!g_open)
++        {
++            g_open = true;
++            g_key = k;
++            if (g_tag != g_ps2xDrawTag)
++                ++g_acc.tagChanges;
++            g_tag = g_ps2xDrawTag;
++        }
++        g_segKeys.insert(k);
++        g_targetsThisPresent.insert(c.frame.fbp * 32u);
++        if (++g_batchPrims >= 65536u) // the GL backend splits at kMaxBatchFloats
++            closeLocked(kFull);
++    }
++
++    // Hard events: the open batch must be drawn before them.
++    void onEvent(int why)
++    {
++        std::lock_guard<std::mutex> lk(g_m);
++        closeLocked(static_cast<Why>(why));
++        if (why != kClut && why != kTexFlush)
++            segmentEndLocked();
++    }
++    void onTransfer(uint32_t dir) { onEvent(dir == 0 ? kUpload : dir == 1 ? kReadback : kLocalCopy); }
++    void onClut() { onEvent(kClut); }
++    void onTexFlush() { onEvent(kTexFlush); }
++    void onFinish() { onEvent(kFinish); }
++    void onPresent()
++    {
++        std::lock_guard<std::mutex> lk(g_m);
++        closeLocked(kPresent);
++        segmentEndLocked();
++        g_targetsThisPresent.clear();
++        ++g_acc.presents;
++        maybePrintLocked();
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_vk_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vk_backend.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5897b19e75698a41c73aa67a873397d0cf7e6c91
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_vk_backend.cpp
+@@ -0,0 +1,496 @@
++// Vulkan GS backend, Phase 3 skeleton (PS2X_GS_BACKEND=vulkan; default renderer stays GL/CPU).
++//
++// Stage 0 (this file): instance (+ VK_LAYER_KHRONOS_validation and a debug messenger when PS2X_VK_VALIDATE=1),
++// physical-device pick (prefers RADV / discrete), one graphics queue, an offscreen colour target, and per present:
++// clear -> copy to a host-visible buffer -> PresentationFrame pixels. The host presenter (raylib/GL window) shows
++// those pixels like any other backend, so this works with PS2X_TEST_WINDOW=hidden and needs no swapchain. All GS
++// work is forwarded to the wrapped reference backend so the game keeps running correctly.
++//   PS2X_VK_CLEAR=RRGGBB   clear colour (default 2050a0)
++//   PS2X_VK_PASSTHRU=1     return the reference renderer's frame instead of the Vulkan clear (still clears/reads)
++//   PS2X_VK_DEVICE=N       force physical device index
++#include "runtime/gs/gs_backend.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <chrono>
++#include <array>
++#include <cmath>
++#include <unordered_map>
++
++#if defined(PS2X_HAVE_VULKAN) && PS2X_HAVE_VULKAN
++#include <vulkan/vulkan.h>
++#include "runtime/gs/gs_cpu_backend.h"
++#if defined(PS2X_HAVE_VK_SHADERS)
++#include "gs_vk_swizzle.spv.h"
++#include "gs_vk_draw_vert.spv.h"
++#include "gs_vk_draw_frag.spv.h"
++#endif
++
++namespace
++{
++    bool envOn(const char *n)
++    {
++        const char *e = std::getenv(n);
++        return e && e[0] == '1';
++    }
++
++    std::mutex g_vkLogMutex;
++    uint64_t g_vkValErrors = 0, g_vkValWarnings = 0;
++
++    VKAPI_ATTR VkBool32 VKAPI_CALL vkDebugCb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT,
++                                             const VkDebugUtilsMessengerCallbackDataEXT *data, void *)
++    {
++        std::lock_guard<std::mutex> lk(g_vkLogMutex);
++        const bool err = (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0;
++        if (err) ++g_vkValErrors; else ++g_vkValWarnings;
++        if (g_vkValErrors + g_vkValWarnings <= 200)
++            std::fprintf(stderr, "[gs:vk] validation %s: %s\n", err ? "ERROR" : "warning", data && data->pMessage ? data->pMessage : "?");
++        return VK_FALSE;
++    }
++
++#include "gs_vk_vram.inl"
++
++    class GSVulkanBackend final : public GSRasterBackend
++    {
++    public:
++        explicit GSVulkanBackend(std::unique_ptr<GSRasterBackend> ref) : m_ref(std::move(ref)) {}
++        ~GSVulkanBackend() override { destroy(); }
++        void setRef(std::unique_ptr<GSRasterBackend> ref) { m_ref = std::move(ref); }
++
++        bool init()
++        {
++            m_validate = envOn("PS2X_VK_VALIDATE");
++            if (const char *c = std::getenv("PS2X_VK_CLEAR"))
++                m_clear = static_cast<uint32_t>(std::strtoul(c, nullptr, 16));
++            m_passthru = envOn("PS2X_VK_PASSTHRU");
++
++            VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++            app.pApplicationName = "ps2xRuntime";
++            app.pEngineName = "ps2x-gs-vk";
++            app.apiVersion = VK_API_VERSION_1_3;
++            std::vector<const char *> layers, exts;
++            if (m_validate)
++            {
++                uint32_t n = 0;
++                vkEnumerateInstanceLayerProperties(&n, nullptr);
++                std::vector<VkLayerProperties> lp(n);
++                vkEnumerateInstanceLayerProperties(&n, lp.data());
++                bool have = false;
++                for (auto &l : lp) have |= std::strcmp(l.layerName, "VK_LAYER_KHRONOS_validation") == 0;
++                if (have) { layers.push_back("VK_LAYER_KHRONOS_validation"); exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME); }
++                else std::fprintf(stderr, "[gs:vk] PS2X_VK_VALIDATE=1 but VK_LAYER_KHRONOS_validation is not installed\n");
++            }
++            VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++            ici.pApplicationInfo = &app;
++            ici.enabledLayerCount = static_cast<uint32_t>(layers.size());
++            ici.ppEnabledLayerNames = layers.data();
++            ici.enabledExtensionCount = static_cast<uint32_t>(exts.size());
++            ici.ppEnabledExtensionNames = exts.data();
++            VkDebugUtilsMessengerCreateInfoEXT dci{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
++            dci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
++            dci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
++                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
++            dci.pfnUserCallback = vkDebugCb;
++            if (!layers.empty())
++                ici.pNext = &dci; // also covers instance create/destroy
++            if (VkResult r = vkCreateInstance(&ici, nullptr, &m_inst); r != VK_SUCCESS)
++                return fail("vkCreateInstance", r);
++            if (!layers.empty())
++            {
++                auto mk = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(vkGetInstanceProcAddr(m_inst, "vkCreateDebugUtilsMessengerEXT"));
++                if (mk) mk(m_inst, &dci, nullptr, &m_msg);
++            }
++
++            uint32_t nd = 0;
++            vkEnumeratePhysicalDevices(m_inst, &nd, nullptr);
++            if (nd == 0)
++                return fail("no Vulkan devices", VK_ERROR_INITIALIZATION_FAILED);
++            std::vector<VkPhysicalDevice> devs(nd);
++            vkEnumeratePhysicalDevices(m_inst, &nd, devs.data());
++            int best = -1, bestScore = -1;
++            const char *force = std::getenv("PS2X_VK_DEVICE");
++            for (uint32_t i = 0; i < nd; ++i)
++            {
++                VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
++                VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
++                p2.pNext = &drv;
++                vkGetPhysicalDeviceProperties2(devs[i], &p2);
++                int score = 0;
++                if (p2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score += 100;
++                else if (p2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score += 50;
++                if (drv.driverID == VK_DRIVER_ID_MESA_RADV) score += 20;
++                if (p2.properties.apiVersion < VK_API_VERSION_1_3) score = -1;
++                std::fprintf(stderr, "[gs:vk] device %u: %s (%s %s) api %u.%u score %d\n", i, p2.properties.deviceName, drv.driverName,
++                             drv.driverInfo, VK_API_VERSION_MAJOR(p2.properties.apiVersion), VK_API_VERSION_MINOR(p2.properties.apiVersion), score);
++                if (force ? (static_cast<uint32_t>(std::atoi(force)) == i) : (score > bestScore)) { best = static_cast<int>(i); bestScore = score; }
++            }
++            if (best < 0 || bestScore < 0)
++                return fail("no Vulkan 1.3 device", VK_ERROR_INCOMPATIBLE_DRIVER);
++            m_phys = devs[static_cast<size_t>(best)];
++
++            uint32_t nq = 0;
++            vkGetPhysicalDeviceQueueFamilyProperties(m_phys, &nq, nullptr);
++            std::vector<VkQueueFamilyProperties> qf(nq);
++            vkGetPhysicalDeviceQueueFamilyProperties(m_phys, &nq, qf.data());
++            m_qfam = UINT32_MAX;
++            for (uint32_t i = 0; i < nq; ++i)
++                if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { m_qfam = i; break; }
++            if (m_qfam == UINT32_MAX)
++                return fail("no graphics queue", VK_ERROR_INITIALIZATION_FAILED);
++            const float prio = 1.0f;
++            VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++            qci.queueFamilyIndex = m_qfam;
++            qci.queueCount = 1;
++            qci.pQueuePriorities = &prio;
++            VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++            f13.dynamicRendering = VK_TRUE; f13.shaderDemoteToHelperInvocation = VK_TRUE;
++            f13.synchronization2 = VK_TRUE;
++            VkDeviceCreateInfo dvci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++            dvci.pNext = &f13;
++            dvci.queueCreateInfoCount = 1;
++            dvci.pQueueCreateInfos = &qci;
++            if (VkResult r = vkCreateDevice(m_phys, &dvci, nullptr, &m_dev); r != VK_SUCCESS)
++                return fail("vkCreateDevice", r);
++            vkGetDeviceQueue(m_dev, m_qfam, 0, &m_queue);
++
++            VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++            pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++            pci.queueFamilyIndex = m_qfam;
++            if (VkResult r = vkCreateCommandPool(m_dev, &pci, nullptr, &m_pool); r != VK_SUCCESS)
++                return fail("vkCreateCommandPool", r);
++            VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++            cai.commandPool = m_pool;
++            cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++            cai.commandBufferCount = 1;
++            if (VkResult r = vkAllocateCommandBuffers(m_dev, &cai, &m_cmd); r != VK_SUCCESS)
++                return fail("vkAllocateCommandBuffers", r);
++            VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++            if (VkResult r = vkCreateFence(m_dev, &fci, nullptr, &m_fence); r != VK_SUCCESS)
++                return fail("vkCreateFence", r);
++            std::fprintf(stderr, "[gs:vk] initialized: device %d, queue family %u, validation %s\n", best, m_qfam,
++                         m_msg ? "on" : "off");
++            if (std::getenv("PS2X_VK_VRAM") == nullptr || envOn("PS2X_VK_VRAM"))
++                m_vramOn = m_vram.init(m_phys, m_dev, m_queue, m_qfam);
++            return true;
++        }
++
++        // ---- forwarded GS work -----------------------------------------------------------------------------
++        void Initialize(uint8_t *vram, uint32_t vramSize) override { m_ref->Initialize(vram, vramSize); }
++        void Reset() override { m_ref->Reset(); }
++        void Submit(const GSPrimitiveBatch &b) override
++        {
++            if (m_vramOn) { m_vram.draw(b.state.context); m_vram.drawPrim(b); }
++            if (!skipRef()) m_ref->Submit(b);
++        }
++        void SubmitList(const GSDrawList &l) override
++        {
++            const auto t0 = std::chrono::steady_clock::now();
++            if (m_vramOn)
++            {
++                for (const GSDrawListBatch &b : l.batches)
++                    m_vram.draw(b.state.context);
++                m_vram.drawList(l);
++            }
++            const auto t1 = std::chrono::steady_clock::now();
++            if (!skipRef()) m_ref->SubmitList(l);
++            m_pVk += std::chrono::duration<double, std::milli>(t1 - t0).count();
++            m_pRef += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
++        }
++        void LoadClut(const GSTex0Reg &t, const GSTexClutReg &c) override { if (m_vramOn) m_vram.loadClut(t, c); m_ref->LoadClut(t, c); }
++        void BeginTransfer(const GSTransferCommand &c) override { if (m_vramOn) m_vram.beginTransfer(c); m_ref->BeginTransfer(c); }
++        void UploadImage(const uint8_t *d, uint32_t n) override { if (m_vramOn) m_vram.upload(d, n); m_ref->UploadImage(d, n); }
++        void Flush() override { m_ref->Flush(); }
++        void TextureFlush() override { m_ref->TextureFlush(); }
++        void Sync(GSSyncReason r) override { m_ref->Sync(r); }
++        bool ClearFramebuffer(const GSContext &c, uint32_t rgba) override { if (m_vramOn) m_vram.draw(c); return m_ref->ClearFramebuffer(c, rgba); }
++        uint32_t ConsumeLocalToHostBytes(uint8_t *d, uint32_t n) override { if (n) ++m_pL2h; return m_ref->ConsumeLocalToHostBytes(d, n); }
++        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override { ++m_pRv; return m_ref->ReadVram(psm, base, bw, x, y); }
++        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t v) override { if (m_vramOn) m_vram.disownAll(); m_ref->WriteVram(psm, base, bw, x, y, v); }
++        void SnapshotVram(std::vector<uint8_t> &out) const override { ++m_pSnap; m_ref->SnapshotVram(out); }
++        GSTransferSnapshot GetTransferSnapshot() const override { return m_ref->GetTransferSnapshot(); }
++
++        GSBackendKind Kind() const override { return GSBackendKind::Vulkan; }
++        const char *Name() const override { return "vulkan"; }
++        uint32_t Capabilities() const override { return kGSCapGpu; }
++
++        PresentationFrame Present(const GSPresentationRequest &req) override
++        {
++            const auto t0 = std::chrono::steady_clock::now();
++            PresentationFrame frame;
++            // Without a comparison the reference frame only supplies metadata (size, source fbp); its present (a GL
++            // draw + readback) is refreshed every 30 presents and cached in between. PS2X_VK_REFPRES=1: every present.
++            const bool fast = m_vramOn && m_vram.renderOn() && !m_vram.comparing() && !m_refPresAll;
++            // The cached source fbp goes stale when the game flips buffers between refreshes (menus flickered: every
++            // other frame showed the buffer being drawn), so shift it by how far DISPFB's fbp has moved since.
++            const auto dfbpOf = [](const GSPresentationRequest &r) { return static_cast<uint32_t>(((r.pmode & 1u) ? r.dispfb1 : r.dispfb2) & 0x1FFu); };
++            if (!fast || m_pN % 30u == 0u || !m_haveMeta) { if (!skipRef() || !m_haveMeta) { frame = m_ref->Present(req); m_meta = frame; m_meta.pixels.clear(); m_haveMeta = true; m_metaDfbp = dfbpOf(req); } }
++            if (fast && frame.pixels.empty() && m_haveMeta)
++            {
++                std::vector<uint8_t> keep; keep.swap(frame.pixels); frame = m_meta;
++                if (!m_staleMeta && frame) frame.sourceFbp = static_cast<decltype(frame.sourceFbp)>((frame.sourceFbp + dfbpOf(req) - m_metaDfbp) & 0x1FFu);
++            }
++            const auto t1 = std::chrono::steady_clock::now();
++            if (m_vramOn)
++            {
++                std::vector<uint8_t> vk;
++                uint32_t vw = 0, vh = 0;
++                m_vram.endFrame(m_ref.get(), &req, &frame, &vk, &vw, &vh);
++                if (fast && vk.empty()) frame = m_ref->Present(req); // nothing from Vulkan: fall back
++                if (m_presDump && !vk.empty() && m_pN % 60u == 0u && m_pN >= 600u)
++                {   // debug (PS2X_VK_PRESDUMP=prefix): the presented Vulkan frame as PPM every 60 presents
++                    char path[512]; std::snprintf(path, sizeof(path), "%s_%llu.ppm", m_presDump, (unsigned long long)m_pN);
++                    if (FILE *fp = std::fopen(path, "wb"))
++                    {
++                        std::fprintf(fp, "P6\n%u %u\n255\n", vw, vh);
++                        for (size_t i = 0; i + 3 < vk.size(); i += 4) std::fwrite(&vk[i], 1, 3, fp);
++                        std::fclose(fp);
++                    }
++                }
++                const auto t2 = std::chrono::steady_clock::now();
++                m_pRefP += std::chrono::duration<double, std::milli>(t1 - t0).count();
++                m_pVkP += std::chrono::duration<double, std::milli>(t2 - t1).count();
++                if (++m_pN % 300u == 0u && m_prof)
++                {
++                    const double now = std::chrono::duration<double, std::milli>(t2.time_since_epoch()).count();
++                    std::fprintf(stderr, "[gs:vk:prof] per present over 300: wall %.2f ms | vk draws %.2f ref draws %.2f | ref present %.2f vk endFrame %.2f | l2h %llu readvram %llu snap %llu noref %d\n",
++                                 m_pWall0 ? (now - m_pWall0) / 300.0 : 0.0, m_pVk / 300.0, m_pRef / 300.0, m_pRefP / 300.0, m_pVkP / 300.0,
++                                 (unsigned long long)m_pL2h, (unsigned long long)m_pRv, (unsigned long long)m_pSnap, skipRef() ? 1 : 0);
++                    m_pWall0 = now; m_pVk = m_pRef = m_pRefP = m_pVkP = 0; m_pL2h = m_pRv = m_pSnap = 0;
++                }
++                if (m_vram.renderOn())
++                {
++                    if (!m_passthru && !vk.empty())
++                    {
++                        frame.pixels = std::move(vk);
++                        frame.width = vw;
++                        frame.height = vh;
++                    }
++                    return frame;
++                }
++            }
++            const uint32_t w = frame.width ? frame.width : 640u, h = frame.height ? frame.height : 448u;
++            std::vector<uint8_t> px;
++            if (!clearAndRead(w, h, px))
++                return frame;
++            if (++m_presents % 600u == 1u)
++                std::fprintf(stderr, "[gs:vk] presents=%llu (%ux%u clear %06x) validation errors=%llu warnings=%llu\n",
++                             static_cast<unsigned long long>(m_presents), w, h, m_clear,
++                             static_cast<unsigned long long>(g_vkValErrors), static_cast<unsigned long long>(g_vkValWarnings));
++            if (!m_passthru)
++            {
++                frame.pixels = std::move(px);
++                frame.width = w;
++                frame.height = h;
++            }
++            return frame;
++        }
++
++    private:
++        bool fail(const char *what, VkResult r)
++        {
++            std::fprintf(stderr, "[gs:vk] %s failed (VkResult %d)\n", what, static_cast<int>(r));
++            return false;
++        }
++
++        uint32_t memType(uint32_t bits, VkMemoryPropertyFlags want)
++        {
++            VkPhysicalDeviceMemoryProperties mp;
++            vkGetPhysicalDeviceMemoryProperties(m_phys, &mp);
++            for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
++                if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want)
++                    return i;
++            return UINT32_MAX;
++        }
++
++        void freeTarget()
++        {
++            if (!m_dev) return;
++            if (m_mapped) { vkUnmapMemory(m_dev, m_bufMem); m_mapped = nullptr; }
++            if (m_buf) vkDestroyBuffer(m_dev, m_buf, nullptr);
++            if (m_bufMem) vkFreeMemory(m_dev, m_bufMem, nullptr);
++            if (m_img) vkDestroyImage(m_dev, m_img, nullptr);
++            if (m_imgMem) vkFreeMemory(m_dev, m_imgMem, nullptr);
++            m_buf = VK_NULL_HANDLE; m_bufMem = VK_NULL_HANDLE; m_img = VK_NULL_HANDLE; m_imgMem = VK_NULL_HANDLE;
++            m_w = m_h = 0;
++        }
++
++        bool makeTarget(uint32_t w, uint32_t h)
++        {
++            freeTarget();
++            VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++            ii.imageType = VK_IMAGE_TYPE_2D;
++            ii.format = VK_FORMAT_R8G8B8A8_UNORM;
++            ii.extent = {w, h, 1};
++            ii.mipLevels = 1;
++            ii.arrayLayers = 1;
++            ii.samples = VK_SAMPLE_COUNT_1_BIT;
++            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
++            ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++            ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++            if (vkCreateImage(m_dev, &ii, nullptr, &m_img) != VK_SUCCESS) return false;
++            VkMemoryRequirements mr;
++            vkGetImageMemoryRequirements(m_dev, m_img, &mr);
++            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++            ai.allocationSize = mr.size;
++            ai.memoryTypeIndex = memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++            if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(m_dev, &ai, nullptr, &m_imgMem) != VK_SUCCESS) return false;
++            vkBindImageMemory(m_dev, m_img, m_imgMem, 0);
++
++            VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++            bi.size = static_cast<VkDeviceSize>(w) * h * 4u;
++            bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++            if (vkCreateBuffer(m_dev, &bi, nullptr, &m_buf) != VK_SUCCESS) return false;
++            vkGetBufferMemoryRequirements(m_dev, m_buf, &mr);
++            ai.allocationSize = mr.size;
++            ai.memoryTypeIndex = memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++            if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(m_dev, &ai, nullptr, &m_bufMem) != VK_SUCCESS) return false;
++            vkBindBufferMemory(m_dev, m_buf, m_bufMem, 0);
++            if (vkMapMemory(m_dev, m_bufMem, 0, VK_WHOLE_SIZE, 0, &m_mapped) != VK_SUCCESS) return false;
++            m_w = w; m_h = h;
++            return true;
++        }
++
++        bool clearAndRead(uint32_t w, uint32_t h, std::vector<uint8_t> &out)
++        {
++            std::lock_guard<std::mutex> lk(m_mutex);
++            if (!m_dev || m_broken) return false;
++            if ((w != m_w || h != m_h) && !makeTarget(w, h)) { m_broken = true; fail("target allocation", VK_ERROR_OUT_OF_DEVICE_MEMORY); return false; }
++            vkResetCommandBuffer(m_cmd, 0);
++            VkCommandBufferBeginInfo bb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++            bb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++            vkBeginCommandBuffer(m_cmd, &bb);
++            VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++            b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++            b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            b.image = m_img;
++            b.subresourceRange = rng;
++            vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
++            VkClearColorValue cc{};
++            cc.float32[0] = ((m_clear >> 16) & 0xFF) / 255.0f;
++            cc.float32[1] = ((m_clear >> 8) & 0xFF) / 255.0f;
++            cc.float32[2] = (m_clear & 0xFF) / 255.0f;
++            cc.float32[3] = 1.0f;
++            vkCmdClearColorImage(m_cmd, m_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &rng);
++            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++            vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
++            VkBufferImageCopy cp{};
++            cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++            cp.imageExtent = {w, h, 1};
++            vkCmdCopyImageToBuffer(m_cmd, m_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_buf, 1, &cp);
++            VkBufferMemoryBarrier hb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
++            hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++            hb.srcQueueFamilyIndex = hb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            hb.buffer = m_buf;
++            hb.size = VK_WHOLE_SIZE;
++            vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hb, 0, nullptr);
++            vkEndCommandBuffer(m_cmd);
++            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++            si.commandBufferCount = 1;
++            si.pCommandBuffers = &m_cmd;
++            if (VkResult r = vkQueueSubmit(m_queue, 1, &si, m_fence); r != VK_SUCCESS) { m_broken = true; return fail("vkQueueSubmit", r); }
++            vkWaitForFences(m_dev, 1, &m_fence, VK_TRUE, UINT64_MAX);
++            vkResetFences(m_dev, 1, &m_fence);
++            const uint8_t *src = static_cast<const uint8_t *>(m_mapped);
++            out.assign(src, src + static_cast<size_t>(w) * h * 4u);
++            return true;
++        }
++
++        void destroy()
++        {
++            if (m_dev)
++            {
++                vkDeviceWaitIdle(m_dev);
++                m_vram.destroy();
++                freeTarget();
++                if (m_fence) vkDestroyFence(m_dev, m_fence, nullptr);
++                if (m_pool) vkDestroyCommandPool(m_dev, m_pool, nullptr);
++                vkDestroyDevice(m_dev, nullptr);
++                m_dev = VK_NULL_HANDLE;
++            }
++            if (m_inst)
++            {
++                if (m_msg)
++                {
++                    std::fprintf(stderr, "[gs:vk] shutdown: presents=%llu validation errors=%llu warnings=%llu\n",
++                                 static_cast<unsigned long long>(m_presents), static_cast<unsigned long long>(g_vkValErrors),
++                                 static_cast<unsigned long long>(g_vkValWarnings));
++                    auto d = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(vkGetInstanceProcAddr(m_inst, "vkDestroyDebugUtilsMessengerEXT"));
++                    if (d) d(m_inst, m_msg, nullptr);
++                    m_msg = VK_NULL_HANDLE;
++                }
++                vkDestroyInstance(m_inst, nullptr);
++                m_inst = VK_NULL_HANDLE;
++            }
++        }
++
++        std::unique_ptr<GSRasterBackend> m_ref;
++        // profiling (PS2X_VK_PROF=1) and PS2X_VK_NOREF=1: Vulkan alone, the wrapped reference renderer only gets
++        // transfers/CLUT (no draws, no present), so its VRAM lacks drawn pixels (counters show if the game reads it back)
++        bool skipRef() const { return m_noRef && m_vramOn && m_vram.renderOn() && !m_vram.comparing(); }
++        uint32_t m_metaDfbp = 0;
++        bool m_staleMeta = std::getenv("PS2X_VK_STALEMETA") != nullptr; // debug: old behaviour (cached source fbp)
++        bool m_prof = std::getenv("PS2X_VK_PROF") != nullptr, m_noRef = std::getenv("PS2X_VK_NOREF") != nullptr;
++        double m_pVk = 0, m_pRef = 0, m_pRefP = 0, m_pVkP = 0, m_pWall0 = 0;
++        uint64_t m_pN = 0;
++        bool m_refPresAll = std::getenv("PS2X_VK_REFPRES") && std::getenv("PS2X_VK_REFPRES")[0] == '1', m_haveMeta = false;
++        const char *m_presDump = std::getenv("PS2X_VK_PRESDUMP");
++        PresentationFrame m_meta;
++        mutable uint64_t m_pL2h = 0, m_pRv = 0, m_pSnap = 0;
++        VkVramMirror m_vram;
++        bool m_vramOn = false;
++        std::mutex m_mutex;
++        bool m_validate = false, m_passthru = false, m_broken = false;
++        uint32_t m_clear = 0x2050a0u;
++        uint64_t m_presents = 0;
++        VkInstance m_inst = VK_NULL_HANDLE;
++        VkDebugUtilsMessengerEXT m_msg = VK_NULL_HANDLE;
++        VkPhysicalDevice m_phys = VK_NULL_HANDLE;
++        VkDevice m_dev = VK_NULL_HANDLE;
++        VkQueue m_queue = VK_NULL_HANDLE;
++        uint32_t m_qfam = 0;
++        VkCommandPool m_pool = VK_NULL_HANDLE;
++        VkCommandBuffer m_cmd = VK_NULL_HANDLE;
++        VkFence m_fence = VK_NULL_HANDLE;
++        VkImage m_img = VK_NULL_HANDLE;
++        VkDeviceMemory m_imgMem = VK_NULL_HANDLE;
++        VkBuffer m_buf = VK_NULL_HANDLE;
++        VkDeviceMemory m_bufMem = VK_NULL_HANDLE;
++        void *m_mapped = nullptr;
++        uint32_t m_w = 0, m_h = 0;
++    };
++}
++
++std::unique_ptr<GSRasterBackend> gsCreateVulkanBackend(std::unique_ptr<GSRasterBackend> &inner)
++{
++    if (!inner)
++        return nullptr;
++    auto vk = std::make_unique<GSVulkanBackend>(nullptr);
++    if (!vk->init())
++        return nullptr; // `inner` untouched
++    vk->setRef(std::move(inner));
++    return vk;
++}
++
++bool gsVulkanCompiledIn() { return true; }
++
++#else // !PS2X_HAVE_VULKAN
++
++std::unique_ptr<GSRasterBackend> gsCreateVulkanBackend(std::unique_ptr<GSRasterBackend> &) { return nullptr; }
++bool gsVulkanCompiledIn() { return false; }
++
++#endif
+diff --git a/ps2xRuntime/src/lib/gs/gs_vk_render.inl b/ps2xRuntime/src/lib/gs/gs_vk_render.inl
+new file mode 100644
+index 0000000000000000000000000000000000000000..d72019151f5f9b13c2ffc88e0949fd15e3847b47
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_vk_render.inl
+@@ -0,0 +1,1062 @@
++// Vulkan GS renderer (Phase 3 steps 3-6). Textually #included INSIDE class VkVramMirror (gs_vk_vram.inl) so it
++// shares the VRAM buffer, LUTs, descriptor set, command buffer and mutex: uploads (compute) and draws (graphics)
++// are recorded into one command stream in GS event order.
++//   pipeline key  = topology | blend (eq, src, dst) | depth (test, op, write) | colour write mask
++//   render target = Vulkan RGBA8 image per FRAME (fbp, fbw, psm) + D32 per ZBUF (zbp, fbw, psm), GENERAL layout
++//   draws         = GSDrawList batches, vertices expanded on the CPU into a 64 MB ring, textures read in the
++//                   fragment shader straight from the VRAM buffer (+ CLUT at CBP)
++// Not yet: render-to-texture (textures only see uploaded data), target <-> VRAM sync, DATE, FB/ZB-only alpha fail,
++// PABE, AA1, CLD buffering, mipmaps, bilinear.
++public:
++    bool renderOn() const { return m_rOn; }
++    bool comparing() const { return m_cmpEvery != 0u || m_checkEvery != 0u; }
++    struct RStats { uint64_t batches = 0, draws = 0, verts = 0, pipelines = 0, targets = 0, passes = 0, skipped = 0, writebacks = 0, seeds = 0, xsync = 0, rtt = 0; };
++
++    void drawList(const GSDrawList &l)
++    {
++        if (!m_rOn) return;
++        std::lock_guard<std::mutex> lk(m_m);
++        waitInFlight();
++        for (const GSDrawListBatch &b : l.batches)
++            drawBatchLocked(b, l.vertices.data() + b.firstVertex, static_cast<size_t>(b.primCount) * b.vertsPerPrim);
++    }
++    void drawPrim(const GSPrimitiveBatch &prim)
++    {
++        if (!m_rOn) return;
++        std::lock_guard<std::mutex> lk(m_m);
++        waitInFlight();
++        GSDrawListBatch b;
++        b.state = prim.state;
++        b.primCount = 1;
++        b.vertsPerPrim = prim.vertexCount > 3 ? 3 : prim.vertexCount;
++        drawBatchLocked(b, prim.vertices.data(), b.vertsPerPrim);
++    }
++
++private:
++    struct RTarget { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; uint32_t w = 0, h = 0; bool depth = false; uint64_t lastF = 0, draws = 0; uint32_t dirtyRows = 0, hiRows = 0, dirtyLo = 0xFFFFFFFFu, loRows = 0xFFFFFFFFu; bool stale = false; uint64_t seq = 0; };
++    static constexpr uint32_t kRing = 64u * 1024u * 1024u;
++    static constexpr uint32_t kRows = 1024u;
++    static constexpr uint32_t kFloats = 12u;
++
++    bool renderInit()
++    {
++        if (const char *e = std::getenv("PS2X_VK_RENDER"); e && e[0] == '0')
++            return false;
++        if (const char *e = std::getenv("PS2X_VK_CMP"))
++            m_cmpEvery = static_cast<uint32_t>(std::max(0, std::atoi(e)));
++        if (const char *e = std::getenv("PS2X_VK_ALIAS"); e && e[0] == '0') m_noAlias = true;
++        if (const char *e = std::getenv("PS2X_VK_WB"); e && e[0] == '0') m_noWb = true;
++        if (const char *e = std::getenv("PS2X_VK_CLUT"); e && e[0] == '0') m_noClut = true;
++        if (const char *e = std::getenv("PS2X_VK_WB16"); e && e[0] == '0') m_noWb16 = true;
++        if (const char *e = std::getenv("PS2X_VK_SEED"); e && e[0] == '0') m_noSeed = true;
++        if (const char *e = std::getenv("PS2X_VK_XSYNC"); e && e[0] == '0') m_noXsync = true;
++        if (const char *e = std::getenv("PS2X_VK_ZKEYPSM"); e && e[0] == '1') m_zkeyPsm = true;
++        if (const char *e = std::getenv("PS2X_VK_TRACE")) m_traceFrame = std::strtoull(e, nullptr, 10);
++        if (const char *e = std::getenv("PS2X_VK_ZFIX"); e && e[0] == '0') m_zfixOff = true;
++        if (!buffer(kRing, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, m_ring, m_ringMem, &m_ringMap) ||
++            !presBuf(0) || !presBuf(1))
++            return false;
++        m_pres = m_presB[0]; m_presMem = m_presMemB[0]; m_presMap = m_presMapB[0];
++        auto mod = [&](const uint32_t *code, size_t size) {
++            VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++            sm.codeSize = size;
++            sm.pCode = code;
++            VkShaderModule m = VK_NULL_HANDLE;
++            vkCreateShaderModule(m_dev, &sm, nullptr, &m);
++            return m;
++        };
++        m_vs = mod(kGsVkDrawVertSpv, sizeof(kGsVkDrawVertSpv));
++        m_fs = mod(kGsVkDrawFragSpv, sizeof(kGsVkDrawFragSpv));
++        VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};
++        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++        pl.setLayoutCount = 1;
++        pl.pSetLayouts = &m_dsl;
++        pl.pushConstantRangeCount = 1;
++        pl.pPushConstantRanges = &pr;
++        VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
++        if (!m_vs || !m_fs || vkCreatePipelineLayout(m_dev, &pl, nullptr, &m_gpl) != VK_SUCCESS ||
++            vkCreatePipelineCache(m_dev, &pci, nullptr, &m_pcache) != VK_SUCCESS)
++            return false;
++        m_rOn = true;
++        std::fprintf(stderr, "[gs:vk] renderer on (draw list -> pipelines keyed by topology/blend/depth/mask, textures from VRAM buffer)%s\n",
++                     m_cmpEvery ? ", comparing with the reference frame" : "");
++        return true;
++    }
++
++    void renderDestroy()
++    {
++        if (!m_dev) return;
++        for (auto &kv : m_pipes) vkDestroyPipeline(m_dev, kv.second, nullptr);
++        m_pipes.clear();
++        auto killT = [&](RTarget &t) { if (t.view) vkDestroyImageView(m_dev, t.view, nullptr); if (t.img) vkDestroyImage(m_dev, t.img, nullptr); if (t.mem) vkFreeMemory(m_dev, t.mem, nullptr); };
++        for (auto &kv : m_colorT) killT(kv.second);
++        for (auto &kv : m_depthT) killT(kv.second);
++        m_colorT.clear(); m_depthT.clear();
++        if (m_pcache) vkDestroyPipelineCache(m_dev, m_pcache, nullptr);
++        if (m_gpl) vkDestroyPipelineLayout(m_dev, m_gpl, nullptr);
++        if (m_vs) vkDestroyShaderModule(m_dev, m_vs, nullptr);
++        if (m_fs) vkDestroyShaderModule(m_dev, m_fs, nullptr);
++        auto kill = [&](VkBuffer &b, VkDeviceMemory &m) { if (b) vkDestroyBuffer(m_dev, b, nullptr); if (m) vkFreeMemory(m_dev, m, nullptr); b = VK_NULL_HANDLE; m = VK_NULL_HANDLE; };
++        kill(m_ring, m_ringMem); kill(m_presB[0], m_presMemB[0]); kill(m_presB[1], m_presMemB[1]); m_pres = VK_NULL_HANDLE; m_presMem = VK_NULL_HANDLE;
++        m_rOn = false;
++    }
++
++    // Address aliasing: a buffer at fbp that lies inside an existing same-width/format target (e.g. the second
++    // half of a double-buffered frame) is drawn into that target at a row offset instead of a new image.
++    static uint32_t pageRows(uint32_t psm) { return (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S || psm == 0x32u || psm == 0x3Au) ? 64u : 32u; }
++    uint64_t aliasKey(uint64_t key, bool depth, uint32_t &off)
++    {
++        off = 0;
++        auto &map = depth ? m_depthT : m_colorT;
++        if (map.count(key) || m_noAlias) return key;
++        const uint32_t fbp = key & 0x1FFu, fbw = std::max<uint32_t>((key >> 9) & 0x3Fu, 1u), psm = (key >> 15) & 0x3Fu;
++        uint64_t best = key; uint32_t bestOff = 0;
++        for (auto &kv : map)
++        {
++            if ((kv.first >> 9) != (key >> 9)) continue;
++            const uint32_t b = kv.first & 0x1FFu;
++            if (b >= fbp || (fbp - b) % fbw) continue;
++            const uint32_t o = (fbp - b) / fbw * pageRows(psm);
++            if (o + 224u > kRows) continue;
++            if (best == key || o < bestOff) { best = kv.first; bestOff = o; }
++        }
++        off = bestOff;
++        return best;
++    }
++
++    // Render-to-texture: copy a dirty CT32/CT24 colour target back into the VRAM mirror (swizzled) so later
++    // texture/CLUT reads of that memory see what was drawn. PS2X_VK_WB=0 disables.
++    void writeBackLocked(uint64_t key, RTarget &t)
++    {
++        const uint32_t psm = (key >> 15) & 0x3Fu, hi = std::min(t.dirtyRows, t.h), lo = std::min(t.dirtyLo, hi), rows = hi - lo;
++        t.dirtyRows = 0; t.dirtyLo = 0xFFFFFFFFu;
++        const bool is16 = psm == GS_PSM_CT16 || psm == GS_PSM_CT16S;
++        if ((psm != GS_PSM_CT32 && psm != GS_PSM_CT24 && !(is16 && !m_noWb16)) || rows == 0) return;
++        const Fmt f = fmt(psm);
++        if (!f.ok) return;
++        const uint32_t bytes = t.w * rows * 4u, alloc = (bytes + 255u) & ~255u;
++        if (alloc > kStaging) return;
++        endRenderingLocked();
++        if (m_stageUsed + alloc > kStaging) { if (m_begun) submitWait(); m_stageUsed = 0; }
++        ensureCompute();
++        VkBufferImageCopy cp{};
++        cp.bufferOffset = m_stageUsed;
++        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        cp.imageOffset = {0, static_cast<int32_t>(lo), 0};
++        cp.imageExtent = {t.w, rows, 1};
++        if (m_scale > 1)
++        {   // scaled target: nearest downsample into the 1x scratch image first (picks the texel at x*N + N/2)
++            scaleBlitLocked(t.img, 0, lo * m_scale, t.w * m_scale, rows * m_scale, m_scrImg, 0, 0, t.w, rows);
++            cp.imageOffset = {0, 0, 0};
++            vkCmdCopyImageToBuffer(m_cmd, m_scrImg, VK_IMAGE_LAYOUT_GENERAL, m_stage, 1, &cp);
++        }
++        else
++            vkCmdCopyImageToBuffer(m_cmd, t.img, VK_IMAGE_LAYOUT_GENERAL, m_stage, 1, &cp);
++        barrier();
++        PC pc{};
++        pc.ioBitBase = static_cast<uint32_t>(m_stageUsed * 8u);
++        pc.firstPixel = 0; pc.count = t.w * rows;
++        pc.srcBits = 32; pc.lutBase = f.lut; pc.pw = f.pw; pc.ph = f.ph;
++        pc.ppr = std::max<uint32_t>(1u, t.w / f.pw);
++        pc.baseBits = (static_cast<uint32_t>(key & 0x1FFu) * 65536u) & 0x1FFFFFFu;
++        pc.dsax = 0; pc.dsay = lo; pc.rrw = t.w;
++        pc.nbits = f.nbits; pc.shift = f.shift; pc.mode = is16 ? 4u : 2u;
++        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
++        vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pl, 0, 1, &m_set, 0, nullptr);
++        vkCmdPushConstants(m_cmd, m_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
++        vkCmdDispatch(m_cmd, (pc.count + 63u) / 64u, 1, 1);
++        barrier();
++        m_stageUsed += alloc;
++        ++m_rs.writebacks;
++    }
++    // VRAM -> target image (unswizzle + convert in compute, then buffer->image copy). PS2X_VK_SEED=0 disables.
++    void seedLocked(uint64_t key, RTarget &t, uint32_t rows, uint32_t y0 = 0)
++    {
++        const uint32_t psm = (key >> 15) & 0x3Fu;
++        const Fmt f = fmt(psm);
++        rows = std::min(rows, t.h);
++        if (!f.ok || rows <= y0) return;
++        const uint32_t bytes = t.w * (rows - y0) * 4u, alloc = (bytes + 255u) & ~255u;
++        if (alloc > kStaging) return;
++        endRenderingLocked();
++        if (m_stageUsed + alloc > kStaging) { if (m_begun) submitWait(); m_stageUsed = 0; }
++        ensureCompute();
++        PC pc{};
++        pc.ioBitBase = static_cast<uint32_t>(m_stageUsed / 4u);
++        pc.firstPixel = t.w * y0; pc.count = t.w * (rows - y0);
++        pc.srcBits = 32; pc.lutBase = f.lut; pc.pw = f.pw; pc.ph = f.ph;
++        pc.ppr = std::max<uint32_t>(1u, t.w / f.pw);
++        pc.baseBits = (static_cast<uint32_t>(key & 0x1FFu) * 65536u) & 0x1FFFFFFu;
++        pc.dsax = 0; pc.dsay = 0; pc.rrw = t.w;
++        pc.nbits = f.nbits; pc.shift = f.shift; pc.mode = 5;
++        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
++        vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pl, 0, 1, &m_set, 0, nullptr);
++        vkCmdPushConstants(m_cmd, m_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
++        vkCmdDispatch(m_cmd, (pc.count + 63u) / 64u, 1, 1);
++        barrier();
++        VkBufferImageCopy cp{};
++        cp.bufferOffset = m_stageUsed;
++        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        cp.imageOffset = {0, static_cast<int32_t>(y0), 0};
++        cp.imageExtent = {t.w, rows - y0, 1};
++        if (m_scale > 1)
++        {   // scaled target: 1x rows into the scratch image, then a nearest upsample (each texel -> N x N block)
++            cp.imageOffset = {0, 0, 0};
++            vkCmdCopyBufferToImage(m_cmd, m_stage, m_scrImg, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
++            barrier();
++            scaleBlitLocked(m_scrImg, 0, 0, t.w, rows - y0, t.img, 0, y0 * m_scale, t.w * m_scale, (rows - y0) * m_scale);
++        }
++        else
++            vkCmdCopyBufferToImage(m_cmd, m_stage, t.img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
++        barrier();
++        m_stageUsed += alloc;
++        ++m_rs.seeds;
++    }
++    // A host->local transfer into memory covered by a colour target: write the target back first (so it can't clobber
++    // the upload later), then re-seed it after the upload.
++    void preUploadLocked(uint64_t b, uint64_t e) { if (m_rOn && !m_noWb) writeBackRangeLocked(b, e); }
++    void postUploadLocked(uint64_t b, uint64_t e)
++    {
++        if (!m_rOn || m_noSeed) return;
++        for (auto &kv : m_colorT)
++        {
++            RTarget &t = kv.second;
++            if (!t.hiRows) continue;
++            const uint32_t kp = (kv.first >> 15) & 0x3Fu, bpp = (kp == GS_PSM_CT16 || kp == GS_PSM_CT16S) ? 2u : 4u;
++            const uint64_t tb = static_cast<uint64_t>(kv.first & 0x1FFu) * 8192u, te = tb + static_cast<uint64_t>(t.w) * t.hiRows * bpp;
++            if (b < te && tb < e) t.stale = true; // re-seeded lazily before the next draw into it or present
++        }
++    }
++    static uint32_t texBits(uint32_t psm)
++    {
++        switch (psm) { case 0x02: case 0x0A: case 0x32: case 0x3A: return 16u; case 0x13: return 8u; case 0x14: return 4u; default: return 32u; }
++    }
++    // debug (PS2X_VK_SPRDUMP=prefix): at the final display sprite, decode VRAM fbp 0x46/w10/CT32 (left) next to
++    // target 01400 rows 224.. (right) -> prefix_<frame>.ppm, every 60th frame from 1200, at most 8 dumps
++    // debug (PS2X_VK_PROBE=1 with PS2X_VK_TRACE): after every draw in the trace window, copy 8 rows (240..247) of the
++    // 3D target 0x1400 into a readback slot; the means are printed after the next submit (no extra waits).
++    struct ProbeSlot { unsigned long long f; unsigned long long ckey; uint32_t n; unsigned long long test; };
++    std::vector<ProbeSlot> m_probe;
++    void probeLocked(uint64_t ckey, uint32_t n, uint64_t test)
++    {
++        auto it = m_colorT.find(0x1400ull);
++        if (it == m_colorT.end() || m_probe.size() >= 400) return;
++        RTarget &t = it->second;
++        if (t.w < 640 || t.h < 248) return;
++        endRenderingLocked();
++        ensureCompute();
++        VkBufferImageCopy cp{};
++        cp.bufferOffset = m_probe.size() * 20480ull;
++        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        cp.imageOffset = {0, 240, 0};
++        cp.imageExtent = {640, 8, 1};
++        cp.bufferRowLength = 640;
++        barrier(true);
++        vkCmdCopyImageToBuffer(m_cmd, t.img, VK_IMAGE_LAYOUT_GENERAL, m_rb, 1, &cp);
++        barrier(true);
++        m_probe.push_back({(unsigned long long)(m_rFrames + 1), (unsigned long long)ckey, n, (unsigned long long)test});
++    }
++    void probePrint()
++    {
++        for (size_t s = 0; s < m_probe.size(); ++s)
++        {
++            const uint8_t *im = static_cast<const uint8_t *>(m_rbMap) + s * 20480u;
++            double r = 0, g = 0, b = 0;
++            for (uint32_t i = 0; i < 640u * 8u; ++i) { r += im[i * 4]; g += im[i * 4 + 1]; b += im[i * 4 + 2]; }
++            const double k = 1.0 / (640.0 * 8.0);
++            std::fprintf(stderr, "[gs:vk:probe] f%llu ckey %llx n%u test %llx top %.0f,%.0f,%.0f\n", m_probe[s].f, m_probe[s].ckey, m_probe[s].n, m_probe[s].test, r * k, g * k, b * k);
++        }
++        m_probe.clear();
++    }
++    void spriteDumpLocked(const char *tag = "")
++    {
++        static const char *pre = std::getenv("PS2X_VK_SPRDUMP");
++        static int done = 0;
++        const bool inTr = m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8; // debug: dump every sprite (and after the sky) inside the trace window
++        if (!pre || done >= 32 || (!inTr && (m_rFrames < 1200 || (m_rFrames / 3) % 20 != 0 || m_rFrames == m_sprDumpF))) return;
++        auto it = m_colorT.find(0x1400ull);
++        if (it == m_colorT.end()) return;
++        m_sprDumpF = m_rFrames; ++done;
++        RTarget &t = it->second;
++        const uint32_t w = 640, h = 448, off = 224;
++        if (t.w < w || t.h < off + h) return;
++        ensureCompute();
++        VkBufferCopy c0{0, 0, kVram};
++        vkCmdCopyBuffer(m_cmd, m_vram, m_rb, 1, &c0);
++        VkBufferImageCopy cp{};
++        cp.bufferOffset = kVram;
++        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        cp.imageOffset = {0, static_cast<int32_t>(off), 0};
++        cp.imageExtent = {w, h, 1};
++        cp.bufferRowLength = t.w;
++        vkCmdCopyImageToBuffer(m_cmd, t.img, VK_IMAGE_LAYOUT_GENERAL, m_rb, 1, &cp);
++        barrier(true);
++        submitWait();
++        m_stageUsed = 0;
++        const uint32_t *mv = static_cast<const uint32_t *>(m_rbMap);
++        const uint8_t *im = static_cast<const uint8_t *>(m_rbMap) + kVram;
++        const Fmt f = fmt(GS_PSM_CT32);
++        char path[512]; std::snprintf(path, sizeof(path), "%s_%llu%s.ppm", pre, (unsigned long long)m_rFrames, tag);
++        FILE *fp = std::fopen(path, "wb");
++        if (!fp) return;
++        std::fprintf(fp, "P6\n%u %u\n255\n", w * 2, h);
++        const uint32_t ppr = 640u / f.pw;
++        for (uint32_t y = 0; y < h; ++y)
++        {
++            for (uint32_t x = 0; x < w; ++x)
++            {
++                const uint32_t page = (y / f.ph) * ppr + x / f.pw;
++                const uint32_t bit = (0x46u * 65536u + page * 65536u + m_lut[f.lut + (y % f.ph) * f.pw + (x % f.pw)]) & 0x1FFFFFFu;
++                const uint32_t v = mv[bit >> 5];
++                const uint8_t px[3] = {uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16)};
++                std::fwrite(px, 1, 3, fp);
++            }
++            for (uint32_t x = 0; x < w; ++x) std::fwrite(im + (size_t(y) * t.w + x) * 4u, 1, 3, fp);
++        }
++        std::fclose(fp);
++        std::fprintf(stderr, "[gs:vk:sprdump] %s dirty %u..%u hi %u\n", path, t.dirtyLo, t.dirtyRows, t.hiRows);
++    }
++    uint64_t m_sprDumpF = 0;
++    // nearest blit between images in GENERAL layout (scale changes for write-back / seed)
++    void scaleBlitLocked(VkImage src, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, VkImage dst, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh)
++    {
++        VkImageBlit bl{};
++        bl.srcSubresource = bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        bl.srcOffsets[0] = {static_cast<int32_t>(sx), static_cast<int32_t>(sy), 0};
++        bl.srcOffsets[1] = {static_cast<int32_t>(sx + sw), static_cast<int32_t>(sy + sh), 1};
++        bl.dstOffsets[0] = {static_cast<int32_t>(dx), static_cast<int32_t>(dy), 0};
++        bl.dstOffsets[1] = {static_cast<int32_t>(dx + dw), static_cast<int32_t>(dy + dh), 1};
++        vkCmdBlitImage(m_cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
++        barrier();
++    }
++    // Render-to-texture at scale > 1: a CT32/CT24 texture that lies inside a colour target (same width, row aligned,
++    // sampled area within rows the target has drawn, no newer overlapping target) is read from the scaled image
++    // (copied to the binding-4 RTT image) instead of the 1x VRAM mirror, so post passes keep the detail.
++    bool rttFindLocked(const GSContext &c, float umin, float vmin, float umax, float vmax, uint64_t &key, uint32_t &rowOff)
++    {
++        if (m_scale <= 1 || s_vkNoRtt()) return false;
++        if (c.tex0.psm != GS_PSM_CT32 && c.tex0.psm != GS_PSM_CT24) return false;
++        if (umin < -0.5f || vmin < -0.5f) return false;
++        const uint32_t tbw = std::max<uint32_t>(c.tex0.tbw, 1u);
++        const uint64_t tb = static_cast<uint64_t>(c.tex0.tbp0) * 256u;
++        const RTarget *best = nullptr;
++        for (auto &kv : m_colorT)
++        {
++            const RTarget &t = kv.second;
++            if (((kv.first >> 15) & 0x3Fu) != GS_PSM_CT32 || ((kv.first >> 9) & 0x3Fu) != tbw || !t.hiRows || t.w != tbw * 64u) continue;
++            const uint64_t base = static_cast<uint64_t>(kv.first & 0x1FFu) * 8192u, rb = static_cast<uint64_t>(t.w) * 4u;
++            if (tb < base || (tb - base) % rb) continue;
++            const uint64_t ro = (tb - base) / rb;
++            if (umax > static_cast<float>(t.w) || ro + static_cast<uint64_t>(std::ceil(vmax)) > t.hiRows) continue;
++            if (!best || t.seq > best->seq) { best = &t; key = kv.first; rowOff = static_cast<uint32_t>(ro); }
++        }
++        if (!best) return false;
++        const uint64_t b0 = tb, b1 = tb + static_cast<uint64_t>(best->w) * 4u * static_cast<uint64_t>(std::ceil(vmax));
++        for (auto &kv : m_colorT)
++        {   // a newer target drew over the same memory: VRAM (merged) is the authority
++            if (kv.first == key || kv.second.seq <= best->seq || !kv.second.hiRows) continue;
++            const uint32_t op = (kv.first >> 15) & 0x3Fu, obpp = (op == GS_PSM_CT16 || op == GS_PSM_CT16S) ? 2u : 4u;
++            const uint64_t ob = static_cast<uint64_t>(kv.first & 0x1FFu) * 8192u, oe = ob + static_cast<uint64_t>(kv.second.w) * kv.second.hiRows * obpp;
++            if (ob < b1 && b0 < oe) return false;
++        }
++        return true;
++    }
++    static bool s_vkNoRtt() { static const bool v = [] { const char *e = std::getenv("PS2X_VK_SCALE_RTT"); return e && e[0] == '0'; }(); return v; }
++    void writeBackOverlapsLocked(const GSContext &c)
++    {
++        const uint64_t tb = static_cast<uint64_t>(c.tex0.tbp0) * 256u;
++        const uint64_t te = tb + static_cast<uint64_t>(std::max<uint32_t>(c.tex0.tbw, 1u)) * 64u * (1ull << std::min<uint32_t>(c.tex0.th, 10u)) * texBits(c.tex0.psm) / 8u;
++        writeBackRangeLocked(tb, te);
++    }
++    bool dirtySpan(uint64_t key, const RTarget &t, uint64_t &b, uint64_t &e) const
++    {
++        if (t.dirtyRows <= std::min(t.dirtyLo, t.dirtyRows)) return false;
++        const uint32_t kp = (key >> 15) & 0x3Fu, bpp = (kp == GS_PSM_CT16 || kp == GS_PSM_CT16S) ? 2u : 4u;
++        const uint64_t base = static_cast<uint64_t>(key & 0x1FFu) * 8192u;
++        b = base + static_cast<uint64_t>(t.w) * t.dirtyLo * bpp; e = base + static_cast<uint64_t>(t.w) * t.dirtyRows * bpp;
++        return true;
++    }
++    // Write back every dirty target overlapping [tb,te), oldest draw first so the newest content wins; older dirty
++    // targets overlapping a written-back one are superseded (dropped) so they can't clobber it later.
++    void writeBackRangeLocked(uint64_t tb, uint64_t te)
++    {
++        std::vector<std::pair<uint64_t, uint64_t>> hit; // (seq, key)
++        for (auto &kv : m_colorT)
++        {
++            uint64_t b, e;
++            if (dirtySpan(kv.first, kv.second, b, e) && tb < e && b < te) hit.emplace_back(kv.second.seq, kv.first);
++        }
++        if (m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 2 && tb == 0x2bc0ull * 256u)
++        {   // debug: what the shadow-map read (tbp 0x2bc0) writes back
++            std::fprintf(stderr, "[gs:vk:wb] f%llu range %llx-%llx hits %zu:", (unsigned long long)(m_rFrames + 1), (unsigned long long)tb, (unsigned long long)te, hit.size());
++            for (auto &h : hit) { const RTarget &x = m_colorT[h.second]; std::fprintf(stderr, " %05llx w%u rows %u..%u seq %llu", (unsigned long long)h.second, x.w, x.dirtyLo, x.dirtyRows, (unsigned long long)x.seq); }
++            std::fprintf(stderr, "\n");
++        }
++        if (hit.empty()) return;
++        std::sort(hit.begin(), hit.end());
++        for (auto &h : hit)
++        {
++            RTarget &t = m_colorT[h.second];
++            uint64_t b, e;
++            if (!dirtySpan(h.second, t, b, e)) continue;
++            writeBackLocked(h.second, t);
++            for (auto &kv : m_colorT)
++            {
++                uint64_t ob, oe;
++                if (kv.first != h.second && kv.second.seq < t.seq && dirtySpan(kv.first, kv.second, ob, oe) && ob < e && b < oe)
++                { kv.second.dirtyRows = 0; kv.second.dirtyLo = 0xFFFFFFFFu; }
++            }
++        }
++    }
++
++    // GS CLUT buffer emulation: each CLUT load snapshots the previous buffer into a new ring slot and loads the
++    // entries from VRAM (after writing back any drawn target that covers the palette). Draws read the current slot.
++    // PS2X_VK_CLUT=0 falls back to reading the palette straight from CBP at draw time.
++public:
++    void loadClut(const GSTex0Reg &t, const GSTexClutReg &)
++    {
++        if (!m_ok || !m_rOn || m_noClut) return;
++        const uint32_t psm = t.psm;
++        const bool t4 = psm == GS_PSM_T4 || psm == 0x24u || psm == 0x2Cu;
++        if (!t4 && psm != GS_PSM_T8 && psm != GS_PSM_T8H) return;
++        switch (t.cld)
++        {
++        case 1: break;
++        case 2: m_clutCbp[0] = t.cbp; break;
++        case 3: m_clutCbp[1] = t.cbp; break;
++        case 4: if (m_clutCbp[0] == t.cbp) return; m_clutCbp[0] = t.cbp; break;
++        case 5: if (m_clutCbp[1] == t.cbp) return; m_clutCbp[1] = t.cbp; break;
++        default: return;
++        }
++        const bool c16 = t.cpsm == GS_PSM_CT16 || t.cpsm == GS_PSM_CT16S;
++        if (!c16 && t.cpsm != GS_PSM_CT32 && t.cpsm != GS_PSM_CT24) return;
++        std::lock_guard<std::mutex> lk(m_m);
++        waitInFlight();
++        if (m_txActive && m_txBytes.size() > m_txFlushedBytes) { endRenderingLocked(); flushTxLocked(false); }
++        writeBackRangeLocked(static_cast<uint64_t>(t.cbp) * 256u, static_cast<uint64_t>(t.cbp) * 256u + 1024u);
++        endRenderingLocked();
++        if (m_clutPending + 2u >= kClutSlots) submitWait();
++        ensureCompute();
++        const uint32_t prev = m_clutSlot, cur = (m_clutSlot + 1u) % kClutSlots;
++        VkBufferCopy cp{kVram + prev * 2048u, kVram + cur * 2048u, 2048u};
++        vkCmdCopyBuffer(m_cmd, m_vram, m_vram, 1, &cp);
++        barrier();
++        const Fmt f = fmt(c16 ? t.cpsm : GS_PSM_CT32);
++        PC pc{};
++        const uint32_t csaOff = t4 ? ((c16 ? (t.csa & 31u) : (t.csa & 15u)) << 4) : 0u;
++        pc.ioBitBase = kVram / 4u + cur * 512u + csaOff;
++        pc.firstPixel = t4 ? 1u : 0u;
++        pc.count = t4 ? 16u : 256u;
++        pc.lutBase = f.lut; pc.pw = f.pw; pc.ph = f.ph; pc.ppr = std::max<uint32_t>(1u, 64u / f.pw);
++        pc.baseBits = (t.cbp * 256u * 8u) & 0x1FFFFFFu;
++        pc.nbits = c16 ? 16u : 32u; pc.shift = 0; pc.mode = 3;
++        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
++        vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pl, 0, 1, &m_set, 0, nullptr);
++        vkCmdPushConstants(m_cmd, m_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
++        vkCmdDispatch(m_cmd, (pc.count + 63u) / 64u, 1, 1);
++        barrier();
++        m_clutSlot = cur;
++        ++m_clutPending;
++        ++m_clutLoads;
++    }
++private:
++
++    RTarget *target(uint64_t key, uint32_t w, bool depth)
++    {
++        auto &map = depth ? m_depthT : m_colorT;
++        auto it = map.find(key);
++        if (it != map.end()) return &it->second;
++        if (map.size() >= 48) return nullptr;
++        RTarget t;
++        t.w = w; t.h = kRows; t.depth = depth;
++        const VkFormat fmt = depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
++        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++        ii.imageType = VK_IMAGE_TYPE_2D;
++        ii.format = fmt;
++        ii.extent = {w * m_scale, kRows * m_scale, 1}; // PS2X_VK_SCALE: images at N x the GS size
++        ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
++        ii.usage = depth ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
++                         : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
++        if (vkCreateImage(m_dev, &ii, nullptr, &t.img) != VK_SUCCESS) return nullptr;
++        VkMemoryRequirements mr;
++        vkGetImageMemoryRequirements(m_dev, t.img, &mr);
++        VkPhysicalDeviceMemoryProperties mp;
++        vkGetPhysicalDeviceMemoryProperties(m_phys, &mp);
++        uint32_t idx = UINT32_MAX;
++        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
++            if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { idx = i; break; }
++        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++        ai.allocationSize = mr.size;
++        ai.memoryTypeIndex = idx;
++        if (idx == UINT32_MAX || vkAllocateMemory(m_dev, &ai, nullptr, &t.mem) != VK_SUCCESS) return nullptr;
++        vkBindImageMemory(m_dev, t.img, t.mem, 0);
++        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++        vi.image = t.img;
++        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
++        vi.format = fmt;
++        vi.subresourceRange = {static_cast<VkImageAspectFlags>(depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
++        if (vkCreateImageView(m_dev, &vi, nullptr, &t.view) != VK_SUCCESS) return nullptr;
++        // UNDEFINED -> GENERAL, cleared (TODO: seed from VRAM)
++        endRenderingLocked();
++        ensureBegun();
++        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        b.image = t.img;
++        b.subresourceRange = vi.subresourceRange;
++        vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
++        if (depth)
++        {
++            VkClearDepthStencilValue z{0.0f, 0};
++            vkCmdClearDepthStencilImage(m_cmd, t.img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &vi.subresourceRange);
++        }
++        else
++        {
++            VkClearColorValue c{};
++            vkCmdClearColorImage(m_cmd, t.img, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &vi.subresourceRange);
++        }
++        barrier();
++        ++m_rs.targets;
++        if (!depth && !m_noSeed)
++        {   // seed the new colour target from VRAM (rows that lie inside the 4 MB)
++            const uint32_t kp = (key >> 15) & 0x3Fu, bpp = (kp == GS_PSM_CT16 || kp == GS_PSM_CT16S) ? 2u : 4u;
++            const uint64_t base = static_cast<uint64_t>(key & 0x1FFu) * 8192u;
++            const uint32_t rows = base < kVram ? static_cast<uint32_t>(std::min<uint64_t>(kRows, (kVram - base) / (static_cast<uint64_t>(w) * bpp))) : 0u;
++            seedLocked(key, t, rows);
++        }
++        return &map.emplace(key, t).first->second;
++    }
++
++    VkPipeline pipeline(uint64_t key)
++    {
++        auto it = m_pipes.find(key);
++        if (it != m_pipes.end()) return it->second;
++        const uint32_t topo = key & 3u;
++        const bool blend = (key >> 2) & 1u;
++        const VkBlendOp eq = static_cast<VkBlendOp>((key >> 3) & 3u);
++        const VkBlendFactor sf = static_cast<VkBlendFactor>((key >> 5) & 31u), df = static_cast<VkBlendFactor>((key >> 10) & 31u);
++        const bool ztest = (key >> 15) & 1u;
++        const VkCompareOp zop = static_cast<VkCompareOp>((key >> 16) & 7u);
++        const bool zwrite = (key >> 19) & 1u;
++        const uint32_t cmask = (key >> 20) & 15u;
++        VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, m_vs, "main", nullptr},
++                                                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, m_fs, "main", nullptr}};
++        VkVertexInputBindingDescription vb{0, kFloats * 4u, VK_VERTEX_INPUT_RATE_VERTEX};
++        VkVertexInputAttributeDescription va[3] = {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 32}};
++        VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++        vis.vertexBindingDescriptionCount = 1; vis.pVertexBindingDescriptions = &vb;
++        vis.vertexAttributeDescriptionCount = 3; vis.pVertexAttributeDescriptions = va;
++        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++        ia.topology = topo == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : topo == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++        vp.viewportCount = 1; vp.scissorCount = 1;
++        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
++        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
++        ds.depthTestEnable = (ztest || zwrite) ? VK_TRUE : VK_FALSE; // Vulkan only writes depth with the test enabled
++        ds.depthWriteEnable = zwrite ? VK_TRUE : VK_FALSE;
++        ds.depthCompareOp = zop;
++        VkPipelineColorBlendAttachmentState ba{};
++        ba.blendEnable = blend ? VK_TRUE : VK_FALSE;
++        ba.srcColorBlendFactor = sf; ba.dstColorBlendFactor = df; ba.colorBlendOp = eq;
++        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; ba.alphaBlendOp = VK_BLEND_OP_ADD;
++        ba.colorWriteMask = cmask;
++        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++        cb.attachmentCount = 1; cb.pAttachments = &ba;
++        VkDynamicState dyn[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
++        VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++        dy.dynamicStateCount = 3; dy.pDynamicStates = dyn;
++        const VkFormat cf = VK_FORMAT_R8G8B8A8_UNORM;
++        VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++        ri.colorAttachmentCount = 1; ri.pColorAttachmentFormats = &cf; ri.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
++        VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++        gp.pNext = &ri;
++        gp.stageCount = 2; gp.pStages = st;
++        gp.pVertexInputState = &vis; gp.pInputAssemblyState = &ia; gp.pViewportState = &vp; gp.pRasterizationState = &rs;
++        gp.pMultisampleState = &ms; gp.pDepthStencilState = &ds; gp.pColorBlendState = &cb; gp.pDynamicState = &dy;
++        gp.layout = m_gpl;
++        VkPipeline p = VK_NULL_HANDLE;
++        if (vkCreateGraphicsPipelines(m_dev, m_pcache, 1, &gp, nullptr, &p) != VK_SUCCESS)
++            p = VK_NULL_HANDLE;
++        m_pipes.emplace(key, p);
++        ++m_rs.pipelines;
++        return p;
++    }
++
++    // GS ALPHA (A-B)*C+D  ->  Vulkan blend (same mapping as the GL backend; As = out.a = As/128, Ad = stored a)
++    static void blendOf(uint64_t alpha, uint32_t fpsm, VkBlendOp &eq, VkBlendFactor &sf, VkBlendFactor &df, float &fix)
++    {
++        const int A = alpha & 3, B = (alpha >> 2) & 3, C = (alpha >> 4) & 3, D = (alpha >> 6) & 3;
++        fix = static_cast<float>((alpha >> 32) & 0xFFu) / 128.0f;
++        VkBlendFactor F = VK_BLEND_FACTOR_SRC_ALPHA, OMF = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++        if (C == 1 && fpsm != GS_PSM_CT24) { F = VK_BLEND_FACTOR_DST_ALPHA; OMF = VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA; }
++        else if (C == 1) { F = VK_BLEND_FACTOR_CONSTANT_ALPHA; OMF = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA; fix = 1.0f; }
++        else if (C >= 2) { F = VK_BLEND_FACTOR_CONSTANT_ALPHA; OMF = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA; }
++        auto coef = [&](int which, VkBlendFactor &factor, int &sign) {
++            const int kf = (A == which ? 1 : 0) - (B == which ? 1 : 0), k1 = (D == which ? 1 : 0);
++            sign = 1;
++            if (k1 == 0 && kf == 0) factor = VK_BLEND_FACTOR_ZERO;
++            else if (k1 == 1 && kf == 0) factor = VK_BLEND_FACTOR_ONE;
++            else if (k1 == 0 && kf == 1) factor = F;
++            else if (k1 == 0 && kf == -1) { factor = F; sign = -1; }
++            else if (k1 == 1 && kf == -1) factor = OMF;
++            else factor = VK_BLEND_FACTOR_ONE;
++        };
++        int ss, dsn;
++        coef(0, sf, ss);
++        coef(1, df, dsn);
++        if (sf == VK_BLEND_FACTOR_ZERO) ss = 1;
++        if (df == VK_BLEND_FACTOR_ZERO) dsn = 1;
++        eq = VK_BLEND_OP_ADD;
++        if (ss > 0 && dsn < 0) eq = VK_BLEND_OP_SUBTRACT;
++        else if (ss < 0 && dsn > 0) eq = VK_BLEND_OP_REVERSE_SUBTRACT;
++        else if (ss < 0 && dsn < 0) { sf = VK_BLEND_FACTOR_ZERO; df = VK_BLEND_FACTOR_ZERO; }
++    }
++
++    void endRenderingLocked()
++    {
++        if (!m_rendering) return;
++        vkCmdEndRendering(m_cmd);
++        m_rendering = false;
++        barrier();
++    }
++
++    static bool s_vkNearest() { static const bool v = std::getenv("PS2X_VK_NEAREST") != nullptr; return v; } // debug: no bilinear
++    void drawBatchLocked(const GSDrawListBatch &b, const GSVertex *verts, size_t nverts)
++    {
++        const GSDrawState &st = b.state;
++        const GSContext &c = st.context;
++        const GSPrimType type = st.prim.type;
++        const uint32_t cls = (type == GS_PRIM_POINT) ? 0u : (type == GS_PRIM_LINE || type == GS_PRIM_LINESTRIP) ? 1u : (type == GS_PRIM_SPRITE ? 3u : 2u);
++        const uint32_t need = cls == 0 ? 1u : (cls == 1 || cls == 3) ? 2u : 3u;
++        if (b.vertsPerPrim < need || b.primCount == 0) { ++m_rs.skipped; return; }
++        if (m_txActive && m_txBytes.size() > m_txFlushedBytes)
++        {
++            endRenderingLocked();
++            flushTxLocked(false);
++        }
++        if (m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8)
++            std::fprintf(stderr, "[gs:vk:trace] f%llu fb %x/%u/%x z %x/%x prim %u n%u tme%u fst%u tex %x/%u/%x %ux%u cpsm %x cbp %x tfx%u tcc%u abe%u alpha %llx test %llx fbmsk %x bbox %d,%d-%d,%d sc %u,%u-%u,%u ofs %u,%u v0 %.1f,%.1f s %.3f t %.3f q %.3f uv %u,%u rgba %u,%u,%u,%u z %.0f zm %u\n",
++                         (unsigned long long)(m_rFrames + 1), c.frame.fbp, c.frame.fbw, c.frame.psm, c.zbuf.zbp, c.zbuf.psm, (unsigned)type, (unsigned)b.primCount, (unsigned)st.prim.tme, (unsigned)st.prim.fst,
++                         c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, st.textureWidth, st.textureHeight, c.tex0.cpsm, c.tex0.cbp, (unsigned)c.tex0.tfx, (unsigned)c.tex0.tcc, (unsigned)st.prim.abe,
++                         (unsigned long long)c.alpha, (unsigned long long)c.test, c.frame.fbmsk, b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3],
++                         c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1, c.xyoffset.ofx >> 4, c.xyoffset.ofy >> 4,
++                         verts[0].x, verts[0].y, verts[0].s, verts[0].t, verts[0].q, verts[0].u, verts[0].v, verts[0].r, verts[0].g, verts[0].b, verts[0].a, (double)verts[0].z, (unsigned)c.zbuf.zmask);
++            if (m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8 && b.primCount * b.vertsPerPrim > 1u)
++                std::fprintf(stderr, "[gs:vk:trace]   v1 %.1f,%.1f uv %u,%u st %.3f,%.3f\n", verts[1].x, verts[1].y, verts[1].u, verts[1].v, verts[1].s, verts[1].t);
++        {   // debug: PS2X_VK_SKIPA=<alpha hex> / PS2X_VK_SKIPT=<tbp hex> drop matching draws (bisecting a pass)
++            static const long long sa = std::getenv("PS2X_VK_SKIPA") ? std::strtoll(std::getenv("PS2X_VK_SKIPA"), nullptr, 16) : -1;
++            static const long long stb = std::getenv("PS2X_VK_SKIPT") ? std::strtoll(std::getenv("PS2X_VK_SKIPT"), nullptr, 16) : -1;
++            if (m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 2)
++                std::fprintf(stderr, "[gs:vk:st] clamp %llx tex1 %llx mip1 %llx fba %llx dthe %llx colclamp %llx pabe %u iip %u fge %u tw %ux%u\n",
++                             (unsigned long long)c.clamp, (unsigned long long)c.tex1, (unsigned long long)c.miptbp1, (unsigned long long)c.fba,
++                             (unsigned long long)st.dthe, (unsigned long long)st.colclamp, (unsigned)st.pabe, (unsigned)st.prim.iip, (unsigned)st.prim.fge, st.textureWidth, st.textureHeight);
++            if ((sa >= 0 && (long long)c.alpha == sa) || (stb >= 0 && st.prim.tme && (long long)c.tex0.tbp0 == stb)) { ++m_rs.skipped; return; }
++        }
++        if (st.prim.tme && !m_noWb) writeBackOverlapsLocked(c);
++        if (st.prim.tme && c.tex0.tbp0 == 0x8c0u && (c.frame.psm == GS_PSM_CT16 || c.frame.psm == GS_PSM_CT16S)) spriteDumpLocked();
++        const uint32_t fbw = std::max<uint32_t>(c.frame.fbw, 1u);
++        const uint32_t W = std::min<uint32_t>(fbw * 64u, 4096u);
++        uint32_t cOff = 0, zOff = 0;
++        // Z targets are keyed by address/width only (a Z32 clear and Z16S draws at the same ZBP share one depth image);
++        // CT24 shares CT32's colour target. PS2X_VK_ZKEYPSM=1 restores psm-keyed depth.
++        const uint32_t cpsmKey = (c.frame.psm == GS_PSM_CT24) ? GS_PSM_CT32 : c.frame.psm;
++        const uint64_t ckey = aliasKey((uint64_t)c.frame.fbp | ((uint64_t)fbw << 9) | ((uint64_t)cpsmKey << 15), false, cOff);
++        const uint64_t zraw = (uint64_t)c.zbuf.zbp | ((uint64_t)fbw << 9) | (m_zkeyPsm ? ((uint64_t)c.zbuf.psm << 15) : 0ull);
++        uint64_t zkey = aliasKey(zraw, true, zOff);
++        // one viewport serves both attachments: a depth alias at another row offset than the colour would read/write the
++        // wrong depth rows, so keep depth un-aliased then (PS2X_VK_ZOFF=0 restores the old behaviour)
++        static const bool s_zoffOld = [] { const char *e = std::getenv("PS2X_VK_ZOFF"); return e && e[0] == '0'; }();
++        if (zOff != cOff && !s_zoffOld) { zkey = zraw; zOff = cOff; }
++        static const bool s_skyLog = std::getenv("PS2X_VK_SKYLOG") != nullptr; // debug: log the sky batch (217 tris, TEST 0x50002)
++        const bool skyB = (s_skyLog || std::getenv("PS2X_VK_PROBESKY")) && b.primCount == 217 && c.test == 0x50002ull;
++        static const bool skyB0 = std::getenv("PS2X_VK_PROBESKY") != nullptr;
++        if (skyB && s_skyLog)
++        {
++            float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, z0 = 1e30f, z1 = -1e30f; int a0 = 999, a1 = -1, f0 = 999, f1 = -1;
++            for (size_t i = 0; i < nverts; ++i)
++            {
++                const GSVertex &v = verts[i];
++                x0 = std::min(x0, (float)v.x); x1 = std::max(x1, (float)v.x); y0 = std::min(y0, (float)v.y); y1 = std::max(y1, (float)v.y);
++                z0 = std::min(z0, (float)v.z); z1 = std::max(z1, (float)v.z); a0 = std::min(a0, (int)v.a); a1 = std::max(a1, (int)v.a);
++                f0 = std::min(f0, (int)v.fog); f1 = std::max(f1, (int)v.fog);
++            }
++            std::fprintf(stderr, "[gs:vk:sky] f%llu verts nv %zu x %.0f..%.0f y %.0f..%.0f z %.0f..%.0f a %d..%d fge %u fog %d..%d fogcol %u,%u,%u iip %u prim %u\n", (unsigned long long)(m_rFrames + 1), nverts,
++                         x0, x1, y0, y1, z0, z1, a0, a1, (unsigned)st.prim.fge, f0, f1, (unsigned)st.fogR, (unsigned)st.fogG, (unsigned)st.fogB, (unsigned)st.prim.iip, (unsigned)type);
++        }
++        if (skyB && s_skyLog) std::fprintf(stderr, "[gs:vk:sky] f%llu enter ckey %llx off %u zkey %llx sc %u-%u ofy %u bbox %d-%d tgts %zu\n", (unsigned long long)(m_rFrames + 1), (unsigned long long)ckey, cOff, (unsigned long long)zkey, c.scissor.y0, c.scissor.y1, c.xyoffset.ofy >> 4, b.bbox[1], b.bbox[3], m_colorT.size());
++        const uint32_t off = (cOff == zOff || zOff == 0) ? cOff : cOff; // colour offset drives the viewport
++        // vertices -> ring
++        const uint32_t outVerts = static_cast<uint32_t>(b.primCount) * (cls == 3 ? 6u : need);
++        const size_t bytes = static_cast<size_t>(outVerts) * kFloats * 4u;
++        if (m_ringUsed + bytes > kRing)
++        {
++            endRenderingLocked();
++            submitWait();
++            m_ringUsed = 0;
++            m_stageUsed = 0;
++            if (bytes > kRing) { ++m_rs.skipped; return; }
++        }
++        float *out = reinterpret_cast<float *>(static_cast<uint8_t *>(m_ringMap) + m_ringUsed);
++        const uint32_t first = static_cast<uint32_t>(m_ringUsed / (kFloats * 4u));
++        const float ofx = static_cast<float>(c.xyoffset.ofx >> 4), ofy = static_cast<float>(c.xyoffset.ofy >> 4);
++        const float tw = static_cast<float>(std::max<uint16_t>(st.textureWidth, 1)), th = static_cast<float>(std::max<uint16_t>(st.textureHeight, 1));
++        const double zs = (c.zbuf.psm == GS_PSM_Z16 || c.zbuf.psm == GS_PSM_Z16S || c.zbuf.psm == 0x02 || c.zbuf.psm == 0x0A) ? 1.0 / 65536.0
++                        : (c.zbuf.psm == GS_PSM_Z24 || c.zbuf.psm == 0x01) ? 1.0 / 16777216.0 : 1.0 / 4294967296.0;
++        const float pcen = cls <= 1 ? 0.5f : 0.0f;
++        size_t o = 0;
++        auto emit = [&](const GSVertex &pv, const GSVertex &cv, float s, float t, float q) {
++            float *f = out + o;
++            f[0] = pv.x - ofx + pcen; f[1] = pv.y - ofy + pcen;
++            f[2] = static_cast<float>(std::min(1.0, std::max(0.0, pv.z * zs))); f[3] = static_cast<float>(cv.fog);
++            f[4] = cv.r; f[5] = cv.g; f[6] = cv.b; f[7] = cv.a;
++            f[8] = s; f[9] = t; f[10] = q; f[11] = 0.0f;
++            o += kFloats;
++        };
++        auto stq = [&](const GSVertex &v, float &s, float &t, float &q) {
++            if (st.prim.fst) { s = (v.u / 16.0f) / tw; t = (v.v / 16.0f) / th; q = 1.0f; }
++            else { s = v.s; t = v.t; q = v.q; }
++        };
++        for (uint32_t p = 0; p < b.primCount; ++p)
++        {
++            const GSVertex *v = verts + static_cast<size_t>(p) * b.vertsPerPrim;
++            if (cls == 3)
++            {
++                float s0, t0, q0, s1, t1, q1;
++                stq(v[0], s0, t0, q0); stq(v[1], s1, t1, q1);
++                if (!st.prim.fst)
++                {
++                    const float a0 = std::max(std::fabs(q0), 1e-20f), a1 = std::max(std::fabs(q1), 1e-20f);
++                    s0 /= a0; t0 /= a0; s1 /= a1; t1 /= a1;
++                }
++                GSVertex a = v[0], bb = v[1], cc = v[0], dd = v[1];
++                bb.y = v[0].y; cc.y = v[1].y; // (x1,y0) (x0,y1)
++                bb.z = cc.z = a.z = v[1].z;
++                emit(a, v[1], s0, t0, 1.0f); emit(bb, v[1], s1, t0, 1.0f); emit(cc, v[1], s0, t1, 1.0f);
++                emit(bb, v[1], s1, t0, 1.0f); emit(dd, v[1], s1, t1, 1.0f); emit(cc, v[1], s0, t1, 1.0f);
++            }
++            else
++                for (uint32_t i = 0; i < need; ++i)
++                {
++                    float s, t, q;
++                    stq(v[i], s, t, q);
++                    emit(v[i], st.prim.iip ? v[i] : v[need - 1], s, t, q); // flat: GS uses the last vertex colour
++                }
++        }
++        // vkCmdDraw addresses the ring by vertex index (firstVertex = m_ringUsed / 48), so every batch must start on a
++        // whole vertex. Rounding to 256 bytes alone left m_ringUsed % 48 at 0/16/32, shifting most batches' attributes.
++        m_ringUsed += ((bytes + 767u) / 768u) * 768u; // 768 = lcm(48, 256)
++        // targets / render pass
++        RTarget *ct = target(ckey, W, false);
++        RTarget *zt = target(zkey, W, true);
++        if (!ct || !zt) { ++m_rs.skipped; return; }
++        if (ct->stale) { ct->stale = false; seedLocked(ckey, *ct, ct->hiRows); }
++        if (!m_noSeed && !m_noWb && !m_noXsync && (m_curC != ckey || !m_rendering))
++        {   // another target (different width/format) drew into this target's memory since: merge through VRAM
++            const uint32_t kp = (ckey >> 15) & 0x3Fu, bpp = (kp == GS_PSM_CT16 || kp == GS_PSM_CT16S) ? 2u : 4u;
++            const uint64_t base = static_cast<uint64_t>(ckey & 0x1FFu) * 8192u;
++            const uint32_t rows = base < kVram ? static_cast<uint32_t>(std::min<uint64_t>(kRows, (kVram - base) / (static_cast<uint64_t>(ct->w) * bpp))) : 0u;
++            const uint64_t end = base + static_cast<uint64_t>(ct->w) * rows * bpp;
++            bool other = false;
++            for (auto &kv : m_colorT)
++            {
++                if (kv.first == ckey || kv.second.seq <= ct->seq || !kv.second.hiRows) continue;
++                const uint32_t op = (kv.first >> 15) & 0x3Fu, obpp = (op == GS_PSM_CT16 || op == GS_PSM_CT16S) ? 2u : 4u;
++                const uint64_t ob = static_cast<uint64_t>(kv.first & 0x1FFu) * 8192u, oe = ob + static_cast<uint64_t>(kv.second.w) * kv.second.hiRows * obpp;
++                if (ob < end && base < oe) { other = true; break; }
++            }
++            if (other)
++            {
++                writeBackRangeLocked(base, end);
++                seedLocked(ckey, *ct, rows);
++                ++m_rs.xsync;
++            }
++        }
++        uint32_t rttCW = 0, rttCH = 0;
++        if (m_scale > 1 && st.prim.tme)
++        {
++            float umin = 1e30f, vmin = 1e30f, umax = -1e30f, vmax = -1e30f;
++            for (size_t i = 0; i < nverts; ++i)
++            {
++                const GSVertex &v = verts[i];
++                float uu, vv;
++                if (st.prim.fst) { uu = v.u / 16.0f; vv = v.v / 16.0f; }
++                else { const float q = std::fabs(v.q) > 1e-20f ? v.q : 1.0f; uu = v.s / q * tw; vv = v.t / q * th; }
++                umin = std::min(umin, uu); vmin = std::min(vmin, vv); umax = std::max(umax, uu); vmax = std::max(vmax, vv);
++            }
++            uint64_t rkey = 0; uint32_t rowOff = 0;
++            if (nverts && rttFindLocked(c, umin, vmin, umax, vmax, rkey, rowOff))
++            {
++                const RTarget &rt = m_colorT[rkey];
++                rttCW = std::min<uint32_t>({rt.w, static_cast<uint32_t>(tw), m_rttW / m_scale});
++                rttCH = std::min<uint32_t>({rt.h - rowOff, static_cast<uint32_t>(th), m_rttH / m_scale});
++                endRenderingLocked();
++                ensureBegun();
++                VkImageCopy ic{};
++                ic.srcSubresource = ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++                ic.srcOffset = {0, static_cast<int32_t>(rowOff * m_scale), 0};
++                ic.extent = {rttCW * m_scale, rttCH * m_scale, 1};
++                vkCmdCopyImage(m_cmd, rt.img, VK_IMAGE_LAYOUT_GENERAL, m_rttImg, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
++                barrier();
++                ++m_rs.rtt;
++            }
++        }
++        ct->lastF = m_rFrames + 1; ++ct->draws; ct->seq = ++m_drawSeq;
++        if (!m_rendering || m_curC != ckey || m_curZ != zkey || m_curOff != off)
++        {
++            endRenderingLocked();
++            ensureBegun();
++            VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++            ca.imageView = ct->view; ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            VkRenderingAttachmentInfo za = ca;
++            za.imageView = zt->view;
++            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
++            ri.renderArea = {{0, 0}, {W * m_scale, kRows * m_scale}};
++            ri.layerCount = 1;
++            ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca; ri.pDepthAttachment = &za;
++            vkCmdBeginRendering(m_cmd, &ri);
++            m_rendering = true;
++            m_curC = ckey; m_curZ = zkey;
++            m_lastPipe = VK_NULL_HANDLE;
++            ++m_rs.passes;
++            m_curOff = off;
++            VkViewport vpt{0, static_cast<float>(off * m_scale), static_cast<float>(W * m_scale), static_cast<float>(kRows * m_scale), 0.0f, 1.0f};
++            vkCmdSetViewport(m_cmd, 0, 1, &vpt);
++            VkDeviceSize zero = 0;
++            vkCmdBindVertexBuffers(m_cmd, 0, 1, &m_ring, &zero);
++            vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_gpl, 0, 1, &m_set, 0, nullptr);
++            m_curW = W;
++        }
++        // pipeline key
++        const uint64_t test = c.test;
++        const uint32_t ztst = static_cast<uint32_t>((test >> 17) & 3u);
++        const bool zte = ((test >> 16) & 1u) != 0u;
++        VkCompareOp zop = VK_COMPARE_OP_ALWAYS;
++        static const bool s_noZt = std::getenv("PS2X_VK_NOZTEST") != nullptr; // debug: depth test always passes
++        if (zte && !s_noZt) zop = ztst == 0 ? VK_COMPARE_OP_NEVER : ztst == 1 ? VK_COMPARE_OP_ALWAYS : ztst == 2 ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_GREATER;
++        // GS: ZTE=0 behaves as ZTST=ALWAYS and still writes Z unless ZMSK (PS2X_VK_ZFIX=0 restores the old rule)
++        const bool zwrite = m_zfixOff ? (!c.zbuf.zmask && zte && ztst != 0) : (!c.zbuf.zmask && !(zte && ztst == 0));
++        VkBlendOp eq = VK_BLEND_OP_ADD;
++        VkBlendFactor sf = VK_BLEND_FACTOR_ONE, df = VK_BLEND_FACTOR_ZERO;
++        float fix = 1.0f;
++        const bool abe = st.prim.abe;
++        if (abe) blendOf(c.alpha, c.frame.psm, eq, sf, df, fix);
++        const uint32_t m = c.frame.fbmsk;
++        uint32_t cmask = 0;
++        if ((m & 0xFFu) != 0xFFu) cmask |= 1; if ((m & 0xFF00u) != 0xFF00u) cmask |= 2; if ((m & 0xFF0000u) != 0xFF0000u) cmask |= 4;
++        if ((m & 0xFF000000u) != 0xFF000000u && c.frame.psm == GS_PSM_CT32) cmask |= 8;
++        const uint32_t topo = cls == 0 ? 0u : cls == 1 ? 1u : 2u;
++        const uint64_t pkey = topo | ((uint64_t)(abe ? 1 : 0) << 2) | ((uint64_t)eq << 3) | ((uint64_t)sf << 5) | ((uint64_t)df << 10) |
++                              ((uint64_t)(zte ? 1 : 0) << 15) | ((uint64_t)zop << 16) | ((uint64_t)(zwrite ? 1 : 0) << 19) | ((uint64_t)cmask << 20);
++        VkPipeline pipe = pipeline(pkey);
++        if (!pipe) { ++m_rs.skipped; return; }
++        if (pipe != m_lastPipe) { vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); m_lastPipe = pipe; }
++        const float bc[4] = {fix, fix, fix, fix};
++        vkCmdSetBlendConstants(m_cmd, bc);
++        const int sx0 = std::min<int>(c.scissor.x0, W), sy0 = std::min<int>(c.scissor.y0, kRows);
++        const int sx1 = std::min<int>(c.scissor.x1 + 1, W), sy1 = std::min<int>(c.scissor.y1 + 1, kRows);
++        if (sx1 <= sx0 || sy1 <= sy0) { ++m_rs.skipped; return; }
++        const int oy0 = std::min<int>(sy0 + (int)off, kRows), oy1 = std::min<int>(sy1 + (int)off, kRows);
++        if (oy1 <= oy0) { ++m_rs.skipped; return; }
++        {   // rows actually touched: scissor clipped by the batch bounding box (if the frontend filled it)
++            // bbox is in primitive coordinates (before XYOFFSET)
++            int ty0 = oy0, ty1 = oy1;
++            if (b.bbox[3] >= b.bbox[1])
++            {
++                ty0 = std::max<int>(ty0, b.bbox[1] - (int)ofy + (int)off);
++                ty1 = std::min<int>(ty1, b.bbox[3] - (int)ofy + 1 + (int)off);
++            }
++            if (ty1 > ty0)
++            {
++                ct->dirtyRows = std::max<uint32_t>(ct->dirtyRows, static_cast<uint32_t>(ty1));
++                ct->dirtyLo = std::min<uint32_t>(ct->dirtyLo, static_cast<uint32_t>(ty0));
++                ct->hiRows = std::max(ct->hiRows, ct->dirtyRows);
++                ct->loRows = std::min<uint32_t>(ct->loRows, static_cast<uint32_t>(ty0)); // lowest row ever drawn
++                if (m_drawLog.size() < 65536u) m_drawLog.push_back({ckey, ct->w, static_cast<uint32_t>(ty0), static_cast<uint32_t>(ty1), ct->seq});
++            }
++        }
++        const int S = static_cast<int>(m_scale);
++        VkRect2D sc{{sx0 * S, oy0 * S}, {static_cast<uint32_t>((sx1 - sx0) * S), static_cast<uint32_t>((oy1 - oy0) * S)}};
++        vkCmdSetScissor(m_cmd, 0, 1, &sc);
++        // push constants
++        uint32_t pc[32] = {};
++        const float fw = static_cast<float>(W), fh = static_cast<float>(kRows);
++        std::memcpy(&pc[0], &fw, 4); std::memcpy(&pc[1], &fh, 4);
++        uint32_t flags = (st.prim.tme ? 1u : 0u) | (st.prim.iip || cls == 3 ? 0u : 0u) | ((cls != 3 && st.prim.iip) ? 2u : 0u) | (st.prim.fge ? 4u : 0u) |
++                         (c.tex0.tcc ? 8u : 0u) | ((c.tex0.tfx & 3u) << 4) | ((test & 1u) ? 64u : 0u) | (((test >> 1) & 7u) << 7) |
++                         (((test >> 12) & 3u) << 10) | (st.texa.aem ? 4096u : 0u) | ((st.prim.tme && st.linearFilter && !s_vkNearest()) ? 8192u : 0u);
++        static const bool s_noAt = std::getenv("PS2X_VK_NOATEST") != nullptr; // debug: alpha test off
++        if (s_noAt) flags &= ~64u;
++        pc[2] = flags;
++        pc[3] = static_cast<uint32_t>((test >> 4) & 0xFFu);
++        if (st.prim.tme)
++        {
++            const Fmt tf = fmt(c.tex0.psm);
++            uint32_t kind = 0;
++            switch (c.tex0.psm)
++            {
++            case GS_PSM_CT32: case GS_PSM_Z32: kind = 0; break;
++            case GS_PSM_CT24: case GS_PSM_Z24: kind = 1; break;
++            case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: kind = 2; break;
++            case GS_PSM_T8: case GS_PSM_T8H: kind = 3; break;
++            default: kind = 4; break;
++            }
++            pc[4] = (c.tex0.tbp0 * 256u * 8u) & 0x1FFFFFFu;
++            pc[5] = std::max<uint32_t>(1u, (std::max<uint32_t>(c.tex0.tbw, 1u) * 64u) / tf.pw);
++            pc[6] = tf.pw | (tf.ph << 16);
++            pc[7] = tf.lut;
++            pc[8] = tf.nbits | (tf.shift << 8) | (kind << 16);
++            pc[9] = static_cast<uint32_t>(std::max<uint16_t>(st.textureWidth, 1)) | (static_cast<uint32_t>(std::max<uint16_t>(st.textureHeight, 1)) << 16);
++            const bool c16 = c.tex0.cpsm == GS_PSM_CT16 || c.tex0.cpsm == GS_PSM_CT16S;
++            const Fmt cf = fmt(c16 ? c.tex0.cpsm : GS_PSM_CT32);
++            pc[10] = (c.tex0.cbp * 256u * 8u) & 0x1FFFFFFu;
++            pc[11] = cf.lut;
++            pc[12] = c16 ? 16u : 32u;
++            if (!m_noClut && m_clutLoads)
++            {
++                const bool t4 = kind == 4u;
++                const uint32_t csaOff = t4 ? ((c16 ? (c.tex0.csa & 31u) : (c.tex0.csa & 15u)) << 4) : 0u;
++                pc[10] = kVram / 4u + m_clutSlot * 512u + csaOff;
++                pc[12] |= 256u;
++            }
++            pc[13] = c.tex0.csa;
++            const uint64_t cl = c.clamp;
++            pc[14] = static_cast<uint32_t>(cl & 15u);
++            pc[15] = static_cast<uint32_t>((cl >> 4) & 0x3FFu) | (static_cast<uint32_t>((cl >> 14) & 0x3FFu) << 16);
++            pc[16] = static_cast<uint32_t>((cl >> 24) & 0x3FFu) | (static_cast<uint32_t>((cl >> 34) & 0x3FFu) << 16);
++            pc[17] = st.texa.ta0 | (static_cast<uint32_t>(st.texa.ta1) << 8);
++        }
++        pc[18] = st.fogR | (static_cast<uint32_t>(st.fogG) << 8) | (static_cast<uint32_t>(st.fogB) << 16);
++        if (rttCW) { pc[2] |= 16384u; pc[19] = m_scale; pc[20] = rttCW | (rttCH << 16); } // texture from the scaled RTT copy
++        vkCmdPushConstants(m_cmd, m_gpl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128, pc);
++        vkCmdDraw(m_cmd, outVerts, 1, first, 0);
++        { static const bool s_probe = std::getenv("PS2X_VK_PROBE") != nullptr; static const unsigned long long s_probeN = std::getenv("PS2X_VK_PROBEN") ? std::strtoull(std::getenv("PS2X_VK_PROBEN"), nullptr, 10) : 8ull; if (s_probe && m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + s_probeN && (!skyB0 || skyB)) probeLocked(ckey, (uint32_t)b.primCount, c.test); }
++        if (skyB && s_skyLog) { std::fprintf(stderr, "[gs:vk:sky] f%llu drawn verts %u pipe %p\n", (unsigned long long)(m_rFrames + 1), outVerts, (void *)pipe); if (m_traceFrame) { endRenderingLocked(); spriteDumpLocked("s"); } }
++        ++m_rs.draws;
++        ++m_rs.batches;
++        m_rs.verts += outVerts;
++    }
++
++    // Records the copy of the displayed buffer into m_pres; returns false if no target.
++    bool recordPresentLocked(const PresentationFrame &ref, const GSPresentationRequest &req, uint32_t &w, uint32_t &h, uint32_t &srcW)
++    {
++        endRenderingLocked();
++        const bool crt1 = (req.pmode & 1u) != 0u;
++        const uint64_t dispfb = crt1 ? req.dispfb1 : req.dispfb2;
++        const uint32_t dfbp = static_cast<uint32_t>(dispfb & 0x1FFu);
++        const uint32_t fbp = ref ? ref.sourceFbp : dfbp;
++        uint32_t dbx = 0, dby = 0;
++        if (fbp == dfbp) { dbx = static_cast<uint32_t>((dispfb >> 32) & 0x7FFu); dby = static_cast<uint32_t>((dispfb >> 43) & 0x7FFu); }
++        RTarget *t = nullptr;
++        {
++            uint32_t off = 0;
++            const uint64_t want = (dispfb & 0xFFFFFull & ~0x1FFull) | fbp;
++            const uint64_t k = aliasKey(want, false, off);
++            auto it = m_colorT.find(k);
++            if (it != m_colorT.end() && it->second.stale) { it->second.stale = false; seedLocked(k, it->second, it->second.hiRows); it->second.lastF = m_rFrames + 1; }
++            if (it != m_colorT.end() && (!m_presRecent || it->second.lastF + 2 >= m_rFrames + 1)) { t = &it->second; dby += off; m_presKey = k; }
++            else
++            {   // fall back to the most recently drawn target at this base pointer
++                for (auto &kv : m_colorT)
++                    if ((kv.first & 0x1FFu) == fbp && (!t || kv.second.lastF > t->lastF)) { t = &kv.second; m_presKey = kv.first; }
++                if (!t && it != m_colorT.end()) { t = &it->second; dby += off; m_presKey = k; }
++            }
++            if (const char *pk = std::getenv("PS2X_VK_PRESKEY"))
++            {   // debug: present a given target key at a given row offset ("hexkey,rows")
++                unsigned long long fk = 0; unsigned fr = 0;
++                std::sscanf(pk, "%llx,%u", &fk, &fr);
++                auto fi = m_colorT.find(fk);
++                if (fi != m_colorT.end()) { t = &fi->second; dbx = 0; dby = fr; m_presKey = fk; }
++            }
++            m_wantKey = want;
++        }
++        static const bool s_presLog = std::getenv("PS2X_VK_PRESLOG") != nullptr; // debug: what present picks, every 60 frames
++        static const bool s_presAll = s_presLog && std::getenv("PS2X_VK_PRESLOG")[0] == '2'; // PRESLOG=2: every present
++        if (s_presLog && (s_presAll || (m_rFrames + 1) % 60u == 0u))
++            std::fprintf(stderr, "[gs:vk:pres] f%llu pmode %llx dispfb1 %llx dispfb2 %llx disp1 %llx disp2 %llx src %x want %llx exact %d pick %llx lastF %llu dby %u ref %ux%u\n",
++                         (unsigned long long)(m_rFrames + 1), (unsigned long long)req.pmode, (unsigned long long)req.dispfb1, (unsigned long long)req.dispfb2,
++                         (unsigned long long)req.display1, (unsigned long long)req.display2, fbp, (unsigned long long)m_wantKey,
++                         (int)(m_colorT.count(aliasKeyPeek(m_wantKey)) != 0), (unsigned long long)m_presKey, t ? (unsigned long long)t->lastF : 0ull, dby, ref.width, ref.height);
++        w = ref ? ref.width : 640u; h = ref ? ref.height : 448u;
++        if (!t || dbx >= t->w || dby >= t->h) return false;
++        w = std::min(w, t->w - dbx); h = std::min(h, t->h - dby);
++        if (!m_noSeed && !m_noWb && !m_noXsync && !std::getenv("PS2X_VK_NOPRESSYNC"))
++        {   // another target (other width/format) drew into the displayed memory after this one: merge through VRAM
++            // first (same rule as the draw-time xsync; menus/loading screens drawn as CT32 over a CT16 display etc.)
++            const uint64_t ckey = m_presKey;
++            const uint32_t kp = (ckey >> 15) & 0x3Fu, bpp = (kp == GS_PSM_CT16 || kp == GS_PSM_CT16S) ? 2u : 4u;
++            const uint64_t base = static_cast<uint64_t>(ckey & 0x1FFu) * 8192u;
++            const uint32_t rows = base < kVram ? static_cast<uint32_t>(std::min<uint64_t>(kRows, (kVram - base) / (static_cast<uint64_t>(t->w) * bpp))) : 0u;
++            const uint64_t lo = base + static_cast<uint64_t>(t->w) * dby * bpp, hi = base + static_cast<uint64_t>(t->w) * std::min<uint64_t>(rows, dby + h) * bpp;
++            // exact: only rows other targets drew (per-draw log) after the display's own last draw; reseed just those
++            const uint64_t rb = static_cast<uint64_t>(t->w) * bpp;
++            uint32_t y0 = UINT32_MAX, y1 = 0;
++            for (const DrawRec &d : m_drawLog)
++            {
++                if (d.key == ckey || d.seq <= t->seq) continue;
++                const uint32_t op = (d.key >> 15) & 0x3Fu, obpp = (op == GS_PSM_CT16 || op == GS_PSM_CT16S) ? 2u : 4u;
++                const uint64_t ob0 = static_cast<uint64_t>(d.key & 0x1FFu) * 8192u;
++                const uint64_t ob = ob0 + static_cast<uint64_t>(d.w) * d.y0 * obpp, oe = ob0 + static_cast<uint64_t>(d.w) * d.y1 * obpp;
++                if (!(ob < hi && lo < oe)) continue;
++                y0 = std::min<uint32_t>(y0, static_cast<uint32_t>((std::max(ob, lo) - base) / rb));
++                y1 = std::max<uint32_t>(y1, static_cast<uint32_t>((std::min(oe, hi) - base + rb - 1) / rb));
++            }
++            if (y1 > y0)
++            {
++                writeBackRangeLocked(base + rb * y0, base + rb * y1);
++                seedLocked(ckey, *t, std::min(y1, rows), y0);
++                t->seq = ++m_drawSeq;
++                ++m_rs.xsync;
++                ensureBegun();
++            }
++        }
++        m_drawLog.clear();
++        if (static_cast<size_t>(w) * h * 4u * m_scale * m_scale > presBytes()) return false;
++        ensureBegun();
++        VkBufferImageCopy cp{};
++        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        cp.imageOffset = {static_cast<int32_t>(dbx * m_scale), static_cast<int32_t>(dby * m_scale), 0};
++        cp.imageExtent = {w * m_scale, h * m_scale, 1};
++        vkCmdCopyImageToBuffer(m_cmd, t->img, VK_IMAGE_LAYOUT_GENERAL, m_pres, 1, &cp);
++        w *= m_scale; h *= m_scale; // the presented frame is N x the GS size
++        srcW = w;
++        return true;
++    }
++
++    struct DrawRec { uint64_t key; uint32_t w, y0, y1; uint64_t seq; };
++    std::vector<DrawRec> m_drawLog; // draws since the last present (present-time merge)
++    uint64_t aliasKeyPeek(uint64_t k) { uint32_t o = 0; return aliasKey(k, false, o); }
++    bool m_rOn = false, m_rendering = false;
++    uint32_t m_cmpEvery = 0, m_curW = 0, m_curOff = 0;
++    bool m_noAlias = false, m_noWb = false, m_zfixOff = false;
++    uint64_t m_traceFrame = 0;
++    bool m_zkeyPsm = false, m_noClut = false, m_noWb16 = false, m_noSeed = false, m_noXsync = false;
++    uint32_t m_clutSlot = 0, m_clutPending = 0, m_clutCbp[2] = {~0u, ~0u};
++    uint64_t m_clutLoads = 0, m_drawSeq = 0;
++    uint64_t m_presKey = 0, m_wantKey = 0;
++    bool m_presRecent = std::getenv("PS2X_VK_PRESRECENT") != nullptr; // old rule: exact display key only if drawn in the last 2 presents
++    uint64_t m_curC = ~0ull, m_curZ = ~0ull, m_rFrames = 0;
++    size_t m_ringUsed = 0;
++    VkPipeline m_lastPipe = VK_NULL_HANDLE;
++    RStats m_rs;
++    std::unordered_map<uint64_t, VkPipeline> m_pipes;
++    std::unordered_map<uint64_t, RTarget> m_colorT, m_depthT;
++    VkBuffer m_ring = VK_NULL_HANDLE, m_pres = VK_NULL_HANDLE;
++    VkDeviceMemory m_ringMem = VK_NULL_HANDLE, m_presMem = VK_NULL_HANDLE;
++    void *m_ringMap = nullptr, *m_presMap = nullptr;
++    // two present readback buffers (host-cached when the device has it): async present reads last frame's
++    VkBuffer m_presB[2] = {}; VkDeviceMemory m_presMemB[2] = {}; void *m_presMapB[2] = {}; uint32_t m_presCur = 0, m_presW = 0, m_presH = 0; bool m_presHave = false;
++    size_t presBytes() const { return std::max<size_t>(8u * 1024u * 1024u, static_cast<size_t>(m_scale) * m_scale * 5u * 1024u * 1024u); }
++    bool presBuf(int i)
++    {
++        const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++        return buffer(presBytes(), VK_BUFFER_USAGE_TRANSFER_DST_BIT, hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_presB[i], m_presMemB[i], &m_presMapB[i]) ||
++               buffer(presBytes(), VK_BUFFER_USAGE_TRANSFER_DST_BIT, hv, m_presB[i], m_presMemB[i], &m_presMapB[i]);
++    }
++    VkShaderModule m_vs = VK_NULL_HANDLE, m_fs = VK_NULL_HANDLE;
++    VkPipelineLayout m_gpl = VK_NULL_HANDLE;
++    VkPipelineCache m_pcache = VK_NULL_HANDLE;
+diff --git a/ps2xRuntime/src/lib/gs/gs_vk_vram.inl b/ps2xRuntime/src/lib/gs/gs_vk_vram.inl
+new file mode 100644
+index 0000000000000000000000000000000000000000..d710c88bd309d1a32b77c516c7f796001ee7a1ef
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_vk_vram.inl
+@@ -0,0 +1,848 @@
++// Vulkan PS2 VRAM mirror (Phase 3 step 2), #included by gs_vk_backend.cpp inside its anonymous namespace.
++// 4 MB device-local buffer = GS local memory. Host->local uploads are swizzled on the GPU by gs_vk_swizzle.comp;
++// an "own" buffer (same size) records which bits were last written by an upload. Draws, clears, local->local
++// copies and WriteVram clear ownership of the pages they may touch (they are not rendered by Vulkan yet).
++// PS2X_VK_VRAM_CHECK=N (1 = every 30 presents): at present, read back VRAM+own and compare every owned bit with the
++// reference backend's VRAM (SnapshotVram), plus an unswizzle round trip of the last upload.
++#if defined(PS2X_HAVE_VK_SHADERS)
++
++// (gs_cpu_backend.h and the SPIR-V header are included at file scope by gs_vk_backend.cpp)
++
++class VkVramMirror
++{
++public:
++    static constexpr uint32_t kVram = 4u * 1024u * 1024u;
++    static constexpr uint32_t kClutSlots = 1024u;
++    static constexpr uint32_t kStaging = 32u * 1024u * 1024u;
++    static constexpr uint32_t kPages = kVram / 8192u;
++
++    bool init(VkPhysicalDevice phys, VkDevice dev, VkQueue q, uint32_t qfam)
++    {
++        m_phys = phys; m_dev = dev; m_q = q;
++        if (const char *e = std::getenv("PS2X_VK_VRAM_CHECK"))
++        {
++            const int n = std::atoi(e);
++            m_checkEvery = n <= 0 ? 0u : (n == 1 ? 30u : static_cast<uint32_t>(n));
++        }
++        buildLuts();
++        // VRAM (4 MB) followed by the CLUT-buffer snapshot ring (kClutSlots x 512 entries, see loadClut)
++        if (!buffer(kVram + kClutSlots * 2048u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_vram, m_vramMem, nullptr) ||
++            !buffer(kVram, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_own, m_ownMem, nullptr) ||
++            !buffer(m_lut.size() * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++                    m_lutBuf, m_lutMem, &m_lutMap) ||
++            !buffer(kStaging, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++                    m_stage, m_stageMem, &m_stageMap) ||
++            !buffer(2u * kVram, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++                    m_rb, m_rbMem, &m_rbMap))
++            return false;
++        std::memcpy(m_lutMap, m_lut.data(), m_lut.size() * 4u);
++        // PS2X_VK_SCALE=N (1-4): internal resolution of the Vulkan renderer. Debug compare/dump modes stay at 1x.
++        if (const char *e = std::getenv("PS2X_VK_SCALE"))
++            m_scale = static_cast<uint32_t>(std::clamp(std::atoi(e), 1, 4));
++        if (std::getenv("PS2X_VK_CMP") || std::getenv("PS2X_VK_DUMP") || m_checkEvery) m_scale = 1;
++        // aux images: the render-to-texture copy (sampled by the draw shader at binding 4) and, at scale > 1, a 1x
++        // scratch image for downsampled write-backs / upsampled seeds
++        m_rttW = m_scale > 1 ? 1024u * m_scale : 1u; m_rttH = m_rttW;
++        if (!auxImage(m_rttW, m_rttH, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, m_rttImg, m_rttMem, &m_rttView))
++            return false;
++        if (m_scale > 1 && !auxImage(kScrW, kScrH, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, m_scrImg, m_scrMem, nullptr))
++            return false;
++        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
++        sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
++        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++        if (vkCreateSampler(m_dev, &sci, nullptr, &m_rttSmp) != VK_SUCCESS) return false;
++
++        VkDescriptorSetLayoutBinding b[5]{};
++        for (uint32_t i = 0; i < 4; ++i)
++        {
++            b[i].binding = i;
++            b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++            b[i].descriptorCount = 1;
++            b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT;
++        }
++        b[4].binding = 4;
++        b[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++        b[4].descriptorCount = 1;
++        b[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++        VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++        dl.bindingCount = 5;
++        dl.pBindings = b;
++        if (vkCreateDescriptorSetLayout(m_dev, &dl, nullptr, &m_dsl) != VK_SUCCESS) return false;
++        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC)};
++        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++        pl.setLayoutCount = 1;
++        pl.pSetLayouts = &m_dsl;
++        pl.pushConstantRangeCount = 1;
++        pl.pPushConstantRanges = &pr;
++        if (vkCreatePipelineLayout(m_dev, &pl, nullptr, &m_pl) != VK_SUCCESS) return false;
++        VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++        sm.codeSize = sizeof(kGsVkSwizzleSpv);
++        sm.pCode = kGsVkSwizzleSpv;
++        VkShaderModule mod = VK_NULL_HANDLE;
++        if (vkCreateShaderModule(m_dev, &sm, nullptr, &mod) != VK_SUCCESS) return false;
++        VkComputePipelineCreateInfo cp{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++        cp.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr};
++        cp.layout = m_pl;
++        const VkResult pr2 = vkCreateComputePipelines(m_dev, VK_NULL_HANDLE, 1, &cp, nullptr, &m_pipe);
++        vkDestroyShaderModule(m_dev, mod, nullptr);
++        if (pr2 != VK_SUCCESS) return false;
++        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
++        VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++        dp.maxSets = 1;
++        dp.poolSizeCount = 2;
++        dp.pPoolSizes = ps;
++        if (vkCreateDescriptorPool(m_dev, &dp, nullptr, &m_dpool) != VK_SUCCESS) return false;
++        VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++        da.descriptorPool = m_dpool;
++        da.descriptorSetCount = 1;
++        da.pSetLayouts = &m_dsl;
++        if (vkAllocateDescriptorSets(m_dev, &da, &m_set) != VK_SUCCESS) return false;
++        VkDescriptorBufferInfo bi[4] = {{m_vram, 0, VK_WHOLE_SIZE}, {m_own, 0, VK_WHOLE_SIZE}, {m_lutBuf, 0, VK_WHOLE_SIZE}, {m_stage, 0, VK_WHOLE_SIZE}};
++        VkWriteDescriptorSet w[4]{};
++        for (uint32_t i = 0; i < 4; ++i)
++        {
++            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++            w[i].dstSet = m_set;
++            w[i].dstBinding = i;
++            w[i].descriptorCount = 1;
++            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++            w[i].pBufferInfo = &bi[i];
++        }
++        vkUpdateDescriptorSets(m_dev, 4, w, 0, nullptr);
++        {
++            VkDescriptorImageInfo ii{m_rttSmp, m_rttView, VK_IMAGE_LAYOUT_GENERAL};
++            VkWriteDescriptorSet wi{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
++            wi.dstSet = m_set; wi.dstBinding = 4; wi.descriptorCount = 1;
++            wi.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wi.pImageInfo = &ii;
++            vkUpdateDescriptorSets(m_dev, 1, &wi, 0, nullptr);
++        }
++        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++        pci.queueFamilyIndex = qfam;
++        if (vkCreateCommandPool(m_dev, &pci, nullptr, &m_pool) != VK_SUCCESS) return false;
++        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++        cai.commandPool = m_pool;
++        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        cai.commandBufferCount = 1;
++        if (vkAllocateCommandBuffers(m_dev, &cai, &m_cmd) != VK_SUCCESS) return false;
++        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++        if (vkCreateFence(m_dev, &fci, nullptr, &m_fence) != VK_SUCCESS) return false;
++        // zero VRAM + ownership (matches the reference's zeroed memory)
++        begin();
++        vkCmdFillBuffer(m_cmd, m_vram, 0, VK_WHOLE_SIZE, 0u);
++        vkCmdFillBuffer(m_cmd, m_own, 0, VK_WHOLE_SIZE, 0u);
++        for (VkImage im : {m_rttImg, m_scrImg})
++        {   // aux images: UNDEFINED -> GENERAL, cleared
++            if (!im) continue;
++            VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++            ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++            ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++            ib.image = im; ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++            vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
++            VkClearColorValue cc{};
++            vkCmdClearColorImage(m_cmd, im, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &ib.subresourceRange);
++        }
++        barrier();
++        submitWait();
++        m_ok = true;
++        renderInit();
++        std::fprintf(stderr, "[gs:vk] VRAM mirror ready (4 MB, compute swizzle, lut %zu entries, check every %u presents)\n", m_lut.size(), m_checkEvery);
++        return true;
++    }
++
++    void destroy()
++    {
++        if (!m_dev) return;
++        vkDeviceWaitIdle(m_dev);
++        renderDestroy();
++        auto kill = [&](VkBuffer &b, VkDeviceMemory &m) { if (b) vkDestroyBuffer(m_dev, b, nullptr); if (m) vkFreeMemory(m_dev, m, nullptr); b = VK_NULL_HANDLE; m = VK_NULL_HANDLE; };
++        kill(m_vram, m_vramMem); kill(m_own, m_ownMem); kill(m_lutBuf, m_lutMem); kill(m_stage, m_stageMem); kill(m_rb, m_rbMem);
++        if (m_fence) vkDestroyFence(m_dev, m_fence, nullptr);
++        if (m_pool) vkDestroyCommandPool(m_dev, m_pool, nullptr);
++        if (m_pipe) vkDestroyPipeline(m_dev, m_pipe, nullptr);
++        if (m_pl) vkDestroyPipelineLayout(m_dev, m_pl, nullptr);
++        if (m_dpool) vkDestroyDescriptorPool(m_dev, m_dpool, nullptr);
++        if (m_dsl) vkDestroyDescriptorSetLayout(m_dev, m_dsl, nullptr);
++        if (m_rttSmp) vkDestroySampler(m_dev, m_rttSmp, nullptr);
++        if (m_rttView) vkDestroyImageView(m_dev, m_rttView, nullptr);
++        for (auto im : {std::make_pair(m_rttImg, m_rttMem), std::make_pair(m_scrImg, m_scrMem)})
++        { if (im.first) vkDestroyImage(m_dev, im.first, nullptr); if (im.second) vkFreeMemory(m_dev, im.second, nullptr); }
++        m_dev = VK_NULL_HANDLE;
++        m_ok = false;
++    }
++
++    // ---- event hooks (any thread) ----
++    void beginTransfer(const GSTransferCommand &c)
++    {
++        if (!m_ok) return;
++        std::lock_guard<std::mutex> lk(m_m);
++        waitInFlight();
++        flushTxLocked();
++        if (c.direction == 0u)
++        {
++            m_tx = c;
++            m_txActive = true;
++            m_txBytes.clear();
++            m_txDone = 0;
++        }
++        else if (c.direction == 2u)
++        {
++            static const bool s_l2lLog = std::getenv("PS2X_VK_L2LLOG") != nullptr; // debug: log local->local copies
++            static unsigned s_l2lN = 0;
++            if (s_l2lLog && s_l2lN < 400u)
++            {
++                ++s_l2lN;
++                std::fprintf(stderr, "[gs:vk:l2l] sbp %x sbw %u spsm %x ss %u,%u -> dbp %x dbw %u dpsm %x ds %u,%u size %ux%u\n", c.bitbltbuf.sbp, c.bitbltbuf.sbw, c.bitbltbuf.spsm,
++                             c.trxpos.ssax, c.trxpos.ssay, c.bitbltbuf.dbp, c.bitbltbuf.dbw, c.bitbltbuf.dpsm, c.trxpos.dsax, c.trxpos.dsay, c.trxreg.rrw, c.trxreg.rrh);
++            }
++            if (!localCopyLocked(c))
++                disownRectLocked(c.bitbltbuf.dbp, c.bitbltbuf.dbw, c.bitbltbuf.dpsm, c.trxpos.dsay, static_cast<uint32_t>(c.trxpos.dsay) + c.trxreg.rrh);
++        }
++    }
++    void upload(const uint8_t *d, uint32_t n)
++    {
++        if (!m_ok || !d || !n) return;
++        std::lock_guard<std::mutex> lk(m_m);
++        waitInFlight();
++        if (m_txActive)
++            m_txBytes.insert(m_txBytes.end(), d, d + n);
++    }
++    void draw(const GSContext &c)
++    {
++        if (!m_ok) return;
++        std::lock_guard<std::mutex> lk(m_m);
++        waitInFlight();
++        if (m_txActive && m_txBytes.size() > m_txFlushedBytes)
++            flushTxLocked(false);
++        const uint64_t k = (uint64_t)c.frame.fbp | ((uint64_t)c.frame.fbw << 9) | ((uint64_t)c.frame.psm << 16) | ((uint64_t)c.zbuf.zbp << 22) |
++                           ((uint64_t)c.zbuf.psm << 31) | ((uint64_t)(c.zbuf.zmask ? 1 : 0) << 37) | ((uint64_t)c.scissor.y0 << 38) | ((uint64_t)c.scissor.y1 << 50);
++        if (k == m_lastDrawKey && !m_ownedSinceDraw)
++            return;
++        m_lastDrawKey = k;
++        m_ownedSinceDraw = false;
++        disownRectLocked(c.frame.fbp * 32u, c.frame.fbw, c.frame.psm, c.scissor.y0, static_cast<uint32_t>(c.scissor.y1) + 1u);
++        if (!c.zbuf.zmask)
++            disownRectLocked(c.zbuf.zbp * 32u, c.frame.fbw, c.zbuf.psm, c.scissor.y0, static_cast<uint32_t>(c.scissor.y1) + 1u);
++    }
++    void disownAll()
++    {
++        if (!m_ok) return;
++        std::lock_guard<std::mutex> lk(m_m);
++        waitInFlight();
++        flushTxLocked(false);
++        ensureCompute();
++        vkCmdFillBuffer(m_cmd, m_own, 0, VK_WHOLE_SIZE, 0u);
++        barrier();
++        for (auto &o : m_pageOwned) o = 0;
++    }
++    // At present: submit everything; optionally compare with the reference VRAM.
++    void endFrame(GSRasterBackend *ref, const GSPresentationRequest *req = nullptr, const PresentationFrame *frame = nullptr,
++                  std::vector<uint8_t> *vkPix = nullptr, uint32_t *vkW = nullptr, uint32_t *vkH = nullptr)
++    {
++        if (!m_ok) return;
++        std::lock_guard<std::mutex> lk(m_m);
++        waitInFlight();
++        flushTxLocked(false);
++        endRenderingLocked();
++        ++m_frames;
++        uint32_t pw = 0, ph = 0, srcW = 0;
++        static const bool s_syncPres = std::getenv("PS2X_VK_SYNCPRES") && std::getenv("PS2X_VK_SYNCPRES")[0] == '1';
++        const bool async = m_rOn && !s_syncPres && !m_cmpEvery && !m_checkEvery && !std::getenv("PS2X_VK_DUMP");
++        if (m_rOn) { m_presCur = async ? (m_presCur ^ 1u) : 0u; m_pres = m_presB[m_presCur]; m_presMem = m_presMemB[m_presCur]; m_presMap = m_presMapB[m_presCur]; }
++        const bool havePres = m_rOn && req && frame && vkPix && recordPresentLocked(*frame, *req, pw, ph, srcW);
++        const bool check = m_checkEvery && ref && (m_frames % m_checkEvery) == 0u;
++        if (!m_begun && !check)
++        {
++            m_stageUsed = 0;
++            return;
++        }
++        ensureCompute();
++        uint32_t rtCount = 0;
++        if (check)
++        {
++            if (std::getenv("PS2X_VK_DUMPVRAM") && m_rOn) { writeBackRangeLocked(0, kVram); ensureCompute(); } // debug: flush drawn targets first
++            VkBufferCopy c0{0, 0, kVram}, c1{0, kVram, kVram};
++            vkCmdCopyBuffer(m_cmd, m_vram, m_rb, 1, &c0);
++            vkCmdCopyBuffer(m_cmd, m_own, m_rb, 1, &c1);
++            rtCount = recordRoundTripLocked();
++            barrier(true);
++        }
++        // async: hand out the previous frame's readback (complete: every locked call waited for its fence)
++        const bool prevPres = async && m_presHave;
++        const uint32_t prevW = m_presW, prevH = m_presH;
++        const void *prevMap = m_presMapB[m_presCur ^ 1u];
++        if (async) submitAsync(); else submitWait();
++        m_presHave = havePres; m_presW = pw; m_presH = ph;
++        m_stageUsed = 0;
++        m_ringUsed = 0;
++        if (async)
++        {
++            if (m_rOn && frame) ++m_rFrames;
++            if (prevPres && vkPix)
++            {   // one pass from (cached) readback memory, alpha forced to 255
++                const size_t n = static_cast<size_t>(prevW) * prevH;
++                vkPix->resize(n * 4u);
++                const uint32_t *s32 = static_cast<const uint32_t *>(prevMap);
++                uint32_t *d32 = reinterpret_cast<uint32_t *>(vkPix->data());
++                for (size_t i = 0; i < n; ++i) d32[i] = s32[i] | 0xFF000000u;
++                *vkW = prevW; *vkH = prevH;
++            }
++            static const bool s_profA = std::getenv("PS2X_VK_PROF") != nullptr;
++            if (s_profA && m_rFrames % 300u == 0u)
++            {
++                std::fprintf(stderr, "[gs:vk:prof] per frame (async): submits %.2f wait %.2f ms\n", m_pSubs / 300.0, m_pWaitMs / 300.0);
++                m_pSubs = 0; m_pWaitMs = 0;
++            }
++            return;
++        }
++        if (m_rOn && frame)
++        {
++            ++m_rFrames;
++            static const bool s_prof = std::getenv("PS2X_VK_PROF") != nullptr;
++            if (s_prof && m_rFrames % 300u == 0u)
++            {
++                std::fprintf(stderr, "[gs:vk:prof] per frame: submits %.2f wait %.2f ms | totals: batches %llu passes %llu wb %llu seeds %llu xsync %llu clut %llu\n", m_pSubs / 300.0, m_pWaitMs / 300.0,
++                             (unsigned long long)m_rs.batches, (unsigned long long)m_rs.passes, (unsigned long long)m_rs.writebacks, (unsigned long long)m_rs.seeds, (unsigned long long)m_rs.xsync, 0ull);
++                m_pSubs = 0; m_pWaitMs = 0;
++            }
++            if (havePres)
++            {
++                const uint8_t *src = static_cast<const uint8_t *>(m_presMap);
++                const size_t n = static_cast<size_t>(pw) * ph;
++                vkPix->resize(n * 4u);
++                const uint32_t *s32 = reinterpret_cast<const uint32_t *>(src);
++                uint32_t *d32 = reinterpret_cast<uint32_t *>(vkPix->data());
++                for (size_t i = 0; i < n; ++i) d32[i] = s32[i] | 0xFF000000u;
++                *vkW = pw; *vkH = ph;
++            }
++            if (m_cmpEvery && (m_rFrames % m_cmpEvery) == 0u)
++            {
++                double sum = 0; uint64_t big = 0, n = 0;
++                if (havePres && frame->width == pw && frame->height == ph && frame->pixels.size() >= vkPix->size())
++                    for (size_t i = 0; i < vkPix->size(); i += 4)
++                    {
++                        int d = 0;
++                        for (int k = 0; k < 3; ++k) d = std::max(d, std::abs(int((*vkPix)[i + k]) - int(frame->pixels[i + k])));
++                        sum += d; if (d > 24) ++big; ++n;
++                    }
++                std::fprintf(stderr, "[gs:vk:render] frame %llu: %s %ux%u | vs reference: mean max-channel diff %.1f, %.1f%% px >24 | batches %llu verts %llu passes %llu pipelines %llu targets %llu skipped %llu\n",
++                             (unsigned long long)m_rFrames, havePres ? "presented" : "NO TARGET", pw, ph, n ? sum / n : -1.0, n ? 100.0 * big / n : -1.0,
++                             (unsigned long long)m_rs.batches, (unsigned long long)m_rs.verts, (unsigned long long)m_rs.passes,
++                             (unsigned long long)m_rs.pipelines, (unsigned long long)m_rs.targets, (unsigned long long)m_rs.skipped);
++                if (m_rs.writebacks || m_rs.seeds) std::fprintf(stderr, "[gs:vk:render] write-backs %llu seeds %llu xsync %llu clut loads %llu\n", (unsigned long long)m_rs.writebacks, (unsigned long long)m_rs.seeds, (unsigned long long)m_rs.xsync, (unsigned long long)m_clutLoads);
++                m_rs.batches = m_rs.verts = m_rs.passes = m_rs.skipped = m_rs.writebacks = m_rs.seeds = m_rs.xsync = 0;
++                if (std::getenv("PS2X_VK_TDEBUG"))
++                {
++                    std::fprintf(stderr, "[gs:vk:tgt] want %05llx shown %05llx src %ux%u |", (unsigned long long)m_wantKey, (unsigned long long)m_presKey, frame->width, frame->height);
++                    for (auto &kv : m_colorT)
++                        if (kv.second.draws) std::fprintf(stderr, " %05llx:%llu@%llu", (unsigned long long)kv.first, (unsigned long long)kv.second.draws, (unsigned long long)kv.second.lastF);
++                    std::fprintf(stderr, "\n");
++                }
++                for (auto &kv : m_colorT) kv.second.draws = 0;
++                static const double s_dumpMin = std::getenv("PS2X_VK_DUMPMIN") ? std::atof(std::getenv("PS2X_VK_DUMPMIN")) : -1.0; // debug: only dump frames this different
++                if (const char *d = std::getenv("PS2X_VK_DUMP"); d && havePres && frame->width == pw && frame->height == ph && (n ? sum / n : 0.0) >= s_dumpMin)
++                {   // side-by-side PPM: Vulkan | reference
++                    char path[512]; std::snprintf(path, sizeof(path), "%s_%llu.ppm", d, (unsigned long long)m_rFrames);
++                    if (FILE *f = std::fopen(path, "wb"))
++                    {
++                        std::fprintf(f, "P6\n%u %u\n255\n", pw * 2, ph);
++                        std::vector<uint8_t> row(pw * 6u);
++                        for (uint32_t y = 0; y < ph; ++y)
++                        {
++                            for (uint32_t x = 0; x < pw; ++x)
++                                for (int k = 0; k < 3; ++k)
++                                {
++                                    row[x * 3 + k] = (*vkPix)[(size_t(y) * pw + x) * 4 + k];
++                                    row[(pw + x) * 3 + k] = frame->pixels[(size_t(y) * pw + x) * 4 + k];
++                                }
++                            std::fwrite(row.data(), 1, row.size(), f);
++                        }
++                        std::fclose(f);
++                    }
++                }
++            }
++        }
++        if (!check)
++            return;
++        std::vector<uint8_t> refVram;
++        ref->SnapshotVram(refVram);
++        const uint32_t *mv = static_cast<const uint32_t *>(m_rbMap);
++        const uint32_t *ow = mv + kVram / 4u;
++        if (const char *d = std::getenv("PS2X_VK_DUMPVRAM"); d && refVram.size() >= kVram)
++        {   // decode one buffer region from mirror and reference VRAM: left = Vulkan mirror, right = reference
++            unsigned fbp = 70, fbw = 10, psm = 0, w = 640, h = 448;
++            if (const char *r = std::getenv("PS2X_VK_DUMPREG")) std::sscanf(r, "%u,%u,%x,%u,%u", &fbp, &fbw, &psm, &w, &h);
++            const Fmt f = fmt(psm);
++            const uint32_t *rv = reinterpret_cast<const uint32_t *>(refVram.data());
++            char path[512]; std::snprintf(path, sizeof(path), "%s_%llu.ppm", d, (unsigned long long)m_frames);
++            if (FILE *fp = f.ok ? std::fopen(path, "wb") : nullptr)
++            {
++                std::fprintf(fp, "P6\n%u %u\n255\n", w * 2, h);
++                const uint32_t ppr = std::max<uint32_t>(1u, fbw * 64u / f.pw);
++                for (uint32_t y = 0; y < h; ++y)
++                    for (int side = 0; side < 2; ++side)
++                        for (uint32_t x = 0; x < w; ++x)
++                        {
++                            const uint32_t page = (y / f.ph) * ppr + x / f.pw;
++                            const uint32_t bit = (fbp * 65536u + page * 65536u + m_lut[f.lut + (y % f.ph) * f.pw + (x % f.pw)] + f.shift) & 0x1FFFFFFu;
++                            uint32_t v = (side ? rv : mv)[bit >> 5] >> (bit & 31u);
++                            uint8_t px[3];
++                            if (f.nbits <= 16) { px[0] = (v & 31u) << 3; px[1] = ((v >> 5) & 31u) << 3; px[2] = ((v >> 10) & 31u) << 3; }
++                            else { px[0] = v & 255u; px[1] = (v >> 8) & 255u; px[2] = (v >> 16) & 255u; }
++                            std::fwrite(px, 1, 3, fp);
++                        }
++                std::fclose(fp);
++            }
++        }
++        uint64_t ownedWords = 0, ownedBits = 0, bad = 0;
++        uint32_t firstBad = UINT32_MAX;
++        if (refVram.size() >= kVram)
++        {
++            const uint32_t *rv = reinterpret_cast<const uint32_t *>(refVram.data());
++            for (uint32_t i = 0; i < kVram / 4u; ++i)
++            {
++                const uint32_t m = ow[i];
++                if (!m) continue;
++                ++ownedWords;
++                ownedBits += static_cast<uint64_t>(__builtin_popcount(m));
++                if ((mv[i] ^ rv[i]) & m)
++                {
++                    if (firstBad == UINT32_MAX) firstBad = i;
++                    ++bad;
++                }
++            }
++        }
++        // unswizzle round trip of the last upload (values written by the dispatch must read back identically)
++        uint64_t rtBad = 0;
++        if (rtCount)
++        {
++            const uint32_t *out = static_cast<const uint32_t *>(m_stageMap) + m_rtOutWord;
++            for (uint32_t i = 0; i < rtCount; ++i)
++                if (out[i] != m_rtExpect[i]) ++rtBad;
++        }
++        ++m_checks;
++        if (bad) ++m_badChecks;
++        std::fprintf(stderr, "[gs:vk:vram] check %llu: owned %llu words (%.2f MB of bits) mismatched %llu%s | uploads %llu (%.1f MB) dispatches %llu disowns %llu | unswizzle round trip %u px, %llu bad | checks failed %llu/%llu\n",
++                     (unsigned long long)m_checks, (unsigned long long)ownedWords, ownedBits / 8.0 / 1048576.0, (unsigned long long)bad,
++                     firstBad != UINT32_MAX ? (" first@0x" + hex(firstBad * 4u) + " mirror=" + hex(mv[firstBad]) + " ref=" + hex(reinterpret_cast<const uint32_t *>(refVram.data())[firstBad]) + " own=" + hex(ow[firstBad])).c_str() : "",
++                     (unsigned long long)m_uploads, m_uploadBytes / 1048576.0, (unsigned long long)m_dispatches, (unsigned long long)m_disowns, rtCount,
++                     (unsigned long long)rtBad, (unsigned long long)m_badChecks, (unsigned long long)m_checks);
++    }
++
++private:
++    struct PC
++    {
++        uint32_t ioBitBase, firstPixel, count, srcBits, lutBase, pw, ph, ppr, baseBits, dsax, dsay, rrw, nbits, shift, mode;
++    };
++    struct Fmt { uint32_t lut, pw, ph, srcBits, nbits, shift; bool ok; };
++    enum { L_CT32, L_Z32, L_CT16, L_CT16S, L_Z16, L_Z16S, L_T8, L_T4, L_N };
++
++    static std::string hex(uint32_t v) { char b[16]; std::snprintf(b, sizeof b, "%08x", v); return b; }
++
++    Fmt fmt(uint32_t psm) const
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT32: return {m_lutOff[L_CT32], 64, 32, 32, 32, 0, true};
++        case GS_PSM_CT24: return {m_lutOff[L_CT32], 64, 32, 24, 24, 0, true};
++        case GS_PSM_CT16: return {m_lutOff[L_CT16], 64, 64, 16, 16, 0, true};
++        case GS_PSM_CT16S: return {m_lutOff[L_CT16S], 64, 64, 16, 16, 0, true};
++        case GS_PSM_T8: return {m_lutOff[L_T8], 128, 64, 8, 8, 0, true};
++        case GS_PSM_T4: return {m_lutOff[L_T4], 128, 128, 4, 4, 0, true};
++        case GS_PSM_T8H: return {m_lutOff[L_CT32], 64, 32, 8, 8, 24, true};
++        case GS_PSM_T4HL: return {m_lutOff[L_CT32], 64, 32, 4, 4, 24, true};
++        case GS_PSM_T4HH: return {m_lutOff[L_CT32], 64, 32, 4, 4, 28, true};
++        case GS_PSM_Z32: return {m_lutOff[L_Z32], 64, 32, 32, 32, 0, true};
++        case GS_PSM_Z24: return {m_lutOff[L_Z32], 64, 32, 24, 24, 0, true};
++        case GS_PSM_Z16: return {m_lutOff[L_Z16], 64, 64, 16, 16, 0, true};
++        case GS_PSM_Z16S: return {m_lutOff[L_Z16S], 64, 64, 16, 16, 0, true};
++        default: return {0, 64, 32, 32, 32, 0, false};
++        }
++    }
++
++    // Page-local bit-offset tables from the runtime's own GS memory functions (scratch CPU backend + 4 MB).
++    void buildLuts()
++    {
++        struct L { uint32_t psm, pw, ph, bits; } ls[L_N] = {{GS_PSM_CT32, 64, 32, 32}, {GS_PSM_Z32, 64, 32, 32}, {GS_PSM_CT16, 64, 64, 16},
++                                                         {GS_PSM_CT16S, 64, 64, 16}, {GS_PSM_Z16, 64, 64, 16}, {GS_PSM_Z16S, 64, 64, 16},
++                                                         {GS_PSM_T8, 128, 64, 8}, {GS_PSM_T4, 128, 128, 4}};
++        std::vector<uint8_t> mem(kVram, 0);
++        GSCpuBackend cpu;
++        cpu.Initialize(mem.data(), kVram);
++        for (int f = 0; f < L_N; ++f)
++        {
++            const L &l = ls[f];
++            const uint32_t n = l.pw * l.ph, slots = 65536u / l.bits;
++            std::vector<uint32_t> slotPix(slots, 0);
++            const uint32_t ones = l.bits >= 32 ? 0xFFFFFFFFu : ((1u << l.bits) - 1u);
++            for (uint32_t k = 0; (1u << k) < n; ++k)
++            {
++                std::memset(mem.data(), 0, 8192);
++                for (uint32_t i = 0; i < n; ++i)
++                    if ((i >> k) & 1u)
++                        cpu.WriteVram(l.psm, 0, l.pw / 64u, i % l.pw, i / l.pw, ones);
++                for (uint32_t s = 0; s < slots; ++s)
++                {
++                    const uint32_t bit = s * l.bits;
++                    uint32_t w;
++                    std::memcpy(&w, mem.data() + (bit >> 5) * 4u, 4);
++                    if ((w >> (bit & 31u)) & ones)
++                        slotPix[s] |= 1u << k;
++                }
++            }
++            m_lutOff[f] = static_cast<uint32_t>(m_lut.size());
++            m_lut.resize(m_lut.size() + n, 0);
++            for (uint32_t s = 0; s < slots; ++s)
++                if (slotPix[s] < n)
++                    m_lut[m_lutOff[f] + slotPix[s]] = s * l.bits;
++        }
++    }
++
++    void disownRectLocked(uint32_t baseBlock, uint32_t bw, uint32_t psm, uint32_t y0, uint32_t y1)
++    {
++        const Fmt f = fmt(psm);
++        const uint32_t ppr = std::max<uint32_t>(1u, (bw * 64u) / f.pw);
++        const uint32_t p0 = baseBlock / 32u;
++        const uint32_t r0 = y0 / f.ph, r1 = (std::max(y1, y0 + 1u) - 1u) / f.ph;
++        for (uint32_t r = r0; r <= r1 && r < 64u; ++r)
++            for (uint32_t c = 0; c <= ppr; ++c) // +1 page: base not page aligned
++            {
++                const uint32_t pg = (p0 + r * ppr + c) % kPages;
++                if (!m_pageOwned[pg]) continue;
++                m_pageOwned[pg] = 0;
++                ensureCompute();
++                vkCmdFillBuffer(m_cmd, m_own, static_cast<VkDeviceSize>(pg) * 8192u, 8192u, 0u);
++                m_needBarrier = true;
++                ++m_disowns;
++            }
++        if (m_needBarrier) { barrier(); m_needBarrier = false; }
++    }
++
++    // Local->local transfer (TRXDIR 2) done in the mirror when Vulkan renders: write back dirty targets over the source
++    // and destination, unswizzle the source rect to staging (mode 1, one raw GS value per word), swizzle it into the
++    // destination (mode 0, 32-bit io), then re-seed targets over the destination. Menus restore their background
++    // this way every frame (e.g. 0x1a40 -> 0x8c0, 640x448 CT32). PS2X_VK_L2L=0 restores the old disown-only path.
++    bool localCopyLocked(const GSTransferCommand &c)
++    {
++        static const bool s_noL2l = [] { const char *e = std::getenv("PS2X_VK_L2L"); return e && e[0] == '0'; }();
++        if (!m_rOn || s_noL2l) return false;
++        const Fmt fs = fmt(c.bitbltbuf.spsm), fd = fmt(c.bitbltbuf.dpsm);
++        const uint32_t rrw = c.trxreg.rrw, rrh = c.trxreg.rrh;
++        if (!fs.ok || !fd.ok || rrw == 0 || rrh == 0) return false;
++        const uint64_t n = static_cast<uint64_t>(rrw) * rrh, alloc = (n * 4u + 255u) & ~255ull;
++        if (alloc > kStaging) return false;
++        const uint32_t sbw = std::max<uint32_t>(c.bitbltbuf.sbw, 1u), dbw = std::max<uint32_t>(c.bitbltbuf.dbw, 1u);
++        const uint64_t sB = static_cast<uint64_t>(c.bitbltbuf.sbp) * 256u, sE = sB + static_cast<uint64_t>(sbw) * 64u * (c.trxpos.ssay + rrh) * texBits(c.bitbltbuf.spsm) / 8u;
++        const uint64_t dB = static_cast<uint64_t>(c.bitbltbuf.dbp) * 256u, dE = dB + static_cast<uint64_t>(dbw) * 64u * (c.trxpos.dsay + rrh) * texBits(c.bitbltbuf.dpsm) / 8u;
++        preUploadLocked(sB, sE);
++        preUploadLocked(dB, dE);
++        if (m_stageUsed + alloc > kStaging) { if (m_begun) submitWait(); m_stageUsed = 0; }
++        ensureCompute();
++        PC pc{};
++        pc.ioBitBase = static_cast<uint32_t>(m_stageUsed / 4u);
++        pc.firstPixel = 0; pc.count = static_cast<uint32_t>(n);
++        pc.srcBits = 32; pc.lutBase = fs.lut; pc.pw = fs.pw; pc.ph = fs.ph;
++        pc.ppr = std::max<uint32_t>(1u, sbw * 64u / fs.pw);
++        pc.baseBits = (c.bitbltbuf.sbp * 256u * 8u) & 0x1FFFFFFu;
++        pc.dsax = c.trxpos.ssax; pc.dsay = c.trxpos.ssay; pc.rrw = rrw;
++        pc.nbits = fs.nbits; pc.shift = fs.shift; pc.mode = 1;
++        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
++        vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pl, 0, 1, &m_set, 0, nullptr);
++        vkCmdPushConstants(m_cmd, m_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
++        vkCmdDispatch(m_cmd, (pc.count + 63u) / 64u, 1, 1);
++        barrier();
++        pc.ioBitBase = static_cast<uint32_t>(m_stageUsed * 8u);
++        pc.lutBase = fd.lut; pc.pw = fd.pw; pc.ph = fd.ph;
++        pc.ppr = std::max<uint32_t>(1u, dbw * 64u / fd.pw);
++        pc.baseBits = (c.bitbltbuf.dbp * 256u * 8u) & 0x1FFFFFFu;
++        pc.dsax = c.trxpos.dsax; pc.dsay = c.trxpos.dsay;
++        pc.nbits = fd.nbits; pc.shift = fd.shift; pc.mode = 0;
++        vkCmdPushConstants(m_cmd, m_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
++        vkCmdDispatch(m_cmd, (pc.count + 63u) / 64u, 1, 1);
++        barrier();
++        m_stageUsed += alloc;
++        ++m_dispatches;
++        postUploadLocked(dB, dE);
++        const uint32_t p0 = c.bitbltbuf.dbp / 32u;
++        for (uint32_t r = c.trxpos.dsay / fd.ph; r <= (c.trxpos.dsay + rrh - 1u) / fd.ph && r < 64u; ++r)
++            for (uint32_t col = 0; col <= pc.ppr; ++col)
++                m_pageOwned[(p0 + r * pc.ppr + col) % kPages] = 1;
++        m_ownedSinceDraw = true;
++        return true;
++    }
++    void flushTxLocked(bool finish = true)
++    {
++        if (!m_txActive) return;
++        const Fmt f = fmt(m_tx.bitbltbuf.dpsm);
++        const uint32_t rrw = m_tx.trxreg.rrw, rrh = m_tx.trxreg.rrh;
++        if (!f.ok || rrw == 0 || rrh == 0) { if (finish) m_txActive = false; return; }
++        const uint64_t total = static_cast<uint64_t>(rrw) * rrh;
++        const uint64_t have = std::min<uint64_t>(total, (static_cast<uint64_t>(m_txBytes.size()) * 8u) / f.srcBits);
++        if (have > m_txDone)
++        {
++            const uint64_t startBit = m_txDone * f.srcBits;
++            const uint64_t startByte = (startBit / 32u) * 4u;
++            const uint64_t endByte = std::min<uint64_t>(m_txBytes.size(), ((have * f.srcBits + 31u) / 32u) * 4u);
++            const uint32_t len = static_cast<uint32_t>(endByte - startByte);
++            const uint32_t alloc = (len + 8u + 255u) & ~255u;
++            const uint64_t txB = static_cast<uint64_t>(m_tx.bitbltbuf.dbp) * 256u;
++            const uint64_t txE = txB + static_cast<uint64_t>(std::max<uint32_t>(m_tx.bitbltbuf.dbw, 1u)) * 64u * (m_tx.trxpos.dsay + rrh) * texBits(m_tx.bitbltbuf.dpsm) / 8u;
++            preUploadLocked(txB, txE);
++            if (m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8)
++                std::fprintf(stderr, "[gs:vk:tx] f%llu dbp %x dbw %u dpsm %x y %u h %u\n", (unsigned long long)(m_rFrames + 1), m_tx.bitbltbuf.dbp, m_tx.bitbltbuf.dbw, m_tx.bitbltbuf.dpsm, m_tx.trxpos.dsay, rrh);
++            if (m_stageUsed + alloc > kStaging)
++            {
++                if (m_begun) submitWait();
++                m_stageUsed = 0;
++            }
++            if (alloc <= kStaging)
++            {
++                uint8_t *dst = static_cast<uint8_t *>(m_stageMap) + m_stageUsed;
++                std::memcpy(dst, m_txBytes.data() + startByte, len);
++                std::memset(dst + len, 0, alloc - len);
++                PC pc{};
++                pc.ioBitBase = static_cast<uint32_t>(m_stageUsed * 8u + (startBit - startByte * 8u));
++                pc.firstPixel = static_cast<uint32_t>(m_txDone);
++                pc.count = static_cast<uint32_t>(have - m_txDone);
++                pc.srcBits = f.srcBits; pc.lutBase = f.lut; pc.pw = f.pw; pc.ph = f.ph;
++                pc.ppr = std::max<uint32_t>(1u, (std::max<uint32_t>(m_tx.bitbltbuf.dbw, 1u) * 64u) / f.pw);
++                pc.baseBits = (m_tx.bitbltbuf.dbp * 256u * 8u) & 0x1FFFFFFu;
++                pc.dsax = m_tx.trxpos.dsax; pc.dsay = m_tx.trxpos.dsay; pc.rrw = rrw;
++                pc.nbits = f.nbits; pc.shift = f.shift; pc.mode = 0;
++                ensureCompute();
++                vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
++                vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pl, 0, 1, &m_set, 0, nullptr);
++                vkCmdPushConstants(m_cmd, m_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
++                vkCmdDispatch(m_cmd, (pc.count + 63u) / 64u, 1, 1);
++                barrier();
++                m_stageUsed += alloc;
++                ++m_dispatches;
++                m_uploadBytes += len;
++                postUploadLocked(txB, txE);
++                // remember for the round-trip check (32/16/8-bit sources only, first 4096 pixels)
++                m_rtPc = pc;
++                m_rtValid = true;
++                m_rtExpect.clear();
++                const uint32_t nrt = std::min<uint32_t>(pc.count, 4096u);
++                for (uint32_t i = 0; i < nrt; ++i)
++                {
++                    const uint64_t sb = (m_txDone + i) * f.srcBits;
++                    uint64_t v = 0;
++                    for (uint32_t b = 0; b < (f.srcBits + 7u) / 8u + 1u && (sb / 8u + b) < m_txBytes.size(); ++b)
++                        v |= static_cast<uint64_t>(m_txBytes[sb / 8u + b]) << (8u * b);
++                    v >>= (sb & 7u);
++                    m_rtExpect.push_back(static_cast<uint32_t>(v & (f.nbits >= 32 ? 0xFFFFFFFFull : ((1ull << f.nbits) - 1ull))));
++                }
++                // mark pages possibly owned (rows touched by this dispatch)
++                const uint32_t ya = pc.dsay + pc.firstPixel / rrw, yb = pc.dsay + (pc.firstPixel + pc.count - 1u) / rrw;
++                const uint32_t p0 = m_tx.bitbltbuf.dbp / 32u;
++                for (uint32_t r = ya / f.ph; r <= yb / f.ph && r < 64u; ++r)
++                    for (uint32_t c = 0; c <= pc.ppr; ++c)
++                        m_pageOwned[(p0 + r * pc.ppr + c) % kPages] = 1;
++                m_ownedSinceDraw = true;
++            }
++            m_txDone = have;
++        }
++        m_txFlushedBytes = m_txBytes.size();
++        if (finish || m_txDone >= total)
++        {
++            if (m_txDone >= total || finish) ++m_uploads;
++            m_txActive = false;
++            m_txBytes.clear();
++            m_txFlushedBytes = 0;
++        }
++    }
++
++    uint32_t recordRoundTripLocked()
++    {
++        if (!m_rtValid || m_rtExpect.empty()) return 0;
++        PC pc = m_rtPc;
++        pc.count = static_cast<uint32_t>(m_rtExpect.size());
++        pc.mode = 1;
++        const uint32_t outByte = (m_stageUsed + 255u) & ~255u;
++        if (outByte + pc.count * 4u > kStaging) return 0;
++        m_rtOutWord = outByte / 4u;
++        pc.ioBitBase = m_rtOutWord;
++        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipe);
++        vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pl, 0, 1, &m_set, 0, nullptr);
++        vkCmdPushConstants(m_cmd, m_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
++        vkCmdDispatch(m_cmd, (pc.count + 63u) / 64u, 1, 1);
++        return pc.count;
++    }
++
++    void ensureBegun() { if (!m_begun) begin(); }
++    void ensureCompute() { endRenderingLocked(); ensureBegun(); }
++    // async present (default when rendering and not comparing; PS2X_VK_SYNCPRES=1 turns it off): the frame's command
++    // buffer is submitted without waiting; the next locked call (or begin/submitWait) waits for the fence first.
++    bool m_inFlight = false;
++    void waitInFlight()
++    {
++        if (!m_inFlight) return;
++        const auto pt0 = std::chrono::steady_clock::now();
++        vkWaitForFences(m_dev, 1, &m_fence, VK_TRUE, UINT64_MAX);
++        m_pWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pt0).count();
++        vkResetFences(m_dev, 1, &m_fence);
++        m_inFlight = false;
++        probePrint();
++    }
++    void submitAsync()
++    {
++        if (!m_begun) return;
++        endRenderingLocked();
++        vkEndCommandBuffer(m_cmd);
++        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++        si.commandBufferCount = 1;
++        si.pCommandBuffers = &m_cmd;
++        ++m_pSubs;
++        if (vkQueueSubmit(m_q, 1, &si, m_fence) == VK_SUCCESS) m_inFlight = true;
++        m_begun = false;
++        m_clutPending = 0;
++    }
++    void begin()
++    {
++        waitInFlight();
++        vkResetCommandBuffer(m_cmd, 0);
++        VkCommandBufferBeginInfo bb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++        bb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        vkBeginCommandBuffer(m_cmd, &bb);
++        m_begun = true;
++    }
++    void barrier(bool toHost = false)
++    {
++        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
++        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | (toHost ? VK_ACCESS_HOST_READ_BIT : 0u);
++        vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | (toHost ? VK_PIPELINE_STAGE_HOST_BIT : 0u),
++                             0, 1, &mb, 0, nullptr, 0, nullptr);
++    }
++    void submitWait()
++    {
++        waitInFlight();
++        if (!m_begun) return;
++        endRenderingLocked();
++        vkEndCommandBuffer(m_cmd);
++        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++        si.commandBufferCount = 1;
++        si.pCommandBuffers = &m_cmd;
++        const auto pt0 = std::chrono::steady_clock::now();
++        ++m_pSubs;
++        if (vkQueueSubmit(m_q, 1, &si, m_fence) == VK_SUCCESS)
++        {
++            vkWaitForFences(m_dev, 1, &m_fence, VK_TRUE, UINT64_MAX);
++            m_pWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pt0).count();
++            vkResetFences(m_dev, 1, &m_fence);
++            probePrint();
++        }
++        m_begun = false;
++        m_clutPending = 0;
++    }
++
++    bool buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props, VkBuffer &b, VkDeviceMemory &m, void **map)
++    {
++        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++        bi.size = size;
++        bi.usage = usage;
++        if (vkCreateBuffer(m_dev, &bi, nullptr, &b) != VK_SUCCESS) return false;
++        VkMemoryRequirements mr;
++        vkGetBufferMemoryRequirements(m_dev, b, &mr);
++        VkPhysicalDeviceMemoryProperties mp;
++        vkGetPhysicalDeviceMemoryProperties(m_phys, &mp);
++        uint32_t idx = UINT32_MAX;
++        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
++            if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) { idx = i; break; }
++        if (idx == UINT32_MAX) return false;
++        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++        ai.allocationSize = mr.size;
++        ai.memoryTypeIndex = idx;
++        if (vkAllocateMemory(m_dev, &ai, nullptr, &m) != VK_SUCCESS) return false;
++        vkBindBufferMemory(m_dev, b, m, 0);
++        if (map && vkMapMemory(m_dev, m, 0, VK_WHOLE_SIZE, 0, map) != VK_SUCCESS) return false;
++        return true;
++    }
++
++    std::mutex m_m;
++    bool m_ok = false, m_begun = false, m_needBarrier = false, m_txActive = false, m_rtValid = false, m_ownedSinceDraw = false;
++    uint32_t m_checkEvery = 0, m_stageUsed = 0, m_rtOutWord = 0;
++    uint64_t m_pSubs = 0; double m_pWaitMs = 0; // PS2X_VK_PROF
++    uint64_t m_frames = 0, m_checks = 0, m_badChecks = 0, m_uploads = 0, m_dispatches = 0, m_disowns = 0, m_lastDrawKey = ~0ull;
++    double m_uploadBytes = 0;
++    GSTransferCommand m_tx{};
++    std::vector<uint8_t> m_txBytes;
++    size_t m_txFlushedBytes = 0;
++    uint64_t m_txDone = 0;
++    PC m_rtPc{};
++    std::vector<uint32_t> m_rtExpect;
++    std::vector<uint32_t> m_lut;
++    uint32_t m_lutOff[L_N] = {};
++    uint8_t m_pageOwned[kPages] = {};
++    VkPhysicalDevice m_phys = VK_NULL_HANDLE;
++    VkDevice m_dev = VK_NULL_HANDLE;
++    VkQueue m_q = VK_NULL_HANDLE;
++    VkBuffer m_vram = VK_NULL_HANDLE, m_own = VK_NULL_HANDLE, m_lutBuf = VK_NULL_HANDLE, m_stage = VK_NULL_HANDLE, m_rb = VK_NULL_HANDLE;
++    VkDeviceMemory m_vramMem = VK_NULL_HANDLE, m_ownMem = VK_NULL_HANDLE, m_lutMem = VK_NULL_HANDLE, m_stageMem = VK_NULL_HANDLE, m_rbMem = VK_NULL_HANDLE;
++    void *m_lutMap = nullptr, *m_stageMap = nullptr, *m_rbMap = nullptr;
++    VkDescriptorSetLayout m_dsl = VK_NULL_HANDLE;
++    VkPipelineLayout m_pl = VK_NULL_HANDLE;
++    VkPipeline m_pipe = VK_NULL_HANDLE;
++    VkDescriptorPool m_dpool = VK_NULL_HANDLE;
++    VkDescriptorSet m_set = VK_NULL_HANDLE;
++    VkCommandPool m_pool = VK_NULL_HANDLE;
++    VkCommandBuffer m_cmd = VK_NULL_HANDLE;
++    VkFence m_fence = VK_NULL_HANDLE;
++    // internal resolution scale (PS2X_VK_SCALE) and its aux images
++    static constexpr uint32_t kScrW = 4096u, kScrH = 1024u;
++    uint32_t m_scale = 1, m_rttW = 1, m_rttH = 1;
++    VkImage m_rttImg = VK_NULL_HANDLE, m_scrImg = VK_NULL_HANDLE;
++    VkDeviceMemory m_rttMem = VK_NULL_HANDLE, m_scrMem = VK_NULL_HANDLE;
++    VkImageView m_rttView = VK_NULL_HANDLE;
++    VkSampler m_rttSmp = VK_NULL_HANDLE;
++    bool auxImage(uint32_t w, uint32_t h, VkImageUsageFlags usage, VkImage &img, VkDeviceMemory &mem, VkImageView *view)
++    {
++        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM; ii.extent = {w, h, 1};
++        ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
++        ii.usage = usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++        if (vkCreateImage(m_dev, &ii, nullptr, &img) != VK_SUCCESS) return false;
++        VkMemoryRequirements mr;
++        vkGetImageMemoryRequirements(m_dev, img, &mr);
++        VkPhysicalDeviceMemoryProperties mp;
++        vkGetPhysicalDeviceMemoryProperties(m_phys, &mp);
++        uint32_t idx = UINT32_MAX;
++        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
++            if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { idx = i; break; }
++        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++        ai.allocationSize = mr.size; ai.memoryTypeIndex = idx;
++        if (idx == UINT32_MAX || vkAllocateMemory(m_dev, &ai, nullptr, &mem) != VK_SUCCESS) return false;
++        vkBindImageMemory(m_dev, img, mem, 0);
++        if (!view) return true;
++        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++        vi.image = img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
++        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++        return vkCreateImageView(m_dev, &vi, nullptr, view) == VK_SUCCESS;
++    }
++
++#include "gs_vk_render.inl"
++};
++#else
++class VkVramMirror
++{
++public:
++    bool init(VkPhysicalDevice, VkDevice, VkQueue, uint32_t) { return false; }
++    void destroy() {}
++    void beginTransfer(const GSTransferCommand &) {}
++    void loadClut(const GSTex0Reg &, const GSTexClutReg &) {}
++    void upload(const uint8_t *, uint32_t) {}
++    void draw(const GSContext &) {}
++    void disownAll() {}
++    void endFrame(GSRasterBackend *, const GSPresentationRequest * = nullptr, const PresentationFrame * = nullptr,
++                  std::vector<uint8_t> * = nullptr, uint32_t * = nullptr, uint32_t * = nullptr) {}
++    bool renderOn() const { return false; }
++    bool comparing() const { return false; }
++    void drawList(const GSDrawList &) {}
++    void drawPrim(const GSPrimitiveBatch &) {}
++};
++#endif
+diff --git a/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.frag b/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.frag
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e3c278d3fdf28e5521ce7f8071d2bc926514174
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.frag
+@@ -0,0 +1,143 @@
++#version 450
++// GS draw fragment: texture fetched straight from the 4 MB VRAM buffer (swizzle LUTs), CLUT from VRAM at CBP,
++// TEXA expansion, TFX, fog, alpha test. Output colour 0..1 (=/255), alpha = As/128 (PS2 1.0 = 0x80).
++layout(std430, binding = 0) readonly buffer Vram { uint vram[]; };
++layout(std430, binding = 2) readonly buffer Lut { uint lut[]; };
++layout(binding = 4) uniform sampler2D rtTex; // scaled render-target copy (flags bit 14; pc 19 scale, 20 w|h<<16)
++layout(location = 0) in vec4 vColor;
++layout(location = 1) flat in vec4 vColorFlat;
++layout(location = 2) in vec3 vStq;
++layout(location = 3) in float vFog;
++layout(location = 0) out vec4 outColor;
++layout(push_constant) uniform PC { uint pc[32]; } p;
++// pc: 0 W, 1 H, 2 flags, 3 aref, 4 texBaseBits, 5 texPpr, 6 texPw|texPh<<16, 7 texLut, 8 texBits|texShift<<8|kind<<16,
++//     9 tw|th<<16, 10 clutBaseBits, 11 clutLut, 12 clutBits(16/32), 13 csa, 14 wms|wmt<<2, 15 minu|maxu<<16,
++//     16 minv|maxv<<16, 17 ta0|ta1<<8, 18 fog rgb
++// flags: 0 tme, 1 iip, 2 fge, 3 tcc, 4-5 tfx, 6 ate, 7-9 atst, 10-11 afail, 12 aem
++uint readPix(uint baseBits, uint ppr, uint pw, uint ph, uint lutBase, uint x, uint y, uint bits, uint shift)
++{
++    uint page = (y / ph) * ppr + (x / pw);
++    uint bit = (baseBits + page * 65536u + lut[lutBase + (y % ph) * pw + (x % pw)] + shift) & 0x1FFFFFFu;
++    uint v = vram[bit >> 5] >> (bit & 31u);
++    return bits >= 32u ? v : (v & ((1u << bits) - 1u));
++}
++vec4 c16(uint v, uint ta0, uint ta1, bool aem)
++{
++    vec3 rgb = vec3(float((v & 31u) << 3), float(((v >> 5) & 31u) << 3), float(((v >> 10) & 31u) << 3));
++    float a = ((v & 0x8000u) != 0u) ? float(ta1) : ((aem && (v & 0x7FFFu) == 0u) ? 0.0 : float(ta0));
++    return vec4(rgb, a);
++}
++vec4 c32(uint v) { return vec4(float(v & 255u), float((v >> 8) & 255u), float((v >> 16) & 255u), float(v >> 24)); }
++uint wrap(int c, uint mode, uint size, uint mn, uint mx)
++{
++    if (mode == 0u) return uint(c) & (size - 1u);
++    if (mode == 1u) return uint(clamp(c, 0, int(size) - 1));
++    if (mode == 2u) return uint(clamp(c, int(mn), int(mx)));
++    return (uint(c) & mn) | mx;
++}
++vec4 texel(int u, int v, uint flags, uint tw, uint th)
++{
++    uint x = wrap(u, p.pc[14] & 3u, tw, p.pc[15] & 0xFFFFu, p.pc[15] >> 16);
++    uint y = wrap(v, (p.pc[14] >> 2) & 3u, th, p.pc[16] & 0xFFFFu, p.pc[16] >> 16);
++    uint kind = (p.pc[8] >> 16) & 255u;
++    uint raw = readPix(p.pc[4], p.pc[5], p.pc[6] & 0xFFFFu, p.pc[6] >> 16, p.pc[7], x, y, p.pc[8] & 255u, (p.pc[8] >> 8) & 255u);
++    uint ta0 = p.pc[17] & 255u, ta1 = (p.pc[17] >> 8) & 255u;
++    bool aem = (flags & 4096u) != 0u;
++    vec4 T;
++    if (kind == 0u) T = c32(raw);
++    else if (kind == 1u) { T = c32(raw); T.a = (aem && (raw & 0xFFFFFFu) == 0u) ? 0.0 : float(ta0); }
++    else if (kind == 2u) T = c16(raw, ta0, ta1, aem);
++    else
++    {
++        uint cx, cy;
++        if (kind == 3u)
++        {
++            uint i = (raw & 0xE7u) | ((raw & 0x08u) << 1) | ((raw & 0x10u) >> 1);
++            cx = i & 15u; cy = i >> 4;
++        }
++        else { cx = raw & 7u; cy = raw >> 3; }
++        uint clutBits = p.pc[12] & 255u;
++        uint cv;
++        if ((p.pc[12] & 256u) != 0u) // CLUT-buffer snapshot (pc[10] = word index of the entry base)
++            cv = vram[p.pc[10] + ((kind == 3u) ? (raw & 255u) : (raw & 15u))] & ((clutBits >= 32u) ? 0xFFFFFFFFu : 0xFFFFu);
++        else
++            cv = readPix(p.pc[10], 1u, 64u, (clutBits == 32u) ? 32u : 64u, p.pc[11], cx, cy, clutBits, 0u);
++        T = (clutBits == 32u) ? c32(cv) : c16(cv, ta0, ta1, aem);
++    }
++    return T;
++}
++vec4 rtTexel(int x, int y, uint flags)
++{   // GS texel from the RTT image: rgb = c*255, alpha stored as A/128 -> GS 0..128
++    int S = int(p.pc[19]);
++    ivec2 lim = ivec2(int(p.pc[20] & 0xFFFFu) * S - 1, int(p.pc[20] >> 16) * S - 1);
++    vec4 c = texelFetch(rtTex, clamp(ivec2(x, y), ivec2(0), lim), 0);
++    vec4 T = vec4(floor(c.rgb * 255.0 + 0.5), floor((floor(c.a * 255.0 + 0.5) * 128.0 + 127.0) / 255.0));
++    if (((p.pc[8] >> 16) & 255u) == 1u)
++        T.a = (((flags & 4096u) != 0u) && T.r + T.g + T.b == 0.0) ? 0.0 : float(p.pc[17] & 255u);
++    return T;
++}
++void main()
++{
++    uint flags = p.pc[2];
++    vec4 F = ((flags & 2u) != 0u) ? vColor : vColorFlat;
++    F = floor(F + 0.5);
++    vec4 C = F;
++    if ((flags & 1u) != 0u)
++    {
++        uint tw = p.pc[9] & 0xFFFFu, th = p.pc[9] >> 16;
++        float q = (vStq.z == 0.0) ? 1.0 : vStq.z;
++        vec4 T;
++        float fu = vStq.x / q * float(tw), fv = vStq.y / q * float(th);
++        if ((flags & 16384u) != 0u)
++        {   // render target at N x: sample the scaled copy (sub-texel detail)
++            float S = float(p.pc[19]);
++            float hu = fu * S, hv = fv * S;
++            if ((flags & 8192u) != 0u)
++            {
++                hu -= 0.5; hv -= 0.5;
++                int u0 = int(floor(hu)), v0 = int(floor(hv));
++                float au = hu - float(u0), av = hv - float(v0);
++                vec4 t00 = rtTexel(u0, v0, flags), t10 = rtTexel(u0 + 1, v0, flags);
++                vec4 t01 = rtTexel(u0, v0 + 1, flags), t11 = rtTexel(u0 + 1, v0 + 1, flags);
++                T = floor(mix(mix(t00, t10, au), mix(t01, t11, au), av) + 0.5);
++            }
++            else
++                T = rtTexel(int(floor(hu)), int(floor(hv)), flags);
++        }
++        else if ((flags & 8192u) != 0u)
++        {   // bilinear (TEX1 MMAG/MMIN linear), GS samples texel centres: (u - 0.5, v - 0.5)
++            fu -= 0.5; fv -= 0.5;
++            int u0 = int(floor(fu)), v0 = int(floor(fv));
++            float au = fu - float(u0), av = fv - float(v0);
++            vec4 t00 = texel(u0, v0, flags, tw, th), t10 = texel(u0 + 1, v0, flags, tw, th);
++            vec4 t01 = texel(u0, v0 + 1, flags, tw, th), t11 = texel(u0 + 1, v0 + 1, flags, tw, th);
++            T = floor(mix(mix(t00, t10, au), mix(t01, t11, au), av) + 0.5);
++        }
++        else
++            T = texel(int(floor(fu)), int(floor(fv)), flags, tw, th);
++        uint tfx = (flags >> 4) & 3u;
++        bool tcc = (flags & 8u) != 0u;
++        if (tfx == 0u) { C.rgb = T.rgb * F.rgb / 128.0; C.a = tcc ? T.a * F.a / 128.0 : F.a; }
++        else if (tfx == 1u) { C.rgb = T.rgb; C.a = tcc ? T.a : F.a; }
++        else if (tfx == 2u) { C.rgb = T.rgb * F.rgb / 128.0 + F.a; C.a = tcc ? T.a + F.a : F.a; }
++        else { C.rgb = T.rgb * F.rgb / 128.0 + F.a; C.a = tcc ? T.a : F.a; }
++        C = min(floor(C), vec4(255.0));
++    }
++    if ((flags & 4u) != 0u)
++    {
++        vec3 fc = vec3(float(p.pc[18] & 255u), float((p.pc[18] >> 8) & 255u), float((p.pc[18] >> 16) & 255u));
++        float f = clamp(floor(vFog + 0.5), 0.0, 255.0);
++        C.rgb = floor((f * C.rgb + (255.0 - f) * fc) / 255.0);
++    }
++    if ((flags & 64u) != 0u)
++    {
++        uint atst = (flags >> 7) & 7u;
++        float aref = float(p.pc[3]);
++        bool pass = atst == 1u || (atst == 2u && C.a < aref) || (atst == 3u && C.a <= aref) || (atst == 4u && C.a == aref) ||
++                    (atst == 5u && C.a >= aref) || (atst == 6u && C.a > aref) || (atst == 7u && C.a != aref);
++        uint afail = (flags >> 10) & 3u;
++        if (!pass && (afail == 0u || afail == 2u))
++            discard;
++    }
++    outColor = vec4(C.rgb / 255.0, C.a / 128.0);
++}
+diff --git a/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.vert b/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.vert
+new file mode 100644
+index 0000000000000000000000000000000000000000..3865b67b478994df520acf063bcc29d2e8026738
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.vert
+@@ -0,0 +1,21 @@
++#version 450
++// GS draw vertex: pixel-space position (XYOFFSET removed), normalized depth, fog, colour (0-255), STQ.
++layout(location = 0) in vec4 inPos;   // x, y, z(0..1), fog(0..255)
++layout(location = 1) in vec4 inColor; // r, g, b, a (0..255)
++layout(location = 2) in vec4 inStq;   // s, t, q, 0
++layout(location = 0) out vec4 vColor;
++layout(location = 1) flat out vec4 vColorFlat;
++layout(location = 2) out vec3 vStq;
++layout(location = 3) out float vFog;
++layout(push_constant) uniform PC { uint pc[32]; } p;
++invariant gl_Position; // multi-pass draws (ZTST=ALWAYS then GEQUAL on the same geometry) need bit-identical depth
++void main()
++{
++    vec2 size = vec2(uintBitsToFloat(p.pc[0]), uintBitsToFloat(p.pc[1]));
++    gl_Position = vec4(inPos.x / size.x * 2.0 - 1.0, inPos.y / size.y * 2.0 - 1.0, inPos.z, 1.0);
++    gl_PointSize = 1.0;
++    vColor = inColor;
++    vColorFlat = inColor;
++    vStq = inStq.xyz;
++    vFog = inPos.w;
++}
+diff --git a/ps2xRuntime/src/lib/gs/shaders/gs_vk_swizzle.comp b/ps2xRuntime/src/lib/gs/shaders/gs_vk_swizzle.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e1576659a18422b2c5071d1c4d7c97c454d45f6
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/shaders/gs_vk_swizzle.comp
+@@ -0,0 +1,92 @@
++#version 450
++// PS2 GS local-memory swizzle (mode 0: host->local upload) / unswizzle (mode 1: local->linear) on a 4 MB VRAM
++// buffer. Addressing: bitAddr = base + page*65536 + lut[pageLocal(x,y)] + shift, lut generated on the CPU from
++// the runtime's own GS memory functions (one table per base layout: CT32, Z32, CT16, CT16S, Z16, Z16S, T8, T4).
++layout(local_size_x = 64) in;
++layout(std430, binding = 0) buffer Vram { uint vram[]; };
++layout(std430, binding = 1) buffer Own { uint own[]; };
++layout(std430, binding = 2) readonly buffer Lut { uint lut[]; };
++layout(std430, binding = 3) buffer Io { uint io[]; };
++layout(push_constant) uniform PC
++{
++    uint ioBitBase;  // mode 0: bit offset of the first source pixel in io[]; mode 1: word offset of output
++    uint firstPixel; // transfer-relative index of the first pixel of this dispatch
++    uint count;
++    uint srcBits;    // 32, 24, 16, 8, 4 (packed transfer pixel size)
++    uint lutBase;
++    uint pw;
++    uint ph;
++    uint ppr;        // pages per row
++    uint baseBits;   // DBP * 256 bytes * 8
++    uint dsax;
++    uint dsay;
++    uint rrw;
++    uint nbits;      // stored value width
++    uint shift;      // extra bit shift inside the slot (T8H/T4HL/T4HH)
++    uint mode;
++} pc;
++
++void main()
++{
++    uint i = gl_GlobalInvocationID.x;
++    if (i >= pc.count)
++        return;
++    if (pc.mode == 3u)
++    {   // CLUT load: buffer entry i <- CLUT memory at CBP (CSM1 layout: T4 8x2, T8 16x16 with entries 8-15/16-23 swapped)
++        uint x, y;
++        if (pc.firstPixel == 1u) { x = i & 7u; y = i >> 3; }
++        else { uint idx = (i & ~0x18u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1); x = idx & 15u; y = idx >> 4; }
++        uint pg = (y / pc.ph) * pc.ppr + (x / pc.pw);
++        uint ba = (pc.baseBits + pg * 65536u + lut[pc.lutBase + (y % pc.ph) * pc.pw + (x % pc.pw)]) & 0x1FFFFFFu;
++        uint vm = (pc.nbits >= 32u) ? 0xFFFFFFFFu : ((1u << pc.nbits) - 1u);
++        vram[pc.ioBitBase + i] = (vram[ba >> 5] >> (ba & 31u)) & vm;
++        return;
++    }
++    uint p = pc.firstPixel + i;
++    uint x = pc.dsax + p % pc.rrw;
++    uint y = pc.dsay + p / pc.rrw;
++    uint page = (y / pc.ph) * pc.ppr + (x / pc.pw);
++    uint bitAddr = (pc.baseBits + page * 65536u + lut[pc.lutBase + (y % pc.ph) * pc.pw + (x % pc.pw)] + pc.shift) & 0x1FFFFFFu;
++    uint word = bitAddr >> 5;
++    uint sh = bitAddr & 31u;
++    uint vmask = (pc.nbits >= 32u) ? 0xFFFFFFFFu : ((1u << pc.nbits) - 1u);
++    if (pc.mode != 1u && pc.mode != 5u) // 1 = unswizzle read, 5 = target seed read; the rest write VRAM
++    {
++        uint sb = pc.ioBitBase + i * pc.srcBits;
++        uint w = sb >> 5, o = sb & 31u;
++        uint v = io[w] >> o;
++        if (o != 0u && o + pc.srcBits > 32u)
++            v |= io[w + 1u] << (32u - o);
++        if (pc.mode == 2u) // render-target write-back: RGBA8 image alpha is a/128 normalised -> GS 0..128
++            v = (v & 0x00FFFFFFu) | ((((v >> 24) * 128u + 127u) / 255u) << 24);
++        else if (pc.mode == 4u) // 16-bit target write-back: RGBA8 -> RGB5A1 (A1 set when GS alpha >= 0x80)
++            v = ((v >> 3) & 31u) | (((v >> 11) & 31u) << 5) | (((v >> 19) & 31u) << 10) | (((v >> 24) >= 255u) ? 0x8000u : 0u);
++        v &= vmask;
++        if (pc.nbits >= 32u)
++        {
++            vram[word] = v;
++            own[word] = 0xFFFFFFFFu;
++        }
++        else
++        {
++            uint m = vmask << sh;
++            atomicAnd(vram[word], ~m);
++            atomicOr(vram[word], (v << sh) & m);
++            atomicOr(own[word], m);
++        }
++    }
++    else
++    {
++        uint v = (vram[word] >> sh) & vmask;
++        if (pc.mode == 5u) // target seed: GS pixel -> RGBA8 with alpha normalised to a/128
++        {
++            if (pc.nbits == 16u)
++                v = ((v & 31u) << 3) | (((v >> 5) & 31u) << 11) | (((v >> 10) & 31u) << 19) | (((v & 0x8000u) != 0u) ? 0xFF000000u : 0u);
++            else if (pc.nbits == 24u)
++                v |= 0xFF000000u;
++            else
++                v = (v & 0x00FFFFFFu) | (min(255u, ((v >> 24) * 255u + 64u) / 128u) << 24);
++        }
++        io[pc.ioBitBase + i] = v;
++    }
++}

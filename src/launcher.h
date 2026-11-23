@@ -14,6 +14,7 @@ struct Settings
     std::string iso;        // disc image
     std::string elf;        // extracted SLUS_203.65 (game folder); empty = auto-detect
     bool gpu = true;        // GS renderer: GPU (OpenGL) or CPU
+    bool vulkan = false;    // GPU renderer: false OpenGL (default), true Vulkan (falls back to GL on failure)
     int scale = 1;          // internal resolution multiplier (GPU only), 1..4
     bool audio = true;      // host audio output
     bool movies = true;     // play FMVs (IPU) or skip them
