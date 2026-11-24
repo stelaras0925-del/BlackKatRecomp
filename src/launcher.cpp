@@ -252,6 +252,10 @@ std::string configPath()
 }
 
 static void parseSettings(std::istream &f, Settings &s);
+// vk20 remaster options (kept here, not in Settings, to leave launcher.h untouched)
+static int g_textFilter = 2; // 0 off (pixel), 1 smooth, 2 sharp -> PS2X_VK_TEXT_FILTER (Vulkan, scale > 1)
+static int g_ripple = 0;     // 0 original, 1 soft, 2 calm -> PS2X_VK_RIPPLE 1 / 0.4 / 0
+static int g_menuFont = 1;   // vk21: 0 original bitmap font, 1 IM FELL vector font -> PS2X_VK_FONT off / imfell
 
 bool loadSettings(Settings &s)
 {
@@ -279,6 +283,10 @@ static void parseSettings(std::istream &f, Settings &s)
         else if (k == "elf") s.elf = v;
         else if (k == "renderer") { s.gpu = (v != "cpu"); s.vulkan = (v == "vulkan"); }
         else if (k == "scale") s.scale = std::clamp(std::atoi(v.c_str()), 1, 4);
+        else if (k == "antialiasing") s.aa = (v == "fxaa");
+        else if (k == "text_filter") g_textFilter = (v == "off") ? 0 : (v == "smooth") ? 1 : 2;
+        else if (k == "water_ripple") g_ripple = (v == "calm") ? 2 : (v == "soft") ? 1 : 0;
+        else if (k == "menu_font") g_menuFont = (v == "original") ? 0 : 1;   // imfell (also old original_hd / vector)
         else if (k == "audio") s.audio = b();
         else if (k == "movies") s.movies = b();
         else if (k == "fullscreen") s.fullscreen = b();
@@ -300,6 +308,10 @@ static std::string serializeSettings(const Settings &s)
       << "elf=" << s.elf << "\n"
       << "renderer=" << (!s.gpu ? "cpu" : s.vulkan ? "vulkan" : "gpu") << "\n"
       << "scale=" << s.scale << "\n"
+      << "antialiasing=" << (s.aa ? "fxaa" : "off") << "\n"
+      << "text_filter=" << (g_textFilter == 0 ? "off" : g_textFilter == 1 ? "smooth" : "sharp") << "\n"
+      << "water_ripple=" << (g_ripple == 2 ? "calm" : g_ripple == 1 ? "soft" : "original") << "\n"
+      << "menu_font=" << (g_menuFont ? "imfell" : "original") << "\n"
       << "audio=" << (s.audio ? 1 : 0) << "\n"
       << "movies=" << (s.movies ? 1 : 0) << "\n"
       << "fullscreen=" << (s.fullscreen ? 1 : 0) << "\n"
@@ -394,6 +406,10 @@ void applyToEnv(const Settings &s)
     set("PS2X_GS_SCALE", std::to_string(s.gpu && !s.vulkan ? std::clamp(s.scale, 1, 4) : 1));
     // Vulkan renders at its own scale (PS2X_VK_SCALE); its OpenGL reference stays at 1x
     set("PS2X_VK_SCALE", std::to_string(s.gpu && s.vulkan ? std::clamp(s.scale, 1, 4) : 1));
+    set("PS2X_VK_AA", s.gpu && s.vulkan && s.aa ? "fxaa" : "off");
+    set("PS2X_VK_TEXT_FILTER", g_textFilter == 0 ? "off" : g_textFilter == 1 ? "smooth" : "sharp");
+    set("PS2X_VK_RIPPLE", g_ripple == 2 ? "0" : g_ripple == 1 ? "0.4" : "1");
+    set("PS2X_VK_FONT", g_menuFont ? "imfell" : "off");
     if (!s.audio) set("PS2X_HOST_AUDIO", "0");
     set("BLACKKAT_PLAY_FMV", s.movies ? "1" : "0");
     set("PS2X_FULLSCREEN", s.fullscreen ? "1" : "0");
@@ -1097,6 +1113,12 @@ static bool runLauncherUi(Settings &s, const char *argv0)
             ImGui::TextColored(kParchDim, "%d x %d", 640 * s.scale, 448 * s.scale);
         else
             ImGui::TextDisabled(s.vulkan && s.gpu ? "640 x 448 (OpenGL only)" : "640 x 448 (GPU only)");
+        ImGui::SameLine(0, 18);
+        ImGui::BeginDisabled(!(s.gpu && s.vulkan));
+        ImGui::Checkbox("FXAA##aa", &s.aa);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Anti-aliasing (FXAA) on the final picture: smooths jagged edges. Vulkan only.");
         rowLabel("Aspect ratio", col);
         {
             const char *aspectLabels[] = {"4:3  (original)", "16:9  (widescreen)"};
@@ -1106,6 +1128,33 @@ static bool runLauncherUi(Settings &s, const char *argv0)
             ImGui::EndGroup();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("16:9 widens the 3D view (more on the sides, nothing stretched).\nThe HUD, menus and movies are stretched sideways. Windowed: the window is made 16:9 for the chosen height.");
+        }
+        rowLabel("Remaster", col);
+        {   // vk20: text upscale + water reflection ripple (Vulkan only)
+            const char *txL[] = {"Pixel text", "Smooth", "Sharp"};
+            const char *rpL[] = {"Ripple", "Soft", "Calm"};
+            const float hw = (segW - 14.0f) * 0.5f;
+            ImGui::BeginDisabled(!(s.gpu && s.vulkan));
+            ImGui::BeginGroup();
+            segmented("textf", txL, 3, &g_textFilter, hw);
+            ImGui::EndGroup();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Upscales menu / HUD text and 2D art at 2x-4x resolution.\nSharp: smooth crisp letter outlines. Smooth: soft filtering. Pixel text: original look. Vulkan only.");
+            ImGui::SameLine(0, 14);
+            ImGui::BeginGroup();
+            segmented("ripple", rpL, 3, &g_ripple, hw);
+            ImGui::EndGroup();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Water reflections: Ripple is the original effect (breaks the reflection into small squares),\nSoft reduces the ripple, Calm gives a clean mirror. Vulkan only.");
+            // vk21: front-end menu font: the original bitmap font or IM FELL English Italic (SIL OFL)
+            const char *mfL[] = {"Original font", "IM FELL"};
+            ImGui::SetCursorPosX(col);
+            ImGui::BeginGroup();
+            segmented("mfont", mfL, 2, &g_menuFont, hw);
+            ImGui::EndGroup();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Menu text: IM FELL redraws the main-menu lettering from a smooth vector font (IM FELL English Italic)\nat the internal resolution, keeping the game's colours, outline, shadow and layout. Original font is the game's bitmap font. Vulkan only.");
+            ImGui::EndDisabled();
         }
         rowLabel("Window", col);
         int mode = s.fullscreen ? 1 : 0;

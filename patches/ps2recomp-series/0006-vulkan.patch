@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d76850a7e3c9b99eea17d66ba0a8cad7d3f24..cff32ecd18d5b988a448853d01e3b0b2d724f053 100644
+index 589d76850a7e3c9b99eea17d66ba0a8cad7d3f24..3d518b5ed441d92a14ed60cb319be9a2506c6914 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -383,6 +383,7 @@ add_library(ps2_runtime STATIC
@@ -10,7 +10,7 @@ index 589d76850a7e3c9b99eea17d66ba0a8cad7d3f24..cff32ecd18d5b988a448853d01e3b0b2
      src/lib/ps2_iop_host.cpp
      src/lib/ps2_memory.cpp
      src/lib/ps2_pad.cpp
-@@ -507,6 +508,40 @@ target_include_directories(ps2_runtime PUBLIC
+@@ -507,6 +508,41 @@ target_include_directories(ps2_runtime PUBLIC
  )
  
  target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
@@ -27,7 +27,8 @@ index 589d76850a7e3c9b99eea17d66ba0a8cad7d3f24..cff32ecd18d5b988a448853d01e3b0b2
 +        file(MAKE_DIRECTORY ${_vk_spv_dir})
 +        foreach(_sh IN ITEMS "gs_vk_swizzle.comp|kGsVkSwizzleSpv|gs_vk_swizzle.spv.h"
 +                              "gs_vk_draw.vert|kGsVkDrawVertSpv|gs_vk_draw_vert.spv.h"
-+                              "gs_vk_draw.frag|kGsVkDrawFragSpv|gs_vk_draw_frag.spv.h")
++                              "gs_vk_draw.frag|kGsVkDrawFragSpv|gs_vk_draw_frag.spv.h"
++                              "gs_vk_fxaa.comp|kGsVkFxaaSpv|gs_vk_fxaa.spv.h")
 +            string(REPLACE "|" ";" _shl "${_sh}")
 +            list(GET _shl 0 _src)
 +            list(GET _shl 1 _var)
@@ -407,10 +408,10 @@ index 0000000000000000000000000000000000000000..42fa046e8150a270837769e6eaa68566
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_vk_backend.cpp b/ps2xRuntime/src/lib/gs/gs_vk_backend.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..ddfbb78076f524b09e54a2d44ebc998093d32b2d
+index 0000000000000000000000000000000000000000..181e42770a9d11cfaa83ed892a79ac68a78f3aa5
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_vk_backend.cpp
-@@ -0,0 +1,584 @@
+@@ -0,0 +1,592 @@
 +// Vulkan GS backend, Phase 3 skeleton (PS2X_GS_BACKEND=vulkan; default renderer stays GL/CPU).
 +//
 +// Stage 0 (this file): instance (+ VK_LAYER_KHRONOS_validation and a debug messenger when PS2X_VK_VALIDATE=1),
@@ -435,6 +436,8 @@ index 0000000000000000000000000000000000000000..ddfbb78076f524b09e54a2d44ebc9980
 +#include <array>
 +#include <cmath>
 +#include <unordered_map>
++#include <filesystem> // vk21: menu font asset lookup (gs_vk_font.inl)
++#include <fstream>
 +
 +#if defined(PS2X_HAVE_VULKAN) && PS2X_HAVE_VULKAN
 +#include <vulkan/vulkan.h>
@@ -443,8 +446,10 @@ index 0000000000000000000000000000000000000000..ddfbb78076f524b09e54a2d44ebc9980
 +#include "gs_vk_swizzle.spv.h"
 +#include "gs_vk_draw_vert.spv.h"
 +#include "gs_vk_draw_frag.spv.h"
++#include "gs_vk_fxaa.spv.h"
 +#endif
 +
++void ps2xPresTakeSpare(std::vector<uint8_t> &v); // vk20, gs_frontend.cpp
 +namespace
 +{
 +    bool envOn(const char *n)
@@ -731,10 +736,14 @@ index 0000000000000000000000000000000000000000..ddfbb78076f524b09e54a2d44ebc9980
 +            if (m_vramOn)
 +            {
 +                std::vector<uint8_t> vk;
++                ps2xPresTakeSpare(vk); // vk20: reuse the previous presented buffer (no 18 MB alloc + zero-fill at 4x)
 +                uint32_t vw = 0, vh = 0;
 +                m_vram.endFrame(m_ref.get(), &req, &frame, &vk, &vw, &vh);
++                if (vw == 0u) vk.clear(); // nothing presented this time: the spare's old pixels must not be shown
 +                if (fast && vk.empty()) { frame = m_ref->Present(req); ++m_pFb; } // nothing from Vulkan: fall back
-+                if (m_presDump && !vk.empty() && m_pN % 60u == 0u && m_pN >= 600u)
++                static const uint64_t s_dumpAt = std::getenv("PS2X_VK_PRESDUMPAT") ? std::strtoull(std::getenv("PS2X_VK_PRESDUMPAT"), nullptr, 10) : 0; // vk19: only these presents (comma: N,M)
++                static const uint64_t s_dumpAt2 = [] { const char *e = std::getenv("PS2X_VK_PRESDUMPAT"); const char *k = e ? std::strchr(e, ',') : nullptr; return k ? std::strtoull(k + 1, nullptr, 10) : 0ull; }();
++                if (m_presDump && !vk.empty() && (s_dumpAt ? (m_pN == s_dumpAt || m_pN == s_dumpAt2) : (m_pN % 60u == 0u && m_pN >= 600u)))
 +                {   // debug (PS2X_VK_PRESDUMP=prefix): the presented Vulkan frame as PPM every 60 presents
 +                    char path[512]; std::snprintf(path, sizeof(path), "%s_%llu.ppm", m_presDump, (unsigned long long)m_pN);
 +                    if (FILE *fp = std::fopen(path, "wb"))
@@ -997,10 +1006,10 @@ index 0000000000000000000000000000000000000000..ddfbb78076f524b09e54a2d44ebc9980
 +#endif
 diff --git a/ps2xRuntime/src/lib/gs/gs_vk_render.inl b/ps2xRuntime/src/lib/gs/gs_vk_render.inl
 new file mode 100644
-index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175eae6ecdc7
+index 0000000000000000000000000000000000000000..a5f6fa847f637d2d74f6ba0a758336e139cd1b21
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_vk_render.inl
-@@ -0,0 +1,1097 @@
+@@ -0,0 +1,1372 @@
 +// Vulkan GS renderer (Phase 3 steps 3-6). Textually #included INSIDE class VkVramMirror (gs_vk_vram.inl) so it
 +// shares the VRAM buffer, LUTs, descriptor set, command buffer and mutex: uploads (compute) and draws (graphics)
 +// are recorded into one command stream in GS event order.
@@ -1038,13 +1047,13 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +    }
 +
 +private:
-+    struct RTarget { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; uint32_t w = 0, h = 0; bool depth = false; uint64_t lastF = 0, draws = 0; uint32_t dirtyRows = 0, hiRows = 0, dirtyLo = 0xFFFFFFFFu, loRows = 0xFFFFFFFFu; bool stale = false; uint64_t seq = 0; uint32_t staleLo = 0xFFFFFFFFu, staleHi = 0; };
++    struct RTarget { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; uint32_t w = 0, h = 0; bool depth = false; uint64_t lastF = 0, draws = 0; uint32_t dirtyRows = 0, hiRows = 0, dirtyLo = 0xFFFFFFFFu, loRows = 0xFFFFFFFFu; bool stale = false; uint64_t seq = 0; uint32_t staleLo = 0xFFFFFFFFu, staleHi = 0; uint64_t drawF = 0; uint32_t drawLo = 0, drawHi = 0; };
 +    static constexpr uint32_t kRing = 64u * 1024u * 1024u;
 +    static constexpr uint32_t kRingHalf = (kRing / 2u / 768u) * 768u; // slot 1's ring base: whole vertices, 256-aligned
 +    size_t ringLo() const { return m_two ? m_slot * kRingHalf : 0u; }
 +    size_t ringHi() const { return m_two ? (m_slot ? kRing : kRingHalf) : kRing; }
 +    static constexpr uint32_t kRows = 1024u;
-+    static constexpr uint32_t kFloats = 12u;
++    static constexpr uint32_t kFloats = 16u; // vk20: +vec4 sprite texel rect (text filter)
 +
 +    bool renderInit()
 +    {
@@ -1065,6 +1074,8 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +            !presBuf(0) || !presBuf(1))
 +            return false;
 +        m_pres = m_presB[0]; m_presMem = m_presMemB[0]; m_presMap = m_presMapB[0];
++        m_aaOn = aaInit();
++        if (!m_aaOn) aaDestroy();
 +        auto mod = [&](const uint32_t *code, size_t size) {
 +            VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
 +            sm.codeSize = size;
@@ -1093,6 +1104,7 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +
 +    void renderDestroy()
 +    {
++        aaDestroy();
 +        if (!m_dev) return;
 +        for (auto &kv : m_pipes) vkDestroyPipeline(m_dev, kv.second, nullptr);
 +        m_pipes.clear();
@@ -1368,6 +1380,17 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +    {
 +        if (m_scale <= 1 || s_vkNoRtt()) return false;
 +        if (c.tex0.psm != GS_PSM_CT32 && c.tex0.psm != GS_PSM_CT24) return false;
++        bool widened = false;
++        {   // vk19: with REPEAT / CLAMP / REGION_CLAMP addressing (the shader wraps the scaled copy the same way),
++            // UVs outside the texture only ever read texels inside it (e.g. the sea reflection: u -687..942 on a
++            // 256 wide texture). PS2X_VK_RTT_WRAP=0: old rule (UV range must lie inside the target).
++            static const bool s_noWrap = std::getenv("PS2X_VK_RTT_WRAP") && std::getenv("PS2X_VK_RTT_WRAP")[0] == '0';
++            const uint32_t wms = static_cast<uint32_t>(c.clamp & 3u), wmt = static_cast<uint32_t>((c.clamp >> 2) & 3u);
++            const float tw = static_cast<float>(1u << std::min<uint32_t>(c.tex0.tw, 10u)), th = static_cast<float>(1u << std::min<uint32_t>(c.tex0.th, 10u));
++            const float maxu = static_cast<float>((c.clamp >> 14) & 0x3FFu) + 1.0f, maxv = static_cast<float>((c.clamp >> 34) & 0x3FFu) + 1.0f;
++            if (!s_noWrap && wms != 3u && (umin < -0.5f || umax > tw)) { umin = 0.0f; umax = wms == 2u ? std::min(tw, maxu) : tw; widened = true; }
++            if (!s_noWrap && wmt != 3u && (vmin < -0.5f || vmax > th)) { vmin = 0.0f; vmax = wmt == 2u ? std::min(th, maxv) : th; widened = true; }
++        }
 +        if (umin < -0.5f || vmin < -0.5f) return false;
 +        const uint32_t tbw = std::max<uint32_t>(c.tex0.tbw, 1u);
 +        const uint64_t tb = static_cast<uint64_t>(c.tex0.tbp0) * 256u;
@@ -1383,6 +1406,9 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +            if (!best || t.seq > best->seq) { best = &t; key = kv.first; rowOff = static_cast<uint32_t>(ro); }
 +        }
 +        if (!best) return false;
++        // vk19: a wrapped read covers the whole texture; only take it from the target when those rows were drawn there
++        // in the last game frame (not seeded from VRAM, e.g. a 1x upload + sprite into memory a reflection target spans)
++        if (widened && (best->drawF + 2u < m_rFrames + 1u || rowOff < best->drawLo || rowOff + static_cast<uint32_t>(std::ceil(vmax)) > best->drawHi)) return false;
 +        const uint64_t b0 = tb, b1 = tb + static_cast<uint64_t>(best->w) * 4u * static_cast<uint64_t>(std::ceil(vmax));
 +        for (auto &kv : m_colorT)
 +        {   // a newer target drew over the same memory: VRAM (merged) is the authority
@@ -1576,10 +1602,10 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +        VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, m_vs, "main", nullptr},
 +                                                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, m_fs, "main", nullptr}};
 +        VkVertexInputBindingDescription vb{0, kFloats * 4u, VK_VERTEX_INPUT_RATE_VERTEX};
-+        VkVertexInputAttributeDescription va[3] = {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 32}};
++        VkVertexInputAttributeDescription va[4] = {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 32}, {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 48}};
 +        VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
 +        vis.vertexBindingDescriptionCount = 1; vis.pVertexBindingDescriptions = &vb;
-+        vis.vertexAttributeDescriptionCount = 3; vis.pVertexAttributeDescriptions = va;
++        vis.vertexAttributeDescriptionCount = 4; vis.pVertexAttributeDescriptions = va;
 +        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
 +        ia.topology = topo == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : topo == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 +        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -1666,6 +1692,7 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +        const uint32_t cls = (type == GS_PRIM_POINT) ? 0u : (type == GS_PRIM_LINE || type == GS_PRIM_LINESTRIP) ? 1u : (type == GS_PRIM_SPRITE ? 3u : 2u);
 +        const uint32_t need = cls == 0 ? 1u : (cls == 1 || cls == 3) ? 2u : 3u;
 +        if (b.vertsPerPrim < need || b.primCount == 0) { ++m_rs.skipped; return; }
++        if (m_kickEvery && ++m_kickBatches >= m_kickEvery) kickLocked();
 +        if (m_txActive && m_txBytes.size() > m_txFlushedBytes)
 +        {
 +            endRenderingLocked();
@@ -1690,6 +1717,17 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +            if ((sa >= 0 && (long long)c.alpha == sa) || (stb >= 0 && st.prim.tme && (long long)c.tex0.tbp0 == stb)) { ++m_rs.skipped; return; }
 +        }
 +        if (st.prim.tme && !m_noWb) writeBackOverlapsLocked(c);
++        if (m_fontValid)
++        {   // vk21: a draw over the menu font atlas memory turns the vector font off until the atlas is uploaded again
++            const int fy = static_cast<int>(c.xyoffset.ofy >> 4);
++            const int ry0 = b.bbox[3] >= b.bbox[1] ? std::max<int>(b.bbox[1] - fy, c.scissor.y0) : c.scissor.y0;
++            const int ry1 = b.bbox[3] >= b.bbox[1] ? std::min<int>(b.bbox[3] - fy, c.scissor.y1) : c.scissor.y1;
++            fontDrawCheck(c.frame.fbp, c.frame.fbw, c.frame.psm, ry0, ry1);
++            if (!c.zbuf.zmask) fontDrawCheck(c.zbuf.zbp, c.frame.fbw, c.zbuf.psm, ry0, ry1);
++        }
++        const bool fontOn = cls == 2 && m_font.ok && fontActive(c, st);
++        float fontY0 = 1e30f, fontY1 = -1e30f;
++        uint32_t fontN = 0;
 +        if (st.prim.tme && c.tex0.tbp0 == 0x8c0u && (c.frame.psm == GS_PSM_CT16 || c.frame.psm == GS_PSM_CT16S)) spriteDumpLocked();
 +        const uint32_t fbw = std::max<uint32_t>(c.frame.fbw, 1u);
 +        const uint32_t W = std::min<uint32_t>(fbw * 64u, 4096u);
@@ -1722,6 +1760,40 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +        }
 +        if (skyB && s_skyLog) std::fprintf(stderr, "[gs:vk:sky] f%llu enter ckey %llx off %u zkey %llx sc %u-%u ofy %u bbox %d-%d tgts %zu\n", (unsigned long long)(m_rFrames + 1), (unsigned long long)ckey, cOff, (unsigned long long)zkey, c.scissor.y0, c.scissor.y1, c.xyoffset.ofy >> 4, b.bbox[1], b.bbox[3], m_colorT.size());
 +        const uint32_t off = (cOff == zOff || zOff == 0) ? cOff : cOff; // colour offset drives the viewport
++        // vk20: PS2X_VK_RIPPLE=<0..1> scales the per-vertex UV displacement of "warp grid" passes (dense fst tri meshes that
++        // copy a texture into a same-sized target with a near-identity mapping, e.g. the water-reflection ripple). The game's
++        // ripple shifts each 8x8 cell by ~1.5 texels, which reads as blocky squares once magnified; 1 = original (default).
++        static const float s_rip = [] { const char *e = std::getenv("PS2X_VK_RIPPLE"); float k = e ? (float)std::atof(e) : 1.0f; return std::min(1.0f, std::max(0.0f, k)); }();
++        bool ripOn = false; float ripA = 1, ripB = 0, ripC = 1, ripD = 0;
++        if (s_rip < 0.999f && st.prim.tme && st.prim.fst && cls == 2 && b.primCount >= 256 && nverts >= 64 &&
++            fbw * 64u == st.textureWidth && st.textureWidth <= 512)
++        {
++            double sx = 0, su = 0, sxx = 0, sxu = 0, sy = 0, sv = 0, syy = 0, syv = 0; const double n = (double)nverts;
++            for (size_t i = 0; i < nverts; ++i)
++            {
++                const double x = verts[i].x, y = verts[i].y, u = verts[i].u / 16.0, v = verts[i].v / 16.0;
++                sx += x; su += u; sxx += x * x; sxu += x * u; sy += y; sv += v; syy += y * y; syv += y * v;
++            }
++            const double dx = sxx - sx * sx / n, dy = syy - sy * sy / n;
++            if (dx > 1.0 && dy > 1.0)
++            {
++                const double a = (sxu - sx * su / n) / dx, c2 = (syv - sy * sv / n) / dy;
++                const double bb = (su - a * sx) / n, d = (sv - c2 * sy) / n;
++                double r2 = 0;
++                for (size_t i = 0; i < nverts; ++i)
++                {
++                    const double eu = verts[i].u / 16.0 - (a * verts[i].x + bb), ev = verts[i].v / 16.0 - (c2 * verts[i].y + d);
++                    r2 += eu * eu + ev * ev;
++                }
++                const double rms = std::sqrt(r2 / n);
++                if (a > 0.5 && a < 2.0 && c2 > 0.5 && c2 < 2.0 && rms > 0.05 && rms < 6.0)
++                {
++                    ripOn = true; ripA = (float)a; ripB = (float)bb; ripC = (float)c2; ripD = (float)d;
++                    static int s_ripLog = 0;
++                    if (s_ripLog < 3) { ++s_ripLog; std::fprintf(stderr, "[gs:vk:ripple] fb %x tex %x n%u fit u=%.3fx%+.1f v=%.3fy%+.1f rms %.2f k %.2f\n", c.frame.fbp, c.tex0.tbp0, (unsigned)b.primCount, a, bb, c2, d, rms, s_rip); }
++                }
++            }
++        }
 +        // vertices -> ring
 +        const uint32_t outVerts = static_cast<uint32_t>(b.primCount) * (cls == 3 ? 6u : need);
 +        const size_t bytes = static_cast<size_t>(outVerts) * kFloats * 4u;
@@ -1741,16 +1813,44 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +                        : (c.zbuf.psm == GS_PSM_Z24 || c.zbuf.psm == 0x01) ? 1.0 / 16777216.0 : 1.0 / 4294967296.0;
 +        const float pcen = cls <= 1 ? 0.5f : 0.0f;
 +        size_t o = 0;
++        // vk20: PS2X_VK_TEXT_FILTER=off|smooth|sharp - at internal scale > 1, nearest-sampled 2D sprites (fst, 1:1-ish texel/pixel,
++        // drawn into a display-width target: menus, HUD, text) are filtered inside their own texel rectangle (no atlas bleed);
++        // smooth = alpha-weighted bilinear, sharp = bilinear + alpha contour sharpening (crisp glyph edges). Default off.
++        static const uint32_t s_txf = [] { const char *e = std::getenv("PS2X_VK_TEXT_FILTER"); if (!e) return 0u;
++            const std::string v(e); return (v == "smooth" || v == "bilinear" || v == "1") ? 1u : (v == "sharp" || v == "xbr" || v == "2") ? 2u : 0u; }();
++        const bool txOn = s_txf && m_scale > 1 && cls == 3 && st.prim.tme && st.prim.fst && !st.linearFilter && fbw >= 8u;
++        float rect[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++        // sharp also re-thresholds the alpha of linear-filtered 2D batches (menu font strips: constant z and q)
++        const uint32_t tpsm = c.tex0.psm;
++        const bool txIdx = tpsm == 0x13u || tpsm == 0x14u || tpsm == 0x1Bu || tpsm == 0x24u || tpsm == 0x2Cu; // T8/T4 (fonts)
++        bool txLin = false;
++        if (s_txf == 2u && txIdx && m_scale > 1 && st.prim.tme && st.linearFilter && fbw >= 8u && nverts > 0)
++        {
++            txLin = true;
++            for (size_t i = 1; i < nverts && txLin; ++i)
++                txLin = verts[i].z == verts[0].z && (st.prim.fst || verts[i].q == verts[0].q);
++        }
++        if (txOn || txLin)
++        {
++            static int s_txLog = 0;
++            if (s_txLog < 6) { ++s_txLog; std::fprintf(stderr, "[gs:vk:textf] %s fb %x/%u tex %x/%x %ux%u prim %u n%u\n", txOn ? "sprite" : "linear2d", c.frame.fbp, fbw, c.tex0.tbp0, c.tex0.psm, st.textureWidth, st.textureHeight, (unsigned)type, (unsigned)b.primCount); }
++        }
 +        auto emit = [&](const GSVertex &pv, const GSVertex &cv, float s, float t, float q) {
 +            float *f = out + o;
 +            f[0] = pv.x - ofx + pcen; f[1] = pv.y - ofy + pcen;
 +            f[2] = static_cast<float>(std::min(1.0, std::max(0.0, pv.z * zs))); f[3] = static_cast<float>(cv.fog);
 +            f[4] = cv.r; f[5] = cv.g; f[6] = cv.b; f[7] = cv.a;
 +            f[8] = s; f[9] = t; f[10] = q; f[11] = 0.0f;
++            f[12] = rect[0]; f[13] = rect[1]; f[14] = rect[2]; f[15] = rect[3];
 +            o += kFloats;
 +        };
 +        auto stq = [&](const GSVertex &v, float &s, float &t, float &q) {
-+            if (st.prim.fst) { s = (v.u / 16.0f) / tw; t = (v.v / 16.0f) / th; q = 1.0f; }
++            if (st.prim.fst)
++            {
++                float uu = v.u / 16.0f, vv = v.v / 16.0f;
++                if (ripOn) { const float fu = ripA * v.x + ripB, fv = ripC * v.y + ripD; uu = fu + s_rip * (uu - fu); vv = fv + s_rip * (vv - fv); }
++                s = uu / tw; t = vv / th; q = 1.0f;
++            }
 +            else { s = v.s; t = v.t; q = v.q; }
 +        };
 +        for (uint32_t p = 0; p < b.primCount; ++p)
@@ -1760,6 +1860,15 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +            {
 +                float s0, t0, q0, s1, t1, q1;
 +                stq(v[0], s0, t0, q0); stq(v[1], s1, t1, q1);
++                if (txOn)
++                {   // texel rect [lo, hi) of this sprite; only for ~1:1..4:1 magnification (else unfiltered)
++                    const float u0 = v[0].u / 16.0f, u1 = v[1].u / 16.0f, w0 = v[0].v / 16.0f, w1 = v[1].v / 16.0f;
++                    const float dx = std::fabs((float)v[1].x - (float)v[0].x), dy = std::fabs((float)v[1].y - (float)v[0].y);
++                    const float du = std::fabs(u1 - u0), dv = std::fabs(w1 - w0);
++                    const bool ok = du >= 1.0f && dv >= 1.0f && dx >= du * 0.5f && dx <= du * 4.5f && dy >= dv * 0.5f && dy <= dv * 4.5f;
++                    rect[0] = ok ? std::floor(std::min(u0, u1)) : 0.0f; rect[1] = ok ? std::floor(std::min(w0, w1)) : 0.0f;
++                    rect[2] = ok ? std::ceil(std::max(u0, u1)) : 0.0f; rect[3] = ok ? std::ceil(std::max(w0, w1)) : 0.0f;
++                }
 +                if (!st.prim.fst)
 +                {
 +                    const float a0 = std::max(std::fabs(q0), 1e-20f), a1 = std::max(std::fabs(q1), 1e-20f);
@@ -1772,12 +1881,31 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +                emit(bb, v[1], s1, t0, 1.0f); emit(dd, v[1], s1, t1, 1.0f); emit(cc, v[1], s0, t1, 1.0f);
 +            }
 +            else
++            {
++                if (fontOn)
++                {   // vk21: glyph triangle -> the same corner of the vector glyph's quad (hi-res atlas, flagged by rect.x = -1)
++                    GSVertex nv[3]; float ns[3], nt[3];
++                    if (fontMapTri(v, st.prim.fst, st.prim.iip, tw, th, nv, ns, nt))
++                    {
++                        rect[0] = -1.0f;
++                        for (uint32_t i = 0; i < 3; ++i)
++                        {
++                            emit(nv[i], st.prim.iip ? nv[i] : nv[2], ns[i], nt[i], 1.0f);
++                            fontY0 = std::min(fontY0, nv[i].y); fontY1 = std::max(fontY1, nv[i].y);
++                        }
++                        rect[0] = 0.0f;
++                        ++fontN;
++                        continue;
++                    }
++                    ++m_fontMiss;
++                }
 +                for (uint32_t i = 0; i < need; ++i)
 +                {
 +                    float s, t, q;
 +                    stq(v[i], s, t, q);
 +                    emit(v[i], st.prim.iip ? v[i] : v[need - 1], s, t, q); // flat: GS uses the last vertex colour
 +                }
++            }
 +        }
 +        // vkCmdDraw addresses the ring by vertex index (firstVertex = m_ringUsed / 48), so every batch must start on a
 +        // whole vertex. Rounding to 256 bytes alone left m_ringUsed % 48 at 0/16/32, shifting most batches' attributes.
@@ -1821,7 +1949,44 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +                umin = std::min(umin, uu); vmin = std::min(vmin, vv); umax = std::max(umax, uu); vmax = std::max(vmax, vv);
 +            }
 +            uint64_t rkey = 0; uint32_t rowOff = 0;
-+            if (nverts && rttFindLocked(c, umin, vmin, umax, vmax, rkey, rowOff))
++            const bool rttHit = nverts && rttFindLocked(c, umin, vmin, umax, vmax, rkey, rowOff);
++            if (!rttHit && m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8 && (c.tex0.psm == GS_PSM_CT32 || c.tex0.psm == GS_PSM_CT24))
++                for (auto &kv : m_colorT)
++                    if ((kv.first & 0x1FFu) * 32u == c.tex0.tbp0)
++                        std::fprintf(stderr, "[gs:vk:rttmiss] f%llu tex %x/%u uv %.1f,%.1f-%.1f,%.1f target %05llx w %u hiRows %u seq %llu\n", (unsigned long long)(m_rFrames + 1), c.tex0.tbp0, c.tex0.tbw,
++                                     umin, vmin, umax, vmax, (unsigned long long)kv.first, kv.second.w, kv.second.hiRows, (unsigned long long)kv.second.seq);
++            int impSlot = -1;
++            if (!rttHit && m_impOn && c.tex0.psm == GS_PSM_CT32)
++                for (auto &a : m_impA)
++                    if (a.on && a.dbp == c.tex0.tbp0 && a.dbw == std::max<uint32_t>(c.tex0.tbw, 1u) && a.w == static_cast<uint32_t>(tw) && a.h == static_cast<uint32_t>(th))
++                    {
++                        bool drawn = false; // a target drew over that memory since the upload: VRAM is the authority
++                        const uint64_t ab = static_cast<uint64_t>(a.dbp) * 256u, ae = ab + static_cast<uint64_t>(a.dbw) * 64u * a.h * 4u;
++                        for (auto &kv : m_colorT)
++                        {
++                            if (kv.second.seq <= a.seq || !kv.second.hiRows) continue;
++                            const uint32_t op = (kv.first >> 15) & 0x3Fu, obpp = (op == GS_PSM_CT16 || op == GS_PSM_CT16S) ? 2u : 4u;
++                            const uint64_t ob = static_cast<uint64_t>(kv.first & 0x1FFu) * 8192u, oe = ob + static_cast<uint64_t>(kv.second.w) * kv.second.hiRows * obpp;
++                            if (ob < ae && ab < oe) { drawn = true; break; }
++                        }
++                        if (drawn) { a.on = false; break; }
++                        impSlot = static_cast<int>(a.slot);
++                        break;
++                    }
++            if (impSlot >= 0)
++            {   // vk19: texture = a GS -> host tile re-uploaded unchanged: sample its hi-res copy
++                rttCW = m_imp[impSlot].w; rttCH = m_imp[impSlot].h;
++                endRenderingLocked();
++                ensureBegun();
++                VkImageCopy ic{};
++                ic.srcSubresource = ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++                ic.srcOffset = {static_cast<int32_t>((impSlot % kImpGrid) * kImpTile * m_scale), static_cast<int32_t>((impSlot / kImpGrid) * kImpTile * m_scale), 0};
++                ic.extent = {rttCW * m_scale, rttCH * m_scale, 1};
++                vkCmdCopyImage(m_cmd, m_impImg, VK_IMAGE_LAYOUT_GENERAL, m_rttImg, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
++                barrier();
++                ++m_pImpHits;
++            }
++            if (rttHit)
 +            {
 +                const RTarget &rt = m_colorT[rkey];
 +                rttCW = std::min<uint32_t>({rt.w, static_cast<uint32_t>(tw), m_rttW / m_scale});
@@ -1835,6 +2000,8 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +                vkCmdCopyImage(m_cmd, rt.img, VK_IMAGE_LAYOUT_GENERAL, m_rttImg, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
 +                barrier();
 +                ++m_rs.rtt;
++                if (m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8)
++                    std::fprintf(stderr, "[gs:vk:rtt] f%llu tex %x/%u from target %05llx row %u %ux%u\n", (unsigned long long)(m_rFrames + 1), c.tex0.tbp0, c.tex0.tbw, (unsigned long long)rkey, rowOff, rttCW, rttCH);
 +            }
 +        }
 +        ct->lastF = m_rFrames + 1; ++ct->draws; ct->seq = ++m_drawSeq;
@@ -1899,8 +2066,10 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +            int ty0 = oy0, ty1 = oy1;
 +            if (b.bbox[3] >= b.bbox[1])
 +            {
-+                ty0 = std::max<int>(ty0, b.bbox[1] - (int)ofy + (int)off);
-+                ty1 = std::min<int>(ty1, b.bbox[3] - (int)ofy + 1 + (int)off);
++                int by0 = b.bbox[1], by1 = b.bbox[3];
++                if (fontN) { by0 = std::min<int>(by0, static_cast<int>(std::floor(fontY0))); by1 = std::max<int>(by1, static_cast<int>(std::ceil(fontY1))); }
++                ty0 = std::max<int>(ty0, by0 - (int)ofy + (int)off);
++                ty1 = std::min<int>(ty1, by1 - (int)ofy + 1 + (int)off);
 +            }
 +            if (ty1 > ty0)
 +            {
@@ -1908,6 +2077,8 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +                ct->dirtyLo = std::min<uint32_t>(ct->dirtyLo, static_cast<uint32_t>(ty0));
 +                ct->hiRows = std::max(ct->hiRows, ct->dirtyRows);
 +                ct->loRows = std::min<uint32_t>(ct->loRows, static_cast<uint32_t>(ty0)); // lowest row ever drawn
++                if (ct->drawF != m_rFrames + 1) { ct->drawF = m_rFrames + 1; ct->drawLo = static_cast<uint32_t>(ty0); ct->drawHi = static_cast<uint32_t>(ty1); } // vk19: rows drawn this present
++                else { ct->drawLo = std::min<uint32_t>(ct->drawLo, static_cast<uint32_t>(ty0)); ct->drawHi = std::max<uint32_t>(ct->drawHi, static_cast<uint32_t>(ty1)); }
 +                if (m_drawLog.size() < 65536u) m_drawLog.push_back({ckey, ct->w, static_cast<uint32_t>(ty0), static_cast<uint32_t>(ty1), ct->seq});
 +            }
 +        }
@@ -1963,7 +2134,15 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +            pc[17] = st.texa.ta0 | (static_cast<uint32_t>(st.texa.ta1) << 8);
 +        }
 +        pc[18] = st.fogR | (static_cast<uint32_t>(st.fogG) << 8) | (static_cast<uint32_t>(st.fogB) << 16);
++        if (txOn || txLin) { pc[2] |= 32768u | ((s_txf == 2u && txIdx) ? 65536u : 0u); pc[19] = m_scale; }
 +        if (rttCW) { pc[2] |= 16384u; pc[19] = m_scale; pc[20] = rttCW | (rttCH << 16); } // texture from the scaled RTT copy
++        if (fontN)
++        {   // vk21: vector glyphs in this batch (binding 5); pc[21] = CLUT outline index | fill index << 8
++            pc[2] |= 131072u; pc[21] = m_font.idx;
++            m_fontHits += fontN;
++            static int s_fl = 0;
++            if (s_fl < 4) { ++s_fl; std::fprintf(stderr, "[gs:vk:font] batch fb %x tex %x cbp %x: %u glyph triangles vector, %llu unmapped so far\n", c.frame.fbp, c.tex0.tbp0, c.tex0.cbp, fontN, (unsigned long long)m_fontMiss); }
++        }
 +        vkCmdPushConstants(m_cmd, m_gpl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128, pc);
 +        vkCmdDraw(m_cmd, outVerts, 1, first, 0);
 +        { static const bool s_probe = std::getenv("PS2X_VK_PROBE") != nullptr; static const unsigned long long s_probeN = std::getenv("PS2X_VK_PROBEN") ? std::strtoull(std::getenv("PS2X_VK_PROBEN"), nullptr, 10) : 8ull; if (s_probe && m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + s_probeN && (!skyB0 || skyB)) probeLocked(ckey, (uint32_t)b.primCount, c.test); }
@@ -2055,11 +2234,30 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +        m_drawLog.clear();
 +        if (static_cast<size_t>(w) * h * 4u * m_scale * m_scale > presBytes()) return false;
 +        ensureBegun();
-+        VkBufferImageCopy cp{};
-+        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-+        cp.imageOffset = {static_cast<int32_t>(dbx * m_scale), static_cast<int32_t>(dby * m_scale), 0};
-+        cp.imageExtent = {w * m_scale, h * m_scale, 1};
-+        vkCmdCopyImageToBuffer(m_cmd, t->img, VK_IMAGE_LAYOUT_GENERAL, m_pres, 1, &cp);
++        if (m_aaOn && w <= kAaW && h <= kAaH)
++        {   // vk19: FXAA pass writes the present buffer
++            VkImageCopy ic{};
++            ic.srcSubresource = ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++            ic.srcOffset = {static_cast<int32_t>(dbx * m_scale), static_cast<int32_t>(dby * m_scale), 0};
++            ic.extent = {w * m_scale, h * m_scale, 1};
++            vkCmdCopyImage(m_cmd, t->img, VK_IMAGE_LAYOUT_GENERAL, m_aaImg, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
++            barrier();
++            struct { uint32_t w, h, mode; float sub, edge, emin; } apc{w * m_scale, h * m_scale, 1u, m_aaSub, m_aaEdge, 0.0312f};
++            vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_aaPipe);
++            vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_aaPl, 0, 1, &m_aaSet[m_presCur], 0, nullptr);
++            vkCmdPushConstants(m_cmd, m_aaPl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(apc), &apc);
++            vkCmdDispatch(m_cmd, (apc.w + 15u) / 16u, (apc.h + 15u) / 16u, 1);
++            barrier(true);
++            ++m_pAa;
++        }
++        else
++        {
++            VkBufferImageCopy cp{};
++            cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++            cp.imageOffset = {static_cast<int32_t>(dbx * m_scale), static_cast<int32_t>(dby * m_scale), 0};
++            cp.imageExtent = {w * m_scale, h * m_scale, 1};
++            vkCmdCopyImageToBuffer(m_cmd, t->img, VK_IMAGE_LAYOUT_GENERAL, m_pres, 1, &cp);
++        }
 +        w *= m_scale; h *= m_scale; // the presented frame is N x the GS size
 +        srcW = w;
 +        return true;
@@ -2092,18 +2290,104 @@ index 0000000000000000000000000000000000000000..bc21fb2be5b5e6261875f986a4f9175e
 +    bool presBuf(int i)
 +    {
 +        const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-+        return buffer(presBytes(), VK_BUFFER_USAGE_TRANSFER_DST_BIT, hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_presB[i], m_presMemB[i], &m_presMapB[i]) ||
-+               buffer(presBytes(), VK_BUFFER_USAGE_TRANSFER_DST_BIT, hv, m_presB[i], m_presMemB[i], &m_presMapB[i]);
++        const VkBufferUsageFlags u = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT; // storage: AA pass output
++        return buffer(presBytes(), u, hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_presB[i], m_presMemB[i], &m_presMapB[i]) ||
++               buffer(presBytes(), u, hv, m_presB[i], m_presMemB[i], &m_presMapB[i]);
++    }
++    // ---- vk19 present post pass (FXAA) ----
++    // PS2X_VK_AA=fxaa (launcher: Anti-aliasing) | off (default). PS2X_VK_AA_SUBPIX (0..1, default 0.5: keeps HUD text
++    // crisp), PS2X_VK_AA_EDGE (default 0.125). The displayed region is copied to m_aaImg and the compute pass writes the
++    // present buffer directly (instead of the image -> buffer copy).
++    static constexpr uint32_t kAaW = 1024, kAaH = 640;
++    bool m_aaOn = false;
++    float m_aaSub = 0.5f, m_aaEdge = 0.125f;
++    VkImage m_aaImg = VK_NULL_HANDLE; VkDeviceMemory m_aaMem = VK_NULL_HANDLE; VkImageView m_aaView = VK_NULL_HANDLE;
++    VkSampler m_aaSmp = VK_NULL_HANDLE;
++    VkDescriptorSetLayout m_aaDsl = VK_NULL_HANDLE; VkPipelineLayout m_aaPl = VK_NULL_HANDLE; VkPipeline m_aaPipe = VK_NULL_HANDLE;
++    VkDescriptorPool m_aaPool = VK_NULL_HANDLE; VkDescriptorSet m_aaSet[2]{};
++    uint64_t m_pAa = 0;
++    bool aaInit()
++    {
++        const char *e = std::getenv("PS2X_VK_AA");
++        if (!e || std::strcmp(e, "fxaa") != 0) return false;
++        if (const char *s = std::getenv("PS2X_VK_AA_SUBPIX")) m_aaSub = std::clamp(static_cast<float>(std::atof(s)), 0.0f, 1.0f);
++        if (const char *s = std::getenv("PS2X_VK_AA_EDGE")) m_aaEdge = std::clamp(static_cast<float>(std::atof(s)), 0.02f, 0.5f);
++        if (!auxImage(kAaW * m_scale, kAaH * m_scale, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, m_aaImg, m_aaMem, &m_aaView)) return false;
++        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
++        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
++        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++        if (vkCreateSampler(m_dev, &sci, nullptr, &m_aaSmp) != VK_SUCCESS) return false;
++        VkDescriptorSetLayoutBinding b[2]{};
++        b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++        b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++        VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++        dl.bindingCount = 2; dl.pBindings = b;
++        if (vkCreateDescriptorSetLayout(m_dev, &dl, nullptr, &m_aaDsl) != VK_SUCCESS) return false;
++        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 24};
++        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++        pl.setLayoutCount = 1; pl.pSetLayouts = &m_aaDsl; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pr;
++        if (vkCreatePipelineLayout(m_dev, &pl, nullptr, &m_aaPl) != VK_SUCCESS) return false;
++        VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++        sm.codeSize = sizeof(kGsVkFxaaSpv); sm.pCode = kGsVkFxaaSpv;
++        VkShaderModule md = VK_NULL_HANDLE;
++        if (vkCreateShaderModule(m_dev, &sm, nullptr, &md) != VK_SUCCESS) return false;
++        VkComputePipelineCreateInfo cp{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++        cp.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, md, "main", nullptr};
++        cp.layout = m_aaPl;
++        const VkResult r = vkCreateComputePipelines(m_dev, VK_NULL_HANDLE, 1, &cp, nullptr, &m_aaPipe);
++        vkDestroyShaderModule(m_dev, md, nullptr);
++        if (r != VK_SUCCESS) return false;
++        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
++        VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++        dp.maxSets = 2; dp.poolSizeCount = 2; dp.pPoolSizes = ps;
++        if (vkCreateDescriptorPool(m_dev, &dp, nullptr, &m_aaPool) != VK_SUCCESS) return false;
++        const VkDescriptorSetLayout ls[2] = {m_aaDsl, m_aaDsl};
++        VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++        da.descriptorPool = m_aaPool; da.descriptorSetCount = 2; da.pSetLayouts = ls;
++        if (vkAllocateDescriptorSets(m_dev, &da, m_aaSet) != VK_SUCCESS) return false;
++        for (int i = 0; i < 2; ++i)
++        {
++            VkDescriptorImageInfo ii{m_aaSmp, m_aaView, VK_IMAGE_LAYOUT_GENERAL};
++            VkDescriptorBufferInfo bi{m_presB[i], 0, VK_WHOLE_SIZE};
++            VkWriteDescriptorSet w[2]{};
++            w[0].sType = w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++            w[0].dstSet = w[1].dstSet = m_aaSet[i];
++            w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &ii;
++            w[1].dstBinding = 1; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &bi;
++            vkUpdateDescriptorSets(m_dev, 2, w, 0, nullptr);
++        }
++        // UNDEFINED -> GENERAL (begin() is called by the VRAM init that runs before; record into the open buffer)
++        ensureBegun();
++        VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++        ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
++        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        ib.image = m_aaImg; ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++        vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
++        std::fprintf(stderr, "[gs:vk] present anti-aliasing: FXAA (subpix %.2f, edge %.3f), PS2X_VK_AA=off to turn off\n", m_aaSub, m_aaEdge);
++        return true;
++    }
++    void aaDestroy()
++    {
++        if (m_aaPipe) vkDestroyPipeline(m_dev, m_aaPipe, nullptr);
++        if (m_aaPl) vkDestroyPipelineLayout(m_dev, m_aaPl, nullptr);
++        if (m_aaPool) vkDestroyDescriptorPool(m_dev, m_aaPool, nullptr);
++        if (m_aaDsl) vkDestroyDescriptorSetLayout(m_dev, m_aaDsl, nullptr);
++        if (m_aaSmp) vkDestroySampler(m_dev, m_aaSmp, nullptr);
++        if (m_aaView) vkDestroyImageView(m_dev, m_aaView, nullptr);
++        if (m_aaImg) vkDestroyImage(m_dev, m_aaImg, nullptr);
++        if (m_aaMem) vkFreeMemory(m_dev, m_aaMem, nullptr);
++        m_aaPipe = VK_NULL_HANDLE; m_aaPl = VK_NULL_HANDLE; m_aaPool = VK_NULL_HANDLE; m_aaDsl = VK_NULL_HANDLE; m_aaSmp = VK_NULL_HANDLE; m_aaView = VK_NULL_HANDLE; m_aaImg = VK_NULL_HANDLE; m_aaMem = VK_NULL_HANDLE;
 +    }
 +    VkShaderModule m_vs = VK_NULL_HANDLE, m_fs = VK_NULL_HANDLE;
 +    VkPipelineLayout m_gpl = VK_NULL_HANDLE;
 +    VkPipelineCache m_pcache = VK_NULL_HANDLE;
 diff --git a/ps2xRuntime/src/lib/gs/gs_vk_vram.inl b/ps2xRuntime/src/lib/gs/gs_vk_vram.inl
 new file mode 100644
-index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f54674838
+index 0000000000000000000000000000000000000000..c331758115734b084129884d4e6b2049332d5fe4
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_vk_vram.inl
-@@ -0,0 +1,930 @@
+@@ -0,0 +1,1065 @@
 +// Vulkan PS2 VRAM mirror (Phase 3 step 2), #included by gs_vk_backend.cpp inside its anonymous namespace.
 +// 4 MB device-local buffer = GS local memory. Host->local uploads are swizzled on the GPU by gs_vk_swizzle.comp;
 +// an "own" buffer (same size) records which bits were last written by an upload. Draws, clears, local->local
@@ -2155,12 +2439,18 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +            return false;
 +        if (m_scale > 1 && !auxImage(kScrW, kScrH, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, m_scrImg, m_scrMem, nullptr))
 +            return false;
++        // vk19: hi-res tile cache for GS -> host reads the game re-uploads unchanged (NPC impostors: a 64x64 tile at
++        // 0x2bc0 is rendered, read back and later uploaded as a texture). PS2X_VK_HIRES_L2H=0 turns it off.
++        m_impOn = m_scale > 1 && !(std::getenv("PS2X_VK_HIRES_L2H") && std::getenv("PS2X_VK_HIRES_L2H")[0] == '0') && !s_vkNoRtt();
++        if (m_impOn && !auxImage(kImpTile * kImpGrid * m_scale, kImpTile * kImpGrid * m_scale, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, m_impImg, m_impMem, nullptr))
++            m_impOn = false;
 +        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
 +        sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
 +        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 +        if (vkCreateSampler(m_dev, &sci, nullptr, &m_rttSmp) != VK_SUCCESS) return false;
++        if (!fontCreate()) return false; // vk21: menu font atlas (binding 5; 1x1 dummy without PS2X_VK_FONT)
 +
-+        VkDescriptorSetLayoutBinding b[5]{};
++        VkDescriptorSetLayoutBinding b[6]{};
 +        for (uint32_t i = 0; i < 4; ++i)
 +        {
 +            b[i].binding = i;
@@ -2172,8 +2462,10 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        b[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 +        b[4].descriptorCount = 1;
 +        b[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++        b[5] = b[4];
++        b[5].binding = 5;
 +        VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-+        dl.bindingCount = 5;
++        dl.bindingCount = 6;
 +        dl.pBindings = b;
 +        if (vkCreateDescriptorSetLayout(m_dev, &dl, nullptr, &m_dsl) != VK_SUCCESS) return false;
 +        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC)};
@@ -2194,7 +2486,7 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        const VkResult pr2 = vkCreateComputePipelines(m_dev, VK_NULL_HANDLE, 1, &cp, nullptr, &m_pipe);
 +        vkDestroyShaderModule(m_dev, mod, nullptr);
 +        if (pr2 != VK_SUCCESS) return false;
-+        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
++        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2}};
 +        VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
 +        dp.maxSets = 1;
 +        dp.poolSizeCount = 2;
@@ -2223,6 +2515,9 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +            wi.dstSet = m_set; wi.dstBinding = 4; wi.descriptorCount = 1;
 +            wi.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wi.pImageInfo = &ii;
 +            vkUpdateDescriptorSets(m_dev, 1, &wi, 0, nullptr);
++            VkDescriptorImageInfo fi{m_fontSmp, m_fontView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
++            wi.dstBinding = 5; wi.pImageInfo = &fi;
++            vkUpdateDescriptorSets(m_dev, 1, &wi, 0, nullptr);
 +        }
 +        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
 +        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -2237,6 +2532,12 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +                !std::getenv("PS2X_VK_CMP") && !std::getenv("PS2X_VK_DUMP") && !(std::getenv("PS2X_VK_SYNCPRES") && std::getenv("PS2X_VK_SYNCPRES")[0] == '1');
 +        cai.commandBufferCount = 2;
 +        if (vkAllocateCommandBuffers(m_dev, &cai, m_cmdB) != VK_SUCCESS) return false;
++        // vk19: extra command buffers per slot for mid-frame kicks (PS2X_VK_KICK=N batches, 0 = off)
++        cai.commandBufferCount = kKick;
++        for (uint32_t i = 0; i < 2; ++i)
++            if (vkAllocateCommandBuffers(m_dev, &cai, m_cmdK[i]) != VK_SUCCESS) return false;
++        if (const char *k = std::getenv("PS2X_VK_KICK")) m_kickEvery = static_cast<uint32_t>(std::strtoul(k, nullptr, 10));
++        if (!m_two) m_kickEvery = 0;
 +        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 +        if (vkCreateFence(m_dev, &fci, nullptr, &m_fenceB[0]) != VK_SUCCESS || vkCreateFence(m_dev, &fci, nullptr, &m_fenceB[1]) != VK_SUCCESS) return false;
 +        m_slot = 0; m_cmd = m_cmdB[0]; m_fence = m_fenceB[0];
@@ -2245,7 +2546,7 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        begin();
 +        vkCmdFillBuffer(m_cmd, m_vram, 0, VK_WHOLE_SIZE, 0u);
 +        vkCmdFillBuffer(m_cmd, m_own, 0, VK_WHOLE_SIZE, 0u);
-+        for (VkImage im : {m_rttImg, m_scrImg})
++        for (VkImage im : {m_rttImg, m_scrImg, m_impImg})
 +        {   // aux images: UNDEFINED -> GENERAL, cleared
 +            if (!im) continue;
 +            VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -2257,6 +2558,7 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +            VkClearColorValue cc{};
 +            vkCmdClearColorImage(m_cmd, im, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &ib.subresourceRange);
 +        }
++        fontRecordUpload();
 +        barrier();
 +        submitWait();
 +        m_ok = true;
@@ -2270,6 +2572,7 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        if (!m_dev) return;
 +        vkDeviceWaitIdle(m_dev);
 +        renderDestroy();
++        fontDestroy();
 +        auto kill = [&](VkBuffer &b, VkDeviceMemory &m) { if (b) vkDestroyBuffer(m_dev, b, nullptr); if (m) vkFreeMemory(m_dev, m, nullptr); b = VK_NULL_HANDLE; m = VK_NULL_HANDLE; };
 +        kill(m_vram, m_vramMem); kill(m_own, m_ownMem); kill(m_lutBuf, m_lutMem); kill(m_stage, m_stageMem); kill(m_rb, m_rbMem);
 +        for (VkFence &f : m_fenceB) { if (f) vkDestroyFence(m_dev, f, nullptr); f = VK_NULL_HANDLE; }
@@ -2281,7 +2584,7 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        if (m_dsl) vkDestroyDescriptorSetLayout(m_dev, m_dsl, nullptr);
 +        if (m_rttSmp) vkDestroySampler(m_dev, m_rttSmp, nullptr);
 +        if (m_rttView) vkDestroyImageView(m_dev, m_rttView, nullptr);
-+        for (auto im : {std::make_pair(m_rttImg, m_rttMem), std::make_pair(m_scrImg, m_scrMem)})
++        for (auto im : {std::make_pair(m_rttImg, m_rttMem), std::make_pair(m_scrImg, m_scrMem), std::make_pair(m_impImg, m_impMem)})
 +        { if (im.first) vkDestroyImage(m_dev, im.first, nullptr); if (im.second) vkFreeMemory(m_dev, im.second, nullptr); }
 +        m_dev = VK_NULL_HANDLE;
 +        m_ok = false;
@@ -2294,6 +2597,11 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        std::lock_guard<std::mutex> lk(m_m);
 +        waitInFlight();
 +        flushTxLocked();
++        if (m_traceFrame && c.direction != 0u && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8)
++            std::fprintf(stderr, "[gs:vk:xfer] f%llu dir %u src %x/%u/%x %u,%u -> dst %x/%u/%x %u,%u size %ux%u\n", (unsigned long long)(m_rFrames + 1), c.direction,
++                         c.bitbltbuf.sbp, c.bitbltbuf.sbw, c.bitbltbuf.spsm, c.trxpos.ssax, c.trxpos.ssay, c.bitbltbuf.dbp, c.bitbltbuf.dbw, c.bitbltbuf.dpsm,
++                         c.trxpos.dsax, c.trxpos.dsay, c.trxreg.rrw, c.trxreg.rrh);
++        if (c.direction != 1u) fontBeginTx(c); // vk21: menu font atlas tracking
 +        if (c.direction == 0u)
 +        {
 +            m_tx = c;
@@ -2321,7 +2629,10 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        std::lock_guard<std::mutex> lk(m_m);
 +        waitInFlight();
 +        if (m_txActive)
++        {
 +            m_txBytes.insert(m_txBytes.end(), d, d + n);
++            fontUpload(d, n);
++        }
 +    }
 +    void draw(const GSContext &c)
 +    {
@@ -2399,8 +2710,10 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +            static const bool s_profA = std::getenv("PS2X_VK_PROF") != nullptr;
 +            if (s_profA && m_rFrames % 300u == 0u)
 +            {
-+                std::fprintf(stderr, "[gs:vk:prof] per frame (async): submits %.2f wait %.2f ms | lock held %.2f ms, copy %.2f ms, draw lock wait %.2f ms\n", m_pSubs / 300.0, m_pWaitMs / 300.0, m_pHeldMs / 300.0, m_pCopyMs / 300.0, m_pLockMs / 300.0);
-+                m_pSubs = 0; m_pWaitMs = 0; m_pHeldMs = 0; m_pCopyMs = 0; m_pLockMs = 0;
++                std::fprintf(stderr, "[gs:vk:prof] per frame (async): submits %.2f (kicks %.2f) wait %.2f ms | lock held %.2f ms, copy %.2f ms, draw lock wait %.2f ms | hi-res tiles: caps %llu matches %llu draws %llu\n", m_pSubs / 300.0, m_pKicks / 300.0, m_pWaitMs / 300.0, m_pHeldMs / 300.0, m_pCopyMs / 300.0, m_pLockMs / 300.0,
++                             (unsigned long long)m_pImpCaps, (unsigned long long)m_pImpMatch, (unsigned long long)m_pImpHits);
++                m_pImpCaps = m_pImpMatch = m_pImpHits = 0;
++                m_pSubs = 0; m_pKicks = 0; m_pWaitMs = 0; m_pHeldMs = 0; m_pCopyMs = 0; m_pLockMs = 0;
 +            }
 +            // vk17: the previous frame's readback buffer is only rewritten by the next endFrame (this thread), so the
 +            // copy runs after the lock is released and no longer blocks the GS stage's draws (4x: ~18 MB per frame).
@@ -2727,12 +3040,19 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pl, 0, 1, &m_set, 0, nullptr);
 +        vkCmdPushConstants(m_cmd, m_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PC), &pc);
 +        vkCmdDispatch(m_cmd, (pc.count + 63u) / 64u, 1, 1);
++        const int impSlot = impCaptureLocked(c);
 +        barrier(true);
 +        m_stageUsed += static_cast<uint32_t>(alloc);
 +        ++m_dispatches;
 +        submitWait();
 +        out.resize(static_cast<size_t>(n));
 +        std::memcpy(out.data(), static_cast<const uint8_t *>(m_stageMap) + at, static_cast<size_t>(n) * 4u);
++        if (impSlot >= 0) m_imp[impSlot].hash = fnv(out.data(), out.size() * 4u);
++        if (const char *td = std::getenv("PS2X_VK_TRACEDUMP"); td && m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8)
++        {   // debug: GS -> host bytes in the trace window
++            char path[512]; std::snprintf(path, sizeof(path), "%s/l2h_%llu_%x_%ux%u.bin", td, (unsigned long long)(m_rFrames + 1), c.bitbltbuf.sbp, rrw, rrh);
++            if (FILE *f = std::fopen(path, "wb")) { std::fwrite(out.data(), 4, out.size(), f); std::fclose(f); }
++        }
 +        m_stageUsed = stageLo();
 +        return true;
 +    }
@@ -2755,6 +3075,12 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +            const uint64_t txB = static_cast<uint64_t>(m_tx.bitbltbuf.dbp) * 256u;
 +            const uint64_t txE = txB + static_cast<uint64_t>(std::max<uint32_t>(m_tx.bitbltbuf.dbw, 1u)) * 64u * (m_tx.trxpos.dsay + rrh) * texBits(m_tx.bitbltbuf.dpsm) / 8u;
 +            preUploadLocked(txB, txE);
++            if (const char *td = std::getenv("PS2X_VK_TRACEDUMP"); td && m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8 && m_txDone == 0)
++            {   // debug: host -> GS upload bytes in the trace window (first chunk)
++                static unsigned s_up = 0;
++                char path[512]; std::snprintf(path, sizeof(path), "%s/up_%llu_%03u_%x_%u_%x_%ux%u.bin", td, (unsigned long long)(m_rFrames + 1), s_up++, m_tx.bitbltbuf.dbp, m_tx.bitbltbuf.dbw, m_tx.bitbltbuf.dpsm, rrw, rrh);
++                if (FILE *f = std::fopen(path, "wb")) { std::fwrite(m_txBytes.data() + startByte, 1, len, f); std::fclose(f); }
++            }
 +            if (m_traceFrame && m_rFrames + 1 >= m_traceFrame && m_rFrames + 1 < m_traceFrame + 8)
 +                std::fprintf(stderr, "[gs:vk:tx] f%llu dbp %x dbw %u dpsm %x y %u h %u\n", (unsigned long long)(m_rFrames + 1), m_tx.bitbltbuf.dbp, m_tx.bitbltbuf.dbw, m_tx.bitbltbuf.dpsm, m_tx.trxpos.dsay, rrh);
 +            if (m_stageUsed + alloc > stageHi())
@@ -2811,6 +3137,7 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +            m_txDone = have;
 +        }
 +        m_txFlushedBytes = m_txBytes.size();
++        if (m_impOn && m_txDone >= total) impMatchUploadLocked(total);
 +        if (finish || m_txDone >= total)
 +        {
 +            if (m_txDone >= total || finish) ++m_uploads;
@@ -2818,6 +3145,69 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +            m_txBytes.clear();
 +            m_txFlushedBytes = 0;
 +        }
++    }
++
++    // ---- vk19 hi-res L2H tile cache ----
++    static constexpr uint32_t kImpTile = 64, kImpGrid = 4, kImpSlots = kImpGrid * kImpGrid;
++    struct ImpSlot { uint64_t hash = 0, use = 0; uint32_t w = 0, h = 0; };
++    ImpSlot m_imp[kImpSlots];
++    struct ImpAlias { bool on = false; uint32_t dbp = 0, dbw = 0, w = 0, h = 0, slot = 0; uint64_t seq = 0; } m_impA[8];
++    bool m_impOn = false;
++    uint64_t m_impUse = 0, m_pImpHits = 0, m_pImpCaps = 0, m_pImpMatch = 0;
++    VkImage m_impImg = VK_NULL_HANDLE; VkDeviceMemory m_impMem = VK_NULL_HANDLE;
++    static uint64_t fnv(const void *d, size_t n)
++    {
++        const uint8_t *p = static_cast<const uint8_t *>(d); uint64_t h = 1469598103934665603ull;
++        for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
++        return h ? h : 1u;
++    }
++    // Copies the scaled source rect of a CT32 read (at 0,0, up to 64x64, from a drawn target) into a cache slot.
++    int impCaptureLocked(const GSTransferCommand &c)
++    {
++        if (!m_impOn || c.bitbltbuf.spsm != GS_PSM_CT32 || c.trxpos.ssax || c.trxpos.ssay) return -1;
++        const uint32_t w = c.trxreg.rrw, h = c.trxreg.rrh;
++        if (w > kImpTile || h > kImpTile || w < 8 || h < 8) return -1;
++        const uint32_t sbw = std::max<uint32_t>(c.bitbltbuf.sbw, 1u);
++        const uint64_t key = static_cast<uint64_t>(c.bitbltbuf.sbp / 32u) | (static_cast<uint64_t>(sbw) << 9) | (static_cast<uint64_t>(GS_PSM_CT32) << 15);
++        if (c.bitbltbuf.sbp % 32u) return -1;
++        auto it = m_colorT.find(key);
++        if (it == m_colorT.end() || it->second.hiRows < h || it->second.w < w || it->second.lastF != m_rFrames + 1) return -1;
++        uint32_t best = 0;
++        for (uint32_t i = 1; i < kImpSlots; ++i) if (m_imp[i].use < m_imp[best].use) best = i;
++        endRenderingLocked();
++        VkImageCopy ic{};
++        ic.srcSubresource = ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        ic.dstOffset = {static_cast<int32_t>((best % kImpGrid) * kImpTile * m_scale), static_cast<int32_t>((best / kImpGrid) * kImpTile * m_scale), 0};
++        ic.extent = {w * m_scale, h * m_scale, 1};
++        vkCmdCopyImage(m_cmd, it->second.img, VK_IMAGE_LAYOUT_GENERAL, m_impImg, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
++        m_imp[best] = ImpSlot{0, ++m_impUse, w, h};
++        ++m_pImpCaps;
++        return static_cast<int>(best);
++    }
++    // A finished CT32 upload whose bytes equal a cached read: remember that this texture is that tile.
++    void impMatchUploadLocked(uint64_t total)
++    {
++        const uint32_t dbp = m_tx.bitbltbuf.dbp, dbw = std::max<uint32_t>(m_tx.bitbltbuf.dbw, 1u), w = m_tx.trxreg.rrw, h = m_tx.trxreg.rrh;
++        const uint64_t b = static_cast<uint64_t>(dbp) * 256u, e = b + static_cast<uint64_t>(dbw) * 64u * (m_tx.trxpos.dsay + h) * texBits(m_tx.bitbltbuf.dpsm) / 8u;
++        for (auto &a : m_impA)
++        {   // any upload over an alias' memory ends it
++            if (!a.on) continue;
++            const uint64_t ab = static_cast<uint64_t>(a.dbp) * 256u, ae = ab + static_cast<uint64_t>(a.dbw) * 64u * a.h * 4u;
++            if (b < ae && ab < e) a.on = false;
++        }
++        if (m_tx.bitbltbuf.dpsm != GS_PSM_CT32 || m_tx.trxpos.dsax || m_tx.trxpos.dsay || w > kImpTile || h > kImpTile || total != static_cast<uint64_t>(w) * h) return;
++        if (m_txBytes.size() < total * 4u) return;
++        const uint64_t hs = fnv(m_txBytes.data(), total * 4u);
++        for (uint32_t i = 0; i < kImpSlots; ++i)
++            if (m_imp[i].hash == hs && m_imp[i].w == w && m_imp[i].h == h)
++            {
++                uint32_t k = 0;
++                for (uint32_t j = 0; j < 8; ++j) if (!m_impA[j].on) { k = j; break; }
++                m_impA[k] = ImpAlias{true, dbp, dbw, w, h, i, m_drawSeq};
++                m_imp[i].use = ++m_impUse;
++                ++m_pImpMatch;
++                return;
++            }
 +    }
 +
 +    uint32_t recordRoundTripLocked()
@@ -2886,10 +3276,38 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        m_clutPending = 0;
 +        if (m_two) { m_slot ^= 1u; m_cmd = m_cmdB[m_slot]; m_fence = m_fenceB[m_slot]; }
 +    }
++    // vk19: submit what is recorded so far (no fence) and continue in a fresh command buffer of the same slot, so the
++    // GPU runs the frame while it is being recorded and a GS -> host read (submitWait) only waits for the tail.
++    // The slot's fence (on the frame's last submit) covers the kicked buffers: fence signals include all earlier
++    // submissions. Kicked buffers are reset in begin() only after that fence (or a submitWait) was waited.
++    static constexpr uint32_t kKick = 32;
++    VkCommandBuffer m_cmdK[2][kKick]{};
++    uint32_t m_kickIdx = 0, m_kickBatches = 0, m_kickEvery = 16;
++    uint64_t m_pKicks = 0;
++    void kickLocked()
++    {
++        m_kickBatches = 0;
++        if (!m_begun || !m_two || m_kickIdx >= kKick) return;
++        endRenderingLocked();
++        vkEndCommandBuffer(m_cmd);
++        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++        si.commandBufferCount = 1;
++        si.pCommandBuffers = &m_cmd;
++        ++m_pSubs; ++m_pKicks;
++        vkQueueSubmit(m_q, 1, &si, VK_NULL_HANDLE);
++        m_cmd = m_cmdK[m_slot][m_kickIdx++];
++        vkResetCommandBuffer(m_cmd, 0);
++        VkCommandBufferBeginInfo bb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++        bb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        vkBeginCommandBuffer(m_cmd, &bb);
++        barrier(); // GPU order after the kicked part
++    }
 +    void begin()
 +    {
 +        waitSlot(m_slot);
 +        if (!m_two) waitAllLocked();
++        if (m_two) m_cmd = m_cmdB[m_slot]; // after a kick m_cmd was one of the slot's kick buffers
++        m_kickIdx = 0; m_kickBatches = 0;
 +        vkResetCommandBuffer(m_cmd, 0);
 +        VkCommandBufferBeginInfo bb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 +        bb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -3013,6 +3431,7 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +        return vkCreateImageView(m_dev, &vi, nullptr, view) == VK_SUCCESS;
 +    }
 +
++#include "gs_vk_font.inl"
 +#include "gs_vk_render.inl"
 +};
 +#else
@@ -3036,20 +3455,22 @@ index 0000000000000000000000000000000000000000..cadb8109e44fddb831a30c0ed472645f
 +#endif
 diff --git a/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.frag b/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.frag
 new file mode 100644
-index 0000000000000000000000000000000000000000..9e3c278d3fdf28e5521ce7f8071d2bc926514174
+index 0000000000000000000000000000000000000000..c5d3d3a7d7f68a793c9f9cf83ca56d4b760bccf9
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.frag
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,229 @@
 +#version 450
 +// GS draw fragment: texture fetched straight from the 4 MB VRAM buffer (swizzle LUTs), CLUT from VRAM at CBP,
 +// TEXA expansion, TFX, fog, alpha test. Output colour 0..1 (=/255), alpha = As/128 (PS2 1.0 = 0x80).
 +layout(std430, binding = 0) readonly buffer Vram { uint vram[]; };
 +layout(std430, binding = 2) readonly buffer Lut { uint lut[]; };
 +layout(binding = 4) uniform sampler2D rtTex; // scaled render-target copy (flags bit 14; pc 19 scale, 20 w|h<<16)
++layout(binding = 5) uniform sampler2D fontTex; // vk21: vector menu font atlas, R = fill, G = fill + outline (flags bit 17, pc 21)
 +layout(location = 0) in vec4 vColor;
 +layout(location = 1) flat in vec4 vColorFlat;
 +layout(location = 2) in vec3 vStq;
 +layout(location = 3) in float vFog;
++layout(location = 4) flat in vec4 vRect; // vk20: sprite texel rect (flags bit 15 text filter, bit 16 sharp)
 +layout(location = 0) out vec4 outColor;
 +layout(push_constant) uniform PC { uint pc[32]; } p;
 +// pc: 0 W, 1 H, 2 flags, 3 aref, 4 texBaseBits, 5 texPpr, 6 texPw|texPh<<16, 7 texLut, 8 texBits|texShift<<8|kind<<16,
@@ -3077,6 +3498,23 @@ index 0000000000000000000000000000000000000000..9e3c278d3fdf28e5521ce7f8071d2bc9
 +    if (mode == 2u) return uint(clamp(c, int(mn), int(mx)));
 +    return (uint(c) & mn) | mx;
 +}
++vec4 clutColor(uint raw, uint kind, uint ta0, uint ta1, bool aem)
++{   // CLUT entry for an indexed texel (kind 3 = T8, 4 = T4)
++    uint cx, cy;
++    if (kind == 3u)
++    {
++        uint i = (raw & 0xE7u) | ((raw & 0x08u) << 1) | ((raw & 0x10u) >> 1);
++        cx = i & 15u; cy = i >> 4;
++    }
++    else { cx = raw & 7u; cy = raw >> 3; }
++    uint clutBits = p.pc[12] & 255u;
++    uint cv;
++    if ((p.pc[12] & 256u) != 0u) // CLUT-buffer snapshot (pc[10] = word index of the entry base)
++        cv = vram[p.pc[10] + ((kind == 3u) ? (raw & 255u) : (raw & 15u))] & ((clutBits >= 32u) ? 0xFFFFFFFFu : 0xFFFFu);
++    else
++        cv = readPix(p.pc[10], 1u, 64u, (clutBits == 32u) ? 32u : 64u, p.pc[11], cx, cy, clutBits, 0u);
++    return (clutBits == 32u) ? c32(cv) : c16(cv, ta0, ta1, aem);
++}
 +vec4 texel(int u, int v, uint flags, uint tw, uint th)
 +{
 +    uint x = wrap(u, p.pc[14] & 3u, tw, p.pc[15] & 0xFFFFu, p.pc[15] >> 16);
@@ -3090,27 +3528,22 @@ index 0000000000000000000000000000000000000000..9e3c278d3fdf28e5521ce7f8071d2bc9
 +    else if (kind == 1u) { T = c32(raw); T.a = (aem && (raw & 0xFFFFFFu) == 0u) ? 0.0 : float(ta0); }
 +    else if (kind == 2u) T = c16(raw, ta0, ta1, aem);
 +    else
-+    {
-+        uint cx, cy;
-+        if (kind == 3u)
-+        {
-+            uint i = (raw & 0xE7u) | ((raw & 0x08u) << 1) | ((raw & 0x10u) >> 1);
-+            cx = i & 15u; cy = i >> 4;
-+        }
-+        else { cx = raw & 7u; cy = raw >> 3; }
-+        uint clutBits = p.pc[12] & 255u;
-+        uint cv;
-+        if ((p.pc[12] & 256u) != 0u) // CLUT-buffer snapshot (pc[10] = word index of the entry base)
-+            cv = vram[p.pc[10] + ((kind == 3u) ? (raw & 255u) : (raw & 15u))] & ((clutBits >= 32u) ? 0xFFFFFFFFu : 0xFFFFu);
-+        else
-+            cv = readPix(p.pc[10], 1u, 64u, (clutBits == 32u) ? 32u : 64u, p.pc[11], cx, cy, clutBits, 0u);
-+        T = (clutBits == 32u) ? c32(cv) : c16(cv, ta0, ta1, aem);
-+    }
++        T = clutColor(raw, kind, ta0, ta1, aem);
 +    return T;
++}
++int rtWrap(int h, uint mode, uint size, uint mn, uint mx, int S)
++{   // vk19: CLAMP_0 addressing on the scaled copy: wrap the texel index, keep the sub-texel offset
++    int t = (h >= 0) ? h / S : -((S - 1 - h) / S);
++    int sub = h - t * S;
++    int w = int(wrap(t, mode, size, mn, mx));
++    if (w != t && mode != 0u && mode != 3u) sub = (t < w) ? 0 : S - 1;
++    return w * S + sub;
 +}
 +vec4 rtTexel(int x, int y, uint flags)
 +{   // GS texel from the RTT image: rgb = c*255, alpha stored as A/128 -> GS 0..128
 +    int S = int(p.pc[19]);
++    x = rtWrap(x, p.pc[14] & 3u, p.pc[9] & 0xFFFFu, p.pc[15] & 0xFFFFu, p.pc[15] >> 16, S);
++    y = rtWrap(y, (p.pc[14] >> 2) & 3u, p.pc[9] >> 16, p.pc[16] & 0xFFFFu, p.pc[16] >> 16, S);
 +    ivec2 lim = ivec2(int(p.pc[20] & 0xFFFFu) * S - 1, int(p.pc[20] >> 16) * S - 1);
 +    vec4 c = texelFetch(rtTex, clamp(ivec2(x, y), ivec2(0), lim), 0);
 +    vec4 T = vec4(floor(c.rgb * 255.0 + 0.5), floor((floor(c.a * 255.0 + 0.5) * 128.0 + 127.0) / 255.0));
@@ -3118,9 +3551,68 @@ index 0000000000000000000000000000000000000000..9e3c278d3fdf28e5521ce7f8071d2bc9
 +        T.a = (((flags & 4096u) != 0u) && T.r + T.g + T.b == 0.0) ? 0.0 : float(p.pc[17] & 255u);
 +    return T;
 +}
++vec4 texel(int u, int v, uint flags, uint tw, uint th);
++vec4 txFilter(float fu, float fv, uint flags, uint tw, uint th)
++{   // vk20: filter inside the sprite's texel rect; colour weighted by alpha so transparent texels don't darken edges
++    vec2 lo = vRect.xy + 0.5, hi = max(vRect.zw - 0.5, lo);
++    vec2 c = clamp(vec2(fu, fv), lo, hi) - 0.5;
++    ivec2 i = ivec2(floor(c)); vec2 f = c - vec2(i);
++    vec4 t00 = texel(i.x, i.y, flags, tw, th), t10 = texel(i.x + 1, i.y, flags, tw, th);
++    vec4 t01 = texel(i.x, i.y + 1, flags, tw, th), t11 = texel(i.x + 1, i.y + 1, flags, tw, th);
++    vec4 w = vec4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
++    float a = dot(w, vec4(t00.a, t10.a, t01.a, t11.a));
++    vec4 wa = w * (vec4(t00.a, t10.a, t01.a, t11.a) + 1e-3);
++    vec3 rgb = (wa.x * t00.rgb + wa.y * t10.rgb + wa.z * t01.rgb + wa.w * t11.rgb) / (wa.x + wa.y + wa.z + wa.w);
++    return floor(vec4(rgb, a) + 0.5);
++}
++vec4 bspl(float t)
++{   // uniform cubic B-spline weights for taps -1, 0, 1, 2
++    float t2 = t * t, t3 = t2 * t;
++    return vec4(1.0 - 3.0 * t + 3.0 * t2 - t3, 4.0 - 6.0 * t2 + 3.0 * t3, 1.0 + 3.0 * t + 3.0 * t2 - 3.0 * t3, t3) / 6.0;
++}
++vec4 txSharp(float fu, float fv, uint flags, uint tw, uint th, bool useRect)
++{   // vk20 "sharp" text upscale: cubic B-spline reconstruction of the glyph texels, re-thresholded against the local 2x2
++    // min/max -> smooth, crisp contours (no texel stair-steps); low-contrast areas keep the smooth reconstruction
++    vec2 lo = useRect ? vRect.xy : vec2(-1e9), hi = useRect ? vRect.zw - 1.0 : vec2(1e9);
++    vec2 c = vec2(fu, fv);
++    if (useRect) c = clamp(c, lo + 0.5, max(hi + 0.5, lo + 0.5));
++    c -= 0.5;
++    ivec2 i = ivec2(floor(c)); vec2 f = c - vec2(i);
++    vec4 wx = bspl(f.x), wy = bspl(f.y);
++    vec4 acc = vec4(0.0); vec3 accRgbA = vec3(0.0); float accA = 0.0;
++    float amn = 1e9, amx = -1e9, lmn = 1e9, lmx = -1e9; vec3 cLo = vec3(0.0);
++    const vec3 L = vec3(0.299, 0.587, 0.114);
++    for (int y = -1; y <= 2; ++y)
++        for (int x = -1; x <= 2; ++x)
++        {
++            ivec2 q = i + ivec2(x, y);
++            if (useRect) q = clamp(q, ivec2(lo), ivec2(max(hi, lo)));
++            vec4 t = texel(q.x, q.y, flags, tw, th);
++            float w = wx[x + 1] * wy[y + 1];
++            acc += w * t; accRgbA += w * (t.a + 1e-3) * t.rgb; accA += w * (t.a + 1e-3);
++            if (x >= 0 && x <= 1 && y >= 0 && y <= 1)
++            {
++                amn = min(amn, t.a); amx = max(amx, t.a);
++                float l = dot(t.rgb, L);
++                if (l < lmn) { lmn = l; cLo = t.rgb; }
++                lmx = max(lmx, l);
++            }
++        }
++    float d = 0.5 / max(float(p.pc[19]), 1.0);
++    vec4 r = vec4(accRgbA / max(accA, 1e-6), acc.a);
++    if (amx - amn >= 24.0)
++        r.a = mix(amn, amx, smoothstep(0.42 - d, 0.42 + d, (acc.a - amn) / (amx - amn)));
++    else if (lmx - lmn >= 24.0)
++    {   // luminance-shaped (alpha flat): move the smooth colour to the thresholded luminance (no rim brighter than the texels)
++        float la = dot(acc.rgb, L), lt = mix(lmn, lmx, smoothstep(0.42 - d, 0.42 + d, (la - lmn) / (lmx - lmn)));
++        r.rgb = cLo + (acc.rgb - cLo) * ((lt - lmn) / max(la - lmn, 1.0));
++    }
++    return floor(clamp(r, vec4(0.0), vec4(255.0)) + 0.5);
++}
 +void main()
 +{
 +    uint flags = p.pc[2];
++    vec2 fdx = dFdx(vStq.xy), fdy = dFdy(vStq.xy); // vk21: font atlas LOD (taken in uniform control flow)
 +    vec4 F = ((flags & 2u) != 0u) ? vColor : vColorFlat;
 +    F = floor(F + 0.5);
 +    vec4 C = F;
@@ -3130,7 +3622,16 @@ index 0000000000000000000000000000000000000000..9e3c278d3fdf28e5521ce7f8071d2bc9
 +        float q = (vStq.z == 0.0) ? 1.0 : vStq.z;
 +        vec4 T;
 +        float fu = vStq.x / q * float(tw), fv = vStq.y / q * float(th);
-+        if ((flags & 16384u) != 0u)
++        if ((flags & 131072u) != 0u && vRect.x < -0.5)
++        {   // vk21: vector glyph: coverage from the hi-res atlas, colours from the game's CLUT (outline / fill entries)
++            vec2 rg = textureGrad(fontTex, vStq.xy, fdx, fdy).rg;
++            float cov = rg.g, fill = clamp(rg.r / max(rg.g, 1e-4), 0.0, 1.0);
++            uint kind = (p.pc[8] >> 16) & 255u, ta0 = p.pc[17] & 255u, ta1 = (p.pc[17] >> 8) & 255u;
++            bool aem = (flags & 4096u) != 0u;
++            vec4 co = clutColor(p.pc[21] & 255u, kind, ta0, ta1, aem), cf = clutColor((p.pc[21] >> 8) & 255u, kind, ta0, ta1, aem);
++            T = floor(vec4(mix(co.rgb, cf.rgb, fill), cov * mix(co.a, cf.a, fill)) + 0.5);
++        }
++        else if ((flags & 16384u) != 0u)
 +        {   // render target at N x: sample the scaled copy (sub-texel detail)
 +            float S = float(p.pc[19]);
 +            float hu = fu * S, hv = fv * S;
@@ -3146,6 +3647,10 @@ index 0000000000000000000000000000000000000000..9e3c278d3fdf28e5521ce7f8071d2bc9
 +            else
 +                T = rtTexel(int(floor(hu)), int(floor(hv)), flags);
 +        }
++        else if ((flags & 32768u) != 0u && vRect.z > vRect.x)
++            T = ((flags & 65536u) != 0u) ? txSharp(fu, fv, flags, tw, th, true) : txFilter(fu, fv, flags, tw, th);
++        else if ((flags & 98304u) == 98304u && (flags & 8192u) != 0u)
++            T = txSharp(fu, fv, flags, tw, th, false);
 +        else if ((flags & 8192u) != 0u)
 +        {   // bilinear (TEX1 MMAG/MMIN linear), GS samples texel centres: (u - 0.5, v - 0.5)
 +            fu -= 0.5; fv -= 0.5;
@@ -3185,15 +3690,17 @@ index 0000000000000000000000000000000000000000..9e3c278d3fdf28e5521ce7f8071d2bc9
 +}
 diff --git a/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.vert b/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.vert
 new file mode 100644
-index 0000000000000000000000000000000000000000..3865b67b478994df520acf063bcc29d2e8026738
+index 0000000000000000000000000000000000000000..e0c8b7073174fe85607979eebbd9eb28d2346fcf
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/shaders/gs_vk_draw.vert
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,24 @@
 +#version 450
 +// GS draw vertex: pixel-space position (XYOFFSET removed), normalized depth, fog, colour (0-255), STQ.
 +layout(location = 0) in vec4 inPos;   // x, y, z(0..1), fog(0..255)
 +layout(location = 1) in vec4 inColor; // r, g, b, a (0..255)
 +layout(location = 2) in vec4 inStq;   // s, t, q, 0
++layout(location = 3) in vec4 inRect;  // vk20: sprite texel rect lo.uv, hi.uv (text filter)
++layout(location = 4) flat out vec4 vRect;
 +layout(location = 0) out vec4 vColor;
 +layout(location = 1) flat out vec4 vColorFlat;
 +layout(location = 2) out vec3 vStq;
@@ -3209,6 +3716,7 @@ index 0000000000000000000000000000000000000000..3865b67b478994df520acf063bcc29d2
 +    vColorFlat = inColor;
 +    vStq = inStq.xyz;
 +    vFog = inPos.w;
++    vRect = inRect;
 +}
 diff --git a/ps2xRuntime/src/lib/gs/shaders/gs_vk_swizzle.comp b/ps2xRuntime/src/lib/gs/shaders/gs_vk_swizzle.comp
 new file mode 100644
@@ -3307,4 +3815,406 @@ index 0000000000000000000000000000000000000000..9e1576659a18422b2c5071d1c4d7c97c
 +        }
 +        io[pc.ioBitBase + i] = v;
 +    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_vk_font.inl b/ps2xRuntime/src/lib/gs/gs_vk_font.inl
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f0f41808c086852a54442839fe68f93919beb7c
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_vk_font.inl
+@@ -0,0 +1,316 @@
++// vk21: vector replacement for the game's front-end menu font (Vulkan renderer). #included inside class VkVramMirror.
++// PS2X_VK_FONT=imfell|off (default off; launcher Remaster row "Original font / IM FELL", config menu_font).
++// Asset: assets/fonts/<name>_menu.p2f, made by tools/gen_menu_font.py from an OFL TrueType font and the game's FNTS
++// glyph table: an RG8 atlas pre-rendered at K x (R = fill, G = fill + outline) plus, per glyph, the original atlas
++// rect (u, v, w, h, xoff, yoff) and the replacement quad relative to the pen / line top.
++// Detection: the 512x512 PSMT4 atlas upload is hashed (ps2x_texrep::hash64 of the upload bytes) and must match the
++// asset; any later upload, local copy or draw over that memory turns the replacement off until the next matching
++// upload. Draws: textured triangles with that TEX0 (TBP, PSMT4 512x512, CBP = TBP + asset offset) whose two-triangle
++// glyph quads map to a table entry are redrawn at the new glyph's quad, sampling the hi-res atlas (trilinear, any
++// internal scale). The CLUT outline / fill colours, the vertex gradient (affine, extended over the new quad) and the
++// game's +3,+3 shadow pass are kept; anything that does not map draws as before. Shader: flags bit 17, pc[21],
++// binding 5. Missing / bad asset or no hash match: the original font, logged once as [gs:vk:font].
++private:
++    struct FontGlyph { uint16_t code, ou, ov, ow, oh; int16_t xo, yo, adv; float nx0, ny0, nw, nh; uint16_t ax, ay, aw, ah; };
++    struct FontAsset
++    {
++        bool ok = false;
++        std::string path;
++        uint32_t aw = 0, ah = 0, tw = 512, th = 512, idx = 0, cbpOff = 0, mips = 1;
++        uint64_t hash = 0;
++        std::vector<FontGlyph> g;
++        std::unordered_map<uint32_t, uint32_t> byUv; // (u << 16 | v) of the original quad -> glyph
++        std::vector<uint8_t> pix;                    // all mip levels, RG8
++        std::vector<uint32_t> mipOff;
++    };
++    FontAsset m_font;
++    VkImage m_fontImg = VK_NULL_HANDLE; VkDeviceMemory m_fontMem = VK_NULL_HANDLE; VkImageView m_fontView = VK_NULL_HANDLE; VkSampler m_fontSmp = VK_NULL_HANDLE;
++    bool m_fontValid = false, m_fontTx = false;
++    uint32_t m_fontTbp = 0, m_fontTxDbp = 0, m_fontTxN = 0, m_fontTailN = 0;
++    uint64_t m_fontH = 0, m_fontHits = 0, m_fontMiss = 0, m_fontPendB = 0, m_fontPendE = 0;
++    uint8_t m_fontTail[8]{};
++
++    static std::string fontFind()
++    {
++        const char *e = std::getenv("PS2X_VK_FONT");
++        if (!e || !e[0]) return {};
++        std::string v(e);
++        if (v == "off" || v == "0" || v == "original") return {};
++        if (v == "1" || v == "on" || v == "hd" || v == "vector" || v == "original_hd") v = "imfell";
++        const std::string file = v + "_menu.p2f";
++        namespace fs = std::filesystem;
++        std::error_code ec;
++        std::vector<fs::path> dirs;
++        if (const char *d = std::getenv("PS2X_VK_FONT_DIR")) dirs.emplace_back(d);
++        fs::path exe = fs::read_symlink("/proc/self/exe", ec);
++        if (!ec)
++            for (fs::path d = exe.parent_path(); !d.empty() && dirs.size() < 8; d = d.parent_path())
++            {
++                dirs.push_back(d / "assets" / "fonts");
++                if (d == d.root_path()) break;
++            }
++        dirs.push_back(fs::current_path(ec) / "assets" / "fonts");
++        for (const fs::path &d : dirs)
++            if (fs::is_regular_file(d / file, ec)) return (d / file).string();
++        std::fprintf(stderr, "[gs:vk:font] PS2X_VK_FONT=%s: %s not found (assets/fonts next to the executable's parents, the cwd, or PS2X_VK_FONT_DIR); original font\n", e, file.c_str());
++        return {};
++    }
++
++    bool fontLoad()
++    {
++        const std::string path = fontFind();
++        if (path.empty()) return false;
++        std::ifstream f(path, std::ios::binary);
++        std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++        auto bad = [&](const char *why) { std::fprintf(stderr, "[gs:vk:font] %s: %s; original font\n", path.c_str(), why); m_font = FontAsset{}; return false; };
++        size_t at = 0;
++        auto rd = [&](void *dst, size_t n) { if (at + n > d.size()) return false; std::memcpy(dst, d.data() + at, n); at += n; return true; };
++        char magic[8]; uint32_t ver = 0, n = 0; float k = 0, base = 0;
++        if (!rd(magic, 8) || std::memcmp(magic, "P2XFONT1", 8) != 0 || !rd(&ver, 4) || ver != 1u) return bad("not a P2XFONT1 v1 file");
++        FontAsset &A = m_font;
++        if (!rd(&A.aw, 4) || !rd(&A.ah, 4) || !rd(&n, 4) || !rd(&A.hash, 8) || !rd(&A.tw, 4) || !rd(&A.th, 4) || !rd(&A.idx, 4) || !rd(&A.cbpOff, 4) || !rd(&k, 4) || !rd(&base, 4))
++            return bad("short header");
++        if (A.aw == 0 || A.ah == 0 || A.aw > 8192 || A.ah > 8192 || n == 0 || n > 4096 || A.tw != 512 || A.th != 512) return bad("bad header");
++        A.g.resize(n);
++        for (uint32_t i = 0; i < n; ++i)
++        {
++            FontGlyph &g = A.g[i];
++            if (!rd(&g.code, 2) || !rd(&g.ou, 2) || !rd(&g.ov, 2) || !rd(&g.ow, 2) || !rd(&g.oh, 2) || !rd(&g.xo, 2) || !rd(&g.yo, 2) || !rd(&g.adv, 2) ||
++                !rd(&g.nx0, 4) || !rd(&g.ny0, 4) || !rd(&g.nw, 4) || !rd(&g.nh, 4) || !rd(&g.ax, 2) || !rd(&g.ay, 2) || !rd(&g.aw, 2) || !rd(&g.ah, 2))
++                return bad("short glyph table");
++            if (static_cast<uint32_t>(g.ax) + g.aw > A.aw || static_cast<uint32_t>(g.ay) + g.ah > A.ah) return bad("glyph outside the atlas");
++            A.byUv[(static_cast<uint32_t>(g.ou) << 16) | g.ov] = i;
++        }
++        uint32_t clen = 0;
++        if (!rd(&clen, 4) || at + clen > d.size()) return bad("short pixel data");
++        const size_t L0 = static_cast<size_t>(A.aw) * A.ah * 2u;
++        A.pix.reserve(L0 + L0 / 3u + 64u);
++        A.pix.resize(L0);
++        size_t o = 0; const uint8_t *p = d.data() + at, *pe = p + clen;
++        while (p < pe && o < L0)
++        {   // PackBits: 0..127 = copy n+1 bytes, 128..255 = repeat the next byte n-126 times
++            const uint8_t c = *p++;
++            if (c < 128u) { const size_t m = std::min<size_t>(c + 1u, std::min<size_t>(pe - p, L0 - o)); std::memcpy(&A.pix[o], p, m); p += m; o += m; }
++            else if (p < pe) { const size_t m = std::min<size_t>(c - 126u, L0 - o); std::memset(&A.pix[o], *p++, m); o += m; }
++        }
++        if (o != L0) return bad("pixel data does not decode to the atlas size");
++        // mip chain (2x2 box), down to 1/16 of K x (enough below 1x internal scale)
++        A.mipOff.push_back(0);
++        uint32_t w = A.aw, h = A.ah;
++        while (A.mips < 5u && w > 1u && h > 1u)
++        {
++            const uint32_t nw = std::max(1u, w / 2u), nh = std::max(1u, h / 2u);
++            const size_t src = A.mipOff.back(), dst = A.pix.size();
++            A.pix.resize(dst + static_cast<size_t>(nw) * nh * 2u);
++            for (uint32_t y = 0; y < nh; ++y)
++                for (uint32_t x = 0; x < nw; ++x)
++                    for (uint32_t ch = 0; ch < 2; ++ch)
++                    {
++                        auto at2 = [&](uint32_t xx, uint32_t yy) { return (uint32_t)A.pix[src + (static_cast<size_t>(std::min(yy, h - 1u)) * w + std::min(xx, w - 1u)) * 2u + ch]; };
++                        A.pix[dst + (static_cast<size_t>(y) * nw + x) * 2u + ch] = static_cast<uint8_t>((at2(2 * x, 2 * y) + at2(2 * x + 1, 2 * y) + at2(2 * x, 2 * y + 1) + at2(2 * x + 1, 2 * y + 1) + 2u) / 4u);
++                    }
++            A.mipOff.push_back(static_cast<uint32_t>(dst));
++            w = nw; h = nh; ++A.mips;
++        }
++        if (A.pix.size() > kStaging) return bad("atlas larger than the staging buffer");
++        A.ok = true; A.path = path;
++        std::fprintf(stderr, "[gs:vk:font] %s: %u glyphs, atlas %ux%u at %.0fx (%u mips), waiting for the menu atlas upload (hash %016llx)\n",
++                     path.c_str(), n, A.aw, A.ah, (double)k, A.mips, (unsigned long long)A.hash);
++        return true;
++    }
++
++    // Image + view + sampler (a 1x1 dummy without an asset, so binding 5 is always valid). Before the descriptor writes.
++    bool fontCreate()
++    {
++        fontLoad();
++        const uint32_t w = m_font.ok ? m_font.aw : 1u, h = m_font.ok ? m_font.ah : 1u, mips = m_font.ok ? m_font.mips : 1u;
++        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8_UNORM; ii.extent = {w, h, 1};
++        ii.mipLevels = mips; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
++        ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++        if (vkCreateImage(m_dev, &ii, nullptr, &m_fontImg) != VK_SUCCESS) return false;
++        VkMemoryRequirements mr;
++        vkGetImageMemoryRequirements(m_dev, m_fontImg, &mr);
++        VkPhysicalDeviceMemoryProperties mp;
++        vkGetPhysicalDeviceMemoryProperties(m_phys, &mp);
++        uint32_t idx = UINT32_MAX;
++        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
++            if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { idx = i; break; }
++        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++        ai.allocationSize = mr.size; ai.memoryTypeIndex = idx;
++        if (idx == UINT32_MAX || vkAllocateMemory(m_dev, &ai, nullptr, &m_fontMem) != VK_SUCCESS) return false;
++        vkBindImageMemory(m_dev, m_fontImg, m_fontMem, 0);
++        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++        vi.image = m_fontImg; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8_UNORM;
++        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
++        if (vkCreateImageView(m_dev, &vi, nullptr, &m_fontView) != VK_SUCCESS) return false;
++        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
++        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
++        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
++        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++        sci.maxLod = static_cast<float>(mips);
++        return vkCreateSampler(m_dev, &sci, nullptr, &m_fontSmp) == VK_SUCCESS;
++    }
++    // Recorded into the init command buffer (staging is unused then): pixels -> image, then SHADER_READ_ONLY.
++    void fontRecordUpload()
++    {
++        if (!m_fontImg) return;
++        const uint32_t mips = m_font.ok ? m_font.mips : 1u;
++        VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++        ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        ib.image = m_fontImg; ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
++        vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
++        if (m_font.ok)
++        {
++            std::memcpy(m_stageMap, m_font.pix.data(), m_font.pix.size());
++            std::vector<VkBufferImageCopy> cp(mips);
++            uint32_t w = m_font.aw, h = m_font.ah;
++            for (uint32_t i = 0; i < mips; ++i)
++            {
++                cp[i] = VkBufferImageCopy{};
++                cp[i].bufferOffset = m_font.mipOff[i];
++                cp[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
++                cp[i].imageExtent = {w, h, 1};
++                w = std::max(1u, w / 2u); h = std::max(1u, h / 2u);
++            }
++            vkCmdCopyBufferToImage(m_cmd, m_stage, m_fontImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mips, cp.data());
++            std::vector<uint8_t>().swap(m_font.pix); // the GPU copy is the only one needed
++        }
++        else
++        {
++            VkClearColorValue cc{};
++            vkCmdClearColorImage(m_cmd, m_fontImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &ib.subresourceRange);
++        }
++        ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
++        ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++        vkCmdPipelineBarrier(m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
++    }
++    void fontDestroy()
++    {
++        if (m_fontSmp) vkDestroySampler(m_dev, m_fontSmp, nullptr);
++        if (m_fontView) vkDestroyImageView(m_dev, m_fontView, nullptr);
++        if (m_fontImg) vkDestroyImage(m_dev, m_fontImg, nullptr);
++        if (m_fontMem) vkFreeMemory(m_dev, m_fontMem, nullptr);
++        m_fontSmp = VK_NULL_HANDLE; m_fontView = VK_NULL_HANDLE; m_fontImg = VK_NULL_HANDLE; m_fontMem = VK_NULL_HANDLE;
++    }
++
++    // ---- atlas tracking (under m_m) ----
++    void fontInvalidate(uint64_t b, uint64_t e, const char *why)
++    {
++        if (!m_fontValid) return;
++        const uint64_t fb = static_cast<uint64_t>(m_fontTbp) * 256u, fe = fb + static_cast<uint64_t>(m_font.tw) * m_font.th / 2u;
++        if (b >= fe || e <= fb) return;
++        m_fontValid = false;
++        static int s_log = 0;
++        if (s_log < 6) { ++s_log; std::fprintf(stderr, "[gs:vk:font] atlas at %x overwritten (%s %llx-%llx): original font until the next upload\n", m_fontTbp, why, (unsigned long long)b, (unsigned long long)e); }
++    }
++    void fontBeginTx(const GSTransferCommand &c)
++    {
++        if (!m_font.ok) return;
++        m_fontTx = false;
++        const uint32_t rrw = c.trxreg.rrw, rrh = c.trxreg.rrh, dbw = std::max<uint32_t>(c.bitbltbuf.dbw, 1u);
++        const uint64_t b = static_cast<uint64_t>(c.bitbltbuf.dbp) * 256u;
++        const uint64_t e = b + static_cast<uint64_t>(dbw) * 64u * (c.trxpos.dsay + rrh) * texBits(c.bitbltbuf.dpsm) / 8u;
++        m_fontPendB = m_fontPendE = 0;
++        if (c.direction == 2u) fontInvalidate(b, e, "local copy");
++        else { m_fontPendB = b; m_fontPendE = e; } // uploads count once data arrives (the game opens some transfers it never fills)
++        if (c.direction == 0u && c.bitbltbuf.dpsm == 0x14u && rrw == m_font.tw && rrh == m_font.th && dbw * 64u == m_font.tw && c.trxpos.dsax == 0 && c.trxpos.dsay == 0)
++        {
++            m_fontTx = true; m_fontTxDbp = c.bitbltbuf.dbp; m_fontTxN = 0; m_fontTailN = 0;
++            m_fontH = 0xcbf29ce484222325ull ^ (static_cast<uint64_t>(m_font.tw) * m_font.th / 2u);
++        }
++    }
++    void fontUpload(const uint8_t *d, uint32_t n)
++    {
++        if (!m_font.ok || !n) return;
++        if (m_fontPendE) { fontInvalidate(m_fontPendB, m_fontPendE, "upload"); m_fontPendB = m_fontPendE = 0; }
++        if (!m_fontTx) return;
++        const uint32_t total = m_font.tw * m_font.th / 2u;
++        auto step = [&](const uint8_t *w8) { uint64_t w; std::memcpy(&w, w8, 8); m_fontH ^= w; m_fontH *= 0x100000001b3ull; m_fontH ^= m_fontH >> 29; };
++        n = std::min(n, total - m_fontTxN);
++        m_fontTxN += n;
++        while (n)
++        {
++            if (m_fontTailN || n < 8u)
++            {
++                const uint32_t m = std::min<uint32_t>(n, 8u - m_fontTailN);
++                std::memcpy(m_fontTail + m_fontTailN, d, m); m_fontTailN += m; d += m; n -= m;
++                if (m_fontTailN == 8u) { step(m_fontTail); m_fontTailN = 0; }
++                continue;
++            }
++            step(d); d += 8; n -= 8;
++        }
++        if (m_fontTxN < total) return;
++        m_fontTx = false;
++        const bool hit = m_fontH == m_font.hash;
++        static int s_log = 0;
++        if (s_log < 8 && (hit != m_fontValid || !hit)) { ++s_log; std::fprintf(stderr, "[gs:vk:font] 512x512 T4 upload at %x hash %016llx: %s\n", m_fontTxDbp, (unsigned long long)m_fontH, hit ? "menu font atlas, vector glyphs on" : "not the menu font"); }
++        if (hit) { m_fontValid = true; m_fontTbp = m_fontTxDbp; }
++    }
++    // A colour / depth draw over the atlas memory (rows y0..y1 of a fbw-wide buffer at fbp) invalidates it.
++    void fontDrawCheck(uint32_t fbp, uint32_t fbw, uint32_t psm, int y0, int y1)
++    {
++        if (!m_fontValid || y1 < y0) return;
++        const uint32_t pr = pageRows(psm), w = std::max<uint32_t>(fbw, 1u);
++        const uint64_t base = static_cast<uint64_t>(fbp) * 8192u;
++        fontInvalidate(base + static_cast<uint64_t>(std::max(y0, 0) / pr) * w * 8192u, base + static_cast<uint64_t>(std::max(y1, 0) / pr + 1u) * w * 8192u, "draw");
++    }
++    bool fontActive(const GSContext &c, const GSDrawState &st) const
++    {
++        return m_fontValid && st.prim.tme && c.tex0.tbp0 == m_fontTbp && c.tex0.psm == 0x14u && st.textureWidth == m_font.tw &&
++               st.textureHeight == m_font.th && c.tex0.cbp == m_fontTbp + m_font.cbpOff;
++    }
++    // One triangle of a glyph quad -> the same corner of the replacement quad. False: draw it unchanged.
++    bool fontMapTri(const GSVertex *v, bool fst, bool iip, float tw, float th, GSVertex *nv, float *ns, float *nt)
++    {
++        float U[3], V[3];
++        for (int i = 0; i < 3; ++i)
++        {
++            if (fst) { U[i] = v[i].u / 16.0f; V[i] = v[i].v / 16.0f; }
++            else { const float q = std::fabs(v[i].q) > 1e-20f ? v[i].q : 1.0f; U[i] = v[i].s / q * tw; V[i] = v[i].t / q * th; }
++        }
++        const float u0 = std::min({U[0], U[1], U[2]}), u1 = std::max({U[0], U[1], U[2]}), w0 = std::min({V[0], V[1], V[2]}), w1 = std::max({V[0], V[1], V[2]});
++        const float x0 = std::min({v[0].x, v[1].x, v[2].x}), x1 = std::max({v[0].x, v[1].x, v[2].x});
++        const float y0 = std::min({v[0].y, v[1].y, v[2].y}), y1 = std::max({v[0].y, v[1].y, v[2].y});
++        const long ku = std::lround(u0), kv = std::lround(w0);
++        if (ku < 0 || kv < 0 || std::fabs(u0 - ku) > 0.05f || std::fabs(w0 - kv) > 0.05f) return false;
++        auto it = m_font.byUv.find((static_cast<uint32_t>(ku) << 16) | static_cast<uint32_t>(kv));
++        if (it == m_font.byUv.end()) return false;
++        const FontGlyph &g = m_font.g[it->second];
++        if (std::fabs(u1 - u0 - g.ow) > 0.05f || std::fabs(w1 - w0 - g.oh) > 0.05f || x1 - x0 < 0.5f || y1 - y0 < 0.5f) return false;
++        const float kx = (x1 - x0) / g.ow, ky = (y1 - y0) / g.oh;
++        bool cx[3], cy[3];
++        for (int i = 0; i < 3; ++i)
++        {   // every vertex a quad corner, texture not mirrored
++            const bool rx = std::fabs(v[i].x - x1) < 0.01f, lx = std::fabs(v[i].x - x0) < 0.01f;
++            const bool by = std::fabs(v[i].y - y1) < 0.01f, ty = std::fabs(v[i].y - y0) < 0.01f;
++            const bool ru = std::fabs(U[i] - u1) < 0.05f, bv = std::fabs(V[i] - w1) < 0.05f;
++            if (!(rx || lx) || !(by || ty) || rx != ru || by != bv) return false;
++            cx[i] = rx; cy[i] = by;
++        }
++        const float X0 = x0 - g.xo * kx + g.nx0 * kx, X1 = X0 + g.nw * kx;
++        const float Y0 = y0 - g.yo * ky + g.ny0 * ky, Y1 = Y0 + g.nh * ky;
++        // colour: the affine gradient through the three original vertices, evaluated at the new corners
++        const float ex = v[1].x - v[0].x, ey = v[1].y - v[0].y, fx = v[2].x - v[0].x, fy = v[2].y - v[0].y, det = ex * fy - fx * ey;
++        for (int i = 0; i < 3; ++i)
++        {
++            nv[i] = v[i];
++            nv[i].x = cx[i] ? X1 : X0; nv[i].y = cy[i] ? Y1 : Y0;
++            ns[i] = (cx[i] ? static_cast<float>(g.ax + g.aw) : static_cast<float>(g.ax)) / m_font.aw;
++            nt[i] = (cy[i] ? static_cast<float>(g.ay + g.ah) : static_cast<float>(g.ay)) / m_font.ah;
++            if (iip && std::fabs(det) > 1e-6f)
++            {
++                const float px = nv[i].x - v[0].x, py = nv[i].y - v[0].y;
++                uint8_t GSVertex::*const ch[4] = {&GSVertex::r, &GSVertex::g, &GSVertex::b, &GSVertex::a};
++                for (auto m : ch)
++                {
++                    const float c0 = v[0].*m, d1 = v[1].*m - c0, d2 = v[2].*m - c0;
++                    const float a = (d1 * fy - d2 * ey) / det, b = (ex * d2 - fx * d1) / det;
++                    nv[i].*m = static_cast<uint8_t>(std::clamp(std::lround(c0 + a * px + b * py), 0L, 255L));
++                }
++            }
++        }
++        return true;
++    }
+diff --git a/ps2xRuntime/src/lib/gs/shaders/gs_vk_fxaa.comp b/ps2xRuntime/src/lib/gs/shaders/gs_vk_fxaa.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a1f6289ed591fe6d54f2f4747705354078de6e96
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/shaders/gs_vk_fxaa.comp
+@@ -0,0 +1,74 @@
++#version 450
++// vk19: present post pass (PS2X_VK_AA=fxaa). Reads the displayed target region (copied to the AA image, linear
++// sampler) and writes packed RGBA8 into the present readback buffer. FXAA 3.11 style: local contrast test, edge
++// direction, edge-end search, sub-pixel blend. mode 0 = plain copy.
++layout(local_size_x = 16, local_size_y = 16) in;
++layout(binding = 0) uniform sampler2D src;
++layout(std430, binding = 1) writeonly buffer Out { uint o[]; };
++layout(push_constant) uniform PC { uint w, h, mode; float subpix; float edgeThr; float edgeMin; } p;
++
++vec2 g_lo, g_hi;
++vec3 tex(vec2 uv) { return textureLod(src, clamp(uv, g_lo, g_hi), 0.0).rgb; }
++float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
++
++void main()
++{
++    uvec2 g = gl_GlobalInvocationID.xy;
++    if (g.x >= p.w || g.y >= p.h) return;
++    vec2 rcp = 1.0 / vec2(textureSize(src, 0));
++    g_lo = 0.5 * rcp; g_hi = (vec2(p.w, p.h) - 0.5) * rcp;
++    vec2 uv = (vec2(g) + 0.5) * rcp;
++    vec4 M = texelFetch(src, ivec2(g), 0);
++    vec3 outc = M.rgb;
++    if (p.mode == 1u)
++    {
++        float lM = luma(M.rgb);
++        float lN = luma(tex(uv + vec2(0.0, -rcp.y))), lS = luma(tex(uv + vec2(0.0, rcp.y)));
++        float lW = luma(tex(uv + vec2(-rcp.x, 0.0))), lE = luma(tex(uv + vec2(rcp.x, 0.0)));
++        float lMax = max(max(lN, lS), max(lW, max(lE, lM))), lMin = min(min(lN, lS), min(lW, min(lE, lM)));
++        float range = lMax - lMin;
++        if (range >= max(p.edgeMin, lMax * p.edgeThr))
++        {
++            float lNW = luma(tex(uv + vec2(-rcp.x, -rcp.y))), lNE = luma(tex(uv + vec2(rcp.x, -rcp.y)));
++            float lSW = luma(tex(uv + vec2(-rcp.x, rcp.y))), lSE = luma(tex(uv + vec2(rcp.x, rcp.y)));
++            float lNS = lN + lS, lWE = lW + lE;
++            float eH = abs(lNW + lSW - 2.0 * lW) + 2.0 * abs(lNS - 2.0 * lM) + abs(lNE + lSE - 2.0 * lE);
++            float eV = abs(lNW + lNE - 2.0 * lN) + 2.0 * abs(lWE - 2.0 * lM) + abs(lSW + lSE - 2.0 * lS);
++            bool horz = eH >= eV;
++            float l1 = horz ? lN : lW, l2 = horz ? lS : lE;
++            float g1 = l1 - lM, g2 = l2 - lM;
++            bool steep1 = abs(g1) >= abs(g2);
++            float gS = 0.25 * max(abs(g1), abs(g2));
++            float stepLen = horz ? rcp.y : rcp.x;
++            float lAvgLocal;
++            if (steep1) { stepLen = -stepLen; lAvgLocal = 0.5 * (l1 + lM); } else lAvgLocal = 0.5 * (l2 + lM);
++            vec2 cuv = uv;
++            if (horz) cuv.y += 0.5 * stepLen; else cuv.x += 0.5 * stepLen;
++            vec2 off = horz ? vec2(rcp.x, 0.0) : vec2(0.0, rcp.y);
++            vec2 uv1 = cuv - off, uv2 = cuv + off;
++            float le1 = luma(tex(uv1)) - lAvgLocal, le2 = luma(tex(uv2)) - lAvgLocal;
++            bool r1 = abs(le1) >= gS, r2 = abs(le2) >= gS;
++            const float Q[10] = float[10](1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 4.0, 8.0);
++            for (int i = 0; i < 10 && !(r1 && r2); ++i)
++            {
++                if (!r1) { uv1 -= off * Q[i]; le1 = luma(tex(uv1)) - lAvgLocal; r1 = abs(le1) >= gS; }
++                if (!r2) { uv2 += off * Q[i]; le2 = luma(tex(uv2)) - lAvgLocal; r2 = abs(le2) >= gS; }
++            }
++            float d1 = horz ? (uv.x - uv1.x) : (uv.y - uv1.y), d2 = horz ? (uv2.x - uv.x) : (uv2.y - uv.y);
++            bool dir1 = d1 < d2;
++            float dmin = min(d1, d2), len = d1 + d2;
++            float pixOff = -dmin / len + 0.5;
++            bool mSmaller = lM < lAvgLocal;
++            bool correct = ((dir1 ? le1 : le2) < 0.0) != mSmaller;
++            float fo = correct ? pixOff : 0.0;
++            float lAvg = (2.0 * (lNS + lWE) + lNW + lNE + lSW + lSE) / 12.0;
++            float s1 = clamp(abs(lAvg - lM) / range, 0.0, 1.0);
++            float s2 = (-2.0 * s1 + 3.0) * s1 * s1;
++            fo = max(fo, s2 * s2 * p.subpix);
++            vec2 fuv = uv;
++            if (horz) fuv.y += fo * stepLen; else fuv.x += fo * stepLen;
++            outc = tex(fuv);
++        }
++    }
++    o[g.y * p.w + g.x] = packUnorm4x8(vec4(outc, M.a));
 +}

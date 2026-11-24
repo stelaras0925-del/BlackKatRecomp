@@ -16,6 +16,7 @@ struct Settings
     bool gpu = true;        // GS renderer: GPU (OpenGL) or CPU
     bool vulkan = false;    // GPU renderer: false OpenGL (default), true Vulkan (falls back to GL on failure)
     int scale = 1;          // internal resolution multiplier (GPU only), 1..4
+    bool aa = false;        // anti-aliasing (FXAA) on the presented picture (Vulkan only)
     bool audio = true;      // host audio output
     bool movies = true;     // play FMVs (IPU) or skip them
     bool fullscreen = false;

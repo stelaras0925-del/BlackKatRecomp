@@ -1555,3 +1555,52 @@ flags single presented frames that differ from both neighbours, 32x24 luma grid,
 - Map / world map / save menus are finished 4:3 pictures (L2L copy from 0x1a40 + 2D sprites), so they stay pillarboxed by design.
   The switch to 4:3 now happens within 3 presents instead of 30 (`PS2X_WS_HUD_MENUFAST=0` = old).
 
+
+### Split submits, hi-res render-to-texture, FXAA (vk19, 2026-11-24)
+- `PS2X_VK_KICK=N` (default 16, 0 = off): the command buffer is submitted without a fence every N batches, so a GS -> host read
+  waits only for the tail (GPU wait per frame on foot 4x 0.55-0.62 ms vs 0.71-1.24 ms; fps within noise).
+- Hi-res RTT: REPEAT / out-of-range UVs on a target drawn this frame sample the scaled target, wrapping in the shader
+  (`PS2X_VK_RTT_WRAP=0` = old rule). The sea reflection is now hi-res at 4x (the black seam streaks from the 1x copy are gone).
+- Hi-res L2H tiles (`PS2X_VK_HIRES_L2H=0` = off; on when scale > 1): the per-frame 64x64 read at 0x2bc0 on foot is an NPC
+  impostor cache, not a shadow map. A read-back tile is kept at full scale and a byte-identical re-upload (FNV-64) aliases it,
+  so the impostor sprites draw from the hi-res copy. The bytes the game reads are unchanged (still the downsampled write-back).
+- FXAA on present: `PS2X_VK_AA=fxaa|off` (default off; `PS2X_VK_AA_SUBPIX` 0.5, `PS2X_VK_AA_EDGE` 0.125), compute pass
+  `shaders/gs_vk_fxaa.comp`. Launcher: "FXAA" checkbox on the Resolution row (Vulkan only), config `antialiasing=fxaa|off`.
+  It softens menu text slightly, so it stays off by default.
+- Validation 0 errors (sea 4x/1x + FXAA, foot 4x + FXAA). Foot 4x 29.4 fps, sea 19.9 (EE-bound).
+
+### Sea fps, water ripple, text upscale (vk20, 2026-11-24)
+- Facing the sea on foot the frame sits right at the 2-vsync boundary (EE ~13 Mcyc/frame at 4x vs 10-11 at 1x; 30 fps needs
+  <= 9.8), mostly EE spinning on D1_CHCR (VIF1 busy) at 0x114378 / 0x114748. Not a renderer bug; 21.5-26 fps at 4x.
+- `PS2X_PRES_FAST` (default on, 0 = old path; gs_frontend.cpp + ps2_runtime.cpp): the presented frame buffer (18 MB at 4x) is
+  recycled instead of allocated and zero-filled every present, and a frame that fills the texture is uploaded directly.
+  Within noise for fps, less main-thread time.
+- Water reflection "little squares" are the game's design (a 32x32 grid of 8x8 cells with each vertex UV displaced ~1.5 texels;
+  GL 1x shows the same). Remaster toggle `PS2X_VK_RIPPLE=0..1` (default 1 = original) scales the displacement of that warp
+  pass only (logged once as `[gs:vk:ripple]`). Launcher Remaster row "Ripple / Soft / Calm", config
+  `water_ripple=original|soft|calm` -> 1 / 0.4 / 0.
+- `PS2X_VK_TEXT_FILTER=off|smooth|sharp` (env default off, launcher default Sharp, config `text_filter`), only at scale > 1 on
+  display-width targets: nearest fst sprites get an alpha-weighted bilinear clamped to the sprite's texel rect (no atlas bleed);
+  sharp also reconstructs T4/T8 linear 2D text (the menu font) with a 4x4 B-spline re-thresholded contour. Vertex is now 16 floats
+  (texel rect at location 3). Logged as `[gs:vk:textf]`. fps unchanged, validation 0 errors.
+
+### Menu font replacement, IM FELL English Italic (vk21, 2026-11-24)
+- `PS2X_VK_FONT=imfell|off` (unset = off; 1/on/vector/hd/original_hd also mean imfell). Launcher Remaster row
+  "Original font / IM FELL", config `menu_font=original|imfell` (default imfell; old values vector/original_hd read as imfell).
+  `PS2X_VK_FONT_DIR` overrides the asset search (exe-parent/assets/fonts, then the cwd).
+- Only the front-end menu font: T4 512x512 at TBP 0x2bc0 / CBP 0x2dc0, FNTS v202 table (83 glyphs, 12-byte entries
+  `<HBBHHBbBB` code,w,h,u,v,adv,xoff,yoff,flag) at 0x12a9380. Detected by hash64 of the upload at dsax/dsay 0
+  (0x999487715c0f918c) plus CBP == TBP + 0x200; data uploads or local copies over the atlas pages invalidate it (empty transfer
+  setups and GS -> host reads do not). In game the atlas is overwritten and the replacement turns itself off.
+- Asset `assets/fonts/imfell_menu.p2f`: 8x RG8 atlas (R = fill, G = fill + 1.3 px outline) + per-glyph metrics, PackBits,
+  5 mips on descriptor binding 5 (1x1 dummy when missing, then it falls back to the original font). Built offline by
+  `tools/gen_menu_font.py` (Pillow + numpy, `--k 8 --outline 1.3 --match mean --xstretch 1.1 --place adv`) from the shipped TTF
+  and the game's FNTS metrics; no game artwork is in the file. OFL.txt and README.txt sit alongside.
+- Per quad (gs_vk_font.inl, gs_vk_render.inl): the UV rect is looked up in the FNTS table, the quad is rebuilt at the new glyph
+  box from the same pen position with the game's advances (layout unchanged), vertex colours are re-evaluated at the new corners,
+  and the fragment shader blends the CLUT outline (index 1) and fill (index 9) colours by coverage. The +3,+3 shadow pass is the
+  same quads drawn again, so it is kept. Each glyph is widened 10% and centred in the game's advance box (IM FELL is ~22% narrower).
+- Coverage: main menu (all items) and the save-list "Back"; the pause menu, save-slot text and shop use other fonts.
+  Validation 0 errors / 0 warnings, 0 unmapped glyphs, fps unchanged (main menu 28-29 at 4x and 1x). Active at every scale.
+- Tried and dropped (vk21b): tracing the game's own glyphs to vectors with potrace; the result looked disconnected because the
+  pixel art relies on the pixel grid.

@@ -1219,7 +1219,7 @@ index 37b6a4decc5865c7e51fbe9209ce46eafa6ccb27..cdad411790f0bf0f5a3d0f01edf4e0d8
 +    uint64_t dispfbWrites() { return g_dispfbWrites.load(std::memory_order_relaxed); }
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c545069acd74d4 100644
+index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..4a5d4e10ef5778c22274b042010442d8f404b476 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -7,6 +7,7 @@
@@ -1275,7 +1275,25 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c54506
  
  namespace ps2_stubs
  {
-@@ -414,7 +447,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -373,6 +406,7 @@ namespace
+     }
+ }
+ 
++bool ps2xPresFast(); // vk20, gs/gs_frontend.cpp
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+@@ -401,7 +435,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         return;
+     }
+ 
+-    s_scratch.clear();
++    if (!ps2xPresFast())
++        s_scratch.clear(); // vk20: kept otherwise, so the latch copy does not zero-fill it again (resize to the same size)
+     uint32_t width = 0u;
+     uint32_t height = 0u;
+     uint32_t displayFbp = 0u;
+@@ -414,7 +449,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                     &sourceFbp,
                                                     &usedPreferredDisplaySource))
      {
@@ -1284,7 +1302,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c54506
          UpdateTexture(tex, blank.data);
          UnloadImage(blank);
          outWidth = FB_WIDTH;
-@@ -450,13 +483,26 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -450,13 +485,35 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      s_lastWidth = width;
      s_lastHeight = height;
  
@@ -1301,6 +1319,15 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c54506
 +        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
 +        s_uploadBuffer.assign(static_cast<size_t>(nw) * nh * 4u, 0u);
 +    }
++    if (ps2xPresFast() && static_cast<int>(width) == tex.width && static_cast<int>(height) == tex.height &&
++        s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
++    {   // vk20: the frame fills the texture exactly (4x): upload it directly, no clear + copy into s_uploadBuffer
++        UpdateTexture(tex, s_scratch.data());
++        outWidth = width;
++        outHeight = height;
++        s_hasUploadedFrame = true;
++        return;
++    }
      std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
      if (!s_scratch.empty() && width != 0u && height != 0u)
      {
@@ -1314,7 +1341,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c54506
          const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
          for (uint32_t y = 0; y < copyHeight; ++y)
          {
-@@ -668,42 +714,121 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -668,42 +725,121 @@ bool PS2Runtime::syncCoreSubsystems()
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
@@ -1454,7 +1481,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c54506
      resetIop();
      m_vu0.reset();
      m_vu1.reset();
-@@ -731,10 +856,100 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,10 +867,100 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -1559,7 +1586,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c54506
  #endif
          SetTargetFPS(60);
          if (m_debugUiInitCallback)
-@@ -1396,6 +1611,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,6 +1622,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -1567,7 +1594,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c54506
      targetFn(rdram, ctx, this);
  
      if (isStopRequested() || ctx->pc == 0u)
-@@ -1403,7 +1619,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,7 +1630,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -1582,7 +1609,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c54506
      {
          ctx->pc = fallthroughPc;
      }
-@@ -2388,51 +2610,171 @@ void PS2Runtime::run()
+@@ -2388,51 +2621,171 @@ void PS2Runtime::run()
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
@@ -1784,7 +1811,7 @@ index 45cb9d267ec998c92f1951d3bc22e7d4c686851e..6509d77352f5adc0722c46e8d8c54506
          const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
          const Rectangle dstRect{
              (screenWidth - dstWidth) * 0.5f,
-@@ -2440,6 +2782,18 @@ void PS2Runtime::run()
+@@ -2440,6 +2793,18 @@ void PS2Runtime::run()
              dstWidth,
              dstHeight};
          DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
