@@ -5927,10 +5927,10 @@ index 0000000000000000000000000000000000000000..11fe48500c554022390f68cb6fcf337f
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_vu1_async.h b/ps2xRuntime/src/lib/ps2_vu1_async.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..5adf17feb75b455d6e0fa1b9333cac9d02114ab0
+index 0000000000000000000000000000000000000000..4f0c169094b0c43f4322b82b183456aa496cae8d
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/ps2_vu1_async.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,72 @@
 +#pragma once
 +// Asynchronous VIF1/VU1/GIF worker (default on, PS2X_VU1_THREAD=0 disables). Private runtime header: it is only
 +// included by runtime .cpp files, never by ps2_runtime.h or generated code.
@@ -5968,6 +5968,25 @@ index 0000000000000000000000000000000000000000..5adf17feb75b455d6e0fa1b9333cac9d
 +    // (STR still set), or drains first when PS2X_VU1_THREAD_DRAIN_ON_POLL=1 and returns false.
 +    bool chcrReadWhileBusy(PS2Memory &mem, uint32_t address, uint32_t &value);
 +
++    // vk22 EE/VU1 overlap (PS2X_VU1_ASYNC, default on with the worker; 0 = the vk21 behaviour where every
++    // EE sync point drains the worker). The EE sees the GS pipeline the way it would with an infinitely deep
++    // VIF1/GIF FIFO: D1/D2 CHCR polls report idle once the transfer is queued (its data was copied at kick),
++    // VIF1_STAT reads and an unchanged GIF_MODE write no longer drain, and GS CSR reads answer FINISH from a
++    // virtual flag set when a queued PATH3 packet carries a FINISH write. CSR write-one-to-clear bits are
++    // queued in order behind the GS work instead of draining. Anything that reads produced data (VU1 memory,
++    // GS->host transfers, other GS privileged registers, VIF1 FIFO) still drains. The EE may run at most
++    // PS2X_VU1_ASYNC_LAG vsyncs (default 2) ahead of the worker. Host time the EE spends blocked on the
++    // worker is charged as EE cycles at the next scheduler checkpoint (PS2X_VU1_ASYNC_CHARGE=0 disables),
++    // so guest time keeps pace with the host clock instead of falling behind during a drain.
++    bool asyncOn();
++    // EE thread, GS CSR read: true when answered without a drain (rawCsr = raw CSR value to report).
++    bool privCsrRead(PS2Memory &mem, uint64_t &rawCsr);
++    // EE thread, GS CSR write: true when handled without a drain. off = byte offset (0/4) for 32-bit
++    // writes, full = 64-bit write.
++    bool privCsrWrite(PS2Memory &mem, uint32_t off, uint64_t value, bool full);
++    // EE scheduler thread, at VBlankStart: bounds how far the EE runs ahead of the worker.
++    void onVsync(PS2Memory &mem);
++
 +    // GS stage (default on with the worker; PS2X_GS_STAGE=0 disables): on the VU1 worker, GIF
 +    // arbiter submits/drains (GIF packet parsing + GS backend calls) are queued to a separate
 +    // "GSStage" thread in order instead of running inline; the worker waits for the stage at
@@ -5986,10 +6005,10 @@ index 0000000000000000000000000000000000000000..5adf17feb75b455d6e0fa1b9333cac9d
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_vu1_async.inl b/ps2xRuntime/src/lib/ps2_vu1_async.inl
 new file mode 100644
-index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8b196b670
+index 0000000000000000000000000000000000000000..a2436d969d0bbbccb23130119f7c22194c5f1fc0
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/ps2_vu1_async.inl
-@@ -0,0 +1,842 @@
+@@ -0,0 +1,1240 @@
 +// ps2_vu1_async.inl - asynchronous VIF1 + VU1 + GIF worker (default on; PS2X_VU1_THREAD=0 disables).
 +// Included at the end of ps2_memory.cpp (needs PS2Memory internals; no header change).
 +//
@@ -6014,9 +6033,24 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +#include <pthread.h>
 +
 +extern std::atomic<uint64_t> g_ps2xVu1RunCycles;
++// vk22: EE cycles owed for host time the EE thread spent blocked on the worker (PS2X_VU1_ASYNC);
++// EeScheduler::checkpointDue accounts them (as idle-skipped cycles) at the next checkpoint.
++std::atomic<uint64_t> g_ps2xVu1ChargeCycles{0};
++std::atomic<uint64_t> g_ps2xVu1CatchCycles{0};
++namespace ps2x_vu1async_dbg
++{
++    // vk22c debug: last CSR-related EE events (EE thread only): kind, value, job index, finished, guest pc
++    struct Ev { char k; uint32_t v; uint64_t job, fin; };
++    Ev g_ring[64]; unsigned g_ringN = 0;
++    inline void ev(char k, uint32_t v, uint64_t job, uint64_t fin) { g_ring[g_ringN++ & 63u] = Ev{k, v, job, fin}; }
++} // vk22b: catch-up cycles added by EeScheduler (stats)
++thread_local bool g_ps2xEeHostThread = false;
++void ps2xVu1WaitTick() noexcept;                   // vk22e: EeScheduler.cpp, repays owed EE cycles mid-wait
++thread_local uint64_t g_ps2xVu1TickChargedNs = 0; // vk22e: blocked ns already charged by wait ticks  // vk22b: set by EeScheduler::checkpointDue (guest EE threads)
 +
 +namespace ps2x_vu1async
 +{
++    bool asyncOn(); // vk22e
 +    namespace
 +    {
 +        struct Item
@@ -6024,6 +6058,7 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +            bool gif = false;
 +            std::vector<uint8_t> data;
 +            uint32_t src = 0, qwc = 0, chain = 0; // VIF1 desync trace
++            uint32_t csrClear = 0;                // vk22: ordered GS CSR write-one-to-clear (no data)
 +        };
 +        struct Job
 +        {
@@ -6070,6 +6105,19 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +            std::atomic<uint64_t> busyPolls{0};
 +            std::atomic<uint64_t> eeSpinNs{0}; // EE time from the first busy CHCR poll until it reads not-busy
 +            std::atomic<uint64_t> inlineGif{0};
++            // vk22 async mode (EE thread only unless atomic)
++            bool virtFinish = false;            // EE-visible CSR.FINISH while jobs are in flight
++            uint64_t finClearJob = 0;           // job number of the last queued FINISH clear
++            uint64_t vsyncSub[8] = {};          // submitted count at the last 8 vsyncs
++            uint64_t vsyncN = 0;
++            std::atomic<uint64_t> virtPolls{0}; // CHCR polls answered idle while a job was in flight
++            std::atomic<uint64_t> virtCsr{0};   // CSR reads answered without a drain
++            std::atomic<uint64_t> csrOps{0};    // queued CSR clears
++            std::atomic<uint64_t> finScan{0};   // PATH3 jobs with a FINISH write
++            std::atomic<uint64_t> lagWaits{0};
++            std::atomic<uint64_t> lagWaitNs{0};
++            std::atomic<uint64_t> chargedNs{0};
++            std::atomic<uint64_t> rescues{0};
 +            std::mutex reasonMutex;
 +            std::unordered_map<std::string, uint64_t> waitReasons;
 +            std::unordered_map<std::string, uint64_t> traceKeys; // EE thread only
@@ -6126,7 +6174,8 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +        {
 +            Submit,
 +            Drain,
-+            Complete
++            Complete,
++            CsrClear // vk22: path = CSR write-one-to-clear bits
 +        };
 +        struct GsOpHdr
 +        {
@@ -6225,6 +6274,12 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +                        if (op.kind == GsOpKind::Complete)
 +                        {
 +                            postCompletion(op.completion);
++                            continue;
++                        }
++                        if (op.kind == GsOpKind::CsrClear)
++                        {
++                            if (mem)
++                                mem->gs().csr.fetch_and(~static_cast<uint64_t>(op.path), std::memory_order_acq_rel);
 +                            continue;
 +                        }
 +                        try
@@ -6331,6 +6386,15 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +        {
 +            for (const Item &it : job.items)
 +            {
++                if (it.csrClear)
++                {
++                    // vk22: CSR W1C bits written by the EE after the GS work queued before them.
++                    if (tlsIsWorker && !tlsIsGsStage && gsStageOn())
++                        gsStageAppend(*mem, GsOpKind::CsrClear, it.csrClear, nullptr, 0u, false);
++                    else
++                        mem->gs().csr.fetch_and(~static_cast<uint64_t>(it.csrClear), std::memory_order_acq_rel);
++                    continue;
++                }
 +                if (it.data.empty())
 +                    continue;
 +                if (it.gif)
@@ -6417,7 +6481,15 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +            mem.m_ioRegisters[D_STAT] = dstat;
 +            mem.queueCompletedDmacCause(channelBit);
 +            mem.m_ioRegisters[channelBase + 0x00] &= ~0x100u;
-+            mem.m_ioRegisters[channelBase + 0x20] = 0;
++            // vk22g: do not zero QWC if this channel was kicked again while the old transfer
++            // was still in flight. applyCompletions already restores STR when busy>0, but a
++            // stomped QWC makes the next 0x153C00 / 0x114710 start see qwc==0 and drop the kick
++            // (missing F in the rescue ring, then a FINISH poll hang).
++            const bool stillBusy = (channelBase == 0x1000A000u) ? (st().busyGif > 0)
++                                  : (channelBase == 0x10009000u) ? (st().busyVif1 > 0)
++                                  : false;
++            if (!stillBusy)
++                mem.m_ioRegisters[channelBase + 0x20] = 0;
 +        }
 +
 +        void maybeStats()
@@ -6445,6 +6517,12 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +                         busyNsSnap ? (g_ps2xVu1RunCycles.exchange(0) * 1e3 / double(busyNsSnap)) : 0.0,
 +                         (unsigned long long)s.drains.exchange(0), (unsigned long long)s.drainsWaited.exchange(0),
 +                         s.drainWaitNs.exchange(0) / 1e6, (unsigned long long)s.busyPolls.exchange(0), s.eeSpinNs.exchange(0) / 1e6, (unsigned long long)s.inlineGif.exchange(0), reasons.c_str());
++            if (asyncOn())
++                std::fprintf(stderr, "[vu1async:stats] virtual polls=%llu csr=%llu csr-clears=%llu finish-scans=%llu | lag waits=%llu (%.0f ms) | charged %.0f ms catch-up %.0f ms\n",
++                             (unsigned long long)s.virtPolls.exchange(0), (unsigned long long)s.virtCsr.exchange(0),
++                             (unsigned long long)s.csrOps.exchange(0), (unsigned long long)s.finScan.exchange(0),
++                             (unsigned long long)s.lagWaits.exchange(0), s.lagWaitNs.exchange(0) / 1e6, s.chargedNs.exchange(0) / 1e6,
++                             g_ps2xVu1CatchCycles.exchange(0) / 294912.0);
 +            if (gsStageOn())
 +                std::fprintf(stderr, "[vu1thread:stats] GS stage busy %.0f%%, worker waited %.0f ms for it, %llu ops in %llu batches\n",
 +                             100.0 * (gsStage().busyNs.exchange(0) / 1e9) / span, gsStage().waitNs.exchange(0) / 1e6,
@@ -6461,28 +6539,78 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +            }
 +        }
 +
++        void chargeBlocked(uint64_t ns, bool fromTick = false); // vk22e: forward decls for waitReport
++        bool chargeOn();
++        // vk22b: idleCv wait that reports a stall (state dump) every 2 s instead of blocking silently.
++        template <class Pred>
++        void waitReport(std::unique_lock<std::mutex> &lk, Pred pred, const char *what, uint64_t target)
++        {
++            State &s = st();
++            unsigned n = 0;
++            // vk22e: on a guest EE thread, wake every PS2X_VU1_ASYNC_TICK_MS (default 2, 0 = off) and repay the
++            // blocked time as EE cycles right away, so the IOP (and SPU2 audio) keeps producing during long waits
++            // instead of in one burst after them (gaps near the 85 ms audio ring target gave stutter/warble).
++            static const int s_tickMs = []() { const char *e = std::getenv("PS2X_VU1_ASYNC_TICK_MS"); const int v = e ? std::atoi(e) : 2; return v < 0 ? 0 : v; }();
++            if (s_tickMs > 0 && g_ps2xEeHostThread && asyncOn() && chargeOn())
++            {
++                uint64_t last = nowNs(), sinceReport = 0;
++                while (!s.idleCv.wait_for(lk, std::chrono::milliseconds(s_tickMs), pred))
++                {
++                    const uint64_t now = nowNs(), slice = now - last;
++                    last = now;
++                    g_ps2xVu1TickChargedNs += slice;
++                    chargeBlocked(slice, true);
++                    lk.unlock();
++                    ps2xVu1WaitTick();
++                    lk.lock();
++                    sinceReport += slice;
++                    if (sinceReport >= 2000000000ull)
++                    {
++                        sinceReport = 0;
++                        ++n;
++                        std::fprintf(stderr, "[vu1async:stall] EE waited %us in %s: target=%llu finished=%llu submitted=%llu queue=%zu done=%zu busyVif1=%d busyGif=%d\n",
++                                     n * 2u, what, (unsigned long long)target, (unsigned long long)s.finished,
++                                     (unsigned long long)s.submitted, s.queue.size(), s.done.size(), (int)s.busyVif1, (int)s.busyGif);
++                    }
++                }
++                return;
++            }
++            while (!s.idleCv.wait_for(lk, std::chrono::seconds(2), pred))
++            {
++                ++n;
++                std::fprintf(stderr, "[vu1async:stall] EE waited %us in %s: target=%llu finished=%llu submitted=%llu queue=%zu done=%zu busyVif1=%d busyGif=%d\n",
++                             n * 2u, what, (unsigned long long)target, (unsigned long long)s.finished,
++                             (unsigned long long)s.submitted, s.queue.size(), s.done.size(), (int)s.busyVif1, (int)s.busyGif);
++            }
++        }
++
 +        // Wait (any thread) until the worker has run everything submitted before this call.
 +        // Snapshot semantics: a thread that is not the submitter must not wait for "idle",
 +        // because the EE may keep the queue non-empty forever.
-+        void waitIdle(const char *reason)
++        uint64_t waitIdle(const char *reason)
 +        {
 +            State &s = st();
 +            const uint64_t target = s.submittedAtomic.load(std::memory_order_acquire);
 +            if (s.finishedAtomic.load(std::memory_order_acquire) >= target)
-+                return;
++                return 0u;
 +            const uint64_t t0 = nowNs();
 +            {
 +                std::unique_lock<std::mutex> lk(s.m);
-+                s.idleCv.wait(lk, [&]() { return s.finished >= target; });
++                waitReport(lk, [&]() { return s.finished >= target; }, reason ? reason : "drain", target);
 +            }
-+            s.drainWaitNs.fetch_add(nowNs() - t0, std::memory_order_relaxed);
++            const uint64_t waited = nowNs() - t0;
++            s.drainWaitNs.fetch_add(waited, std::memory_order_relaxed);
 +            s.drainsWaited.fetch_add(1, std::memory_order_relaxed);
 +            if (statsOn() && reason)
 +            {
 +                std::lock_guard<std::mutex> lk(s.reasonMutex);
 +                ++s.waitReasons[reason];
 +            }
++            return waited;
 +        }
++
++        // vk22: owe the EE the host time it spent blocked (EE thread only).
++        void chargeBlocked(uint64_t ns, bool fromTick);
 +
 +        std::vector<uint8_t> gatherLinear(PS2Memory &mem, uint32_t srcAddr, uint32_t qwc, bool fromScratchpad)
 +        {
@@ -6546,6 +6674,280 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +            }();
 +            return on && enabled();
 +        }
++    }
++
++    bool asyncOn()
++    {
++        static const bool on = []() {
++            const char *e = std::getenv("PS2X_VU1_ASYNC");
++            const bool v = !(e && e[0] == '0');
++            if (v && enabled())
++                std::fprintf(stderr, "[vu1async] EE/VU1 overlap on (PS2X_VU1_ASYNC=0 disables)\n");
++            return v;
++        }();
++        return on && enabled();
++    }
++
++    namespace
++    {
++        bool chargeOn()
++        {
++            static const bool on = []() { const char *e = std::getenv("PS2X_VU1_ASYNC_CHARGE"); return !(e && e[0] == '0'); }();
++            return on;
++        }
++
++        void chargeBlocked(uint64_t ns, bool fromTick)
++        {
++            if (!fromTick)
++            {
++                // vk22e: the part of this wait that the ticks already charged
++                const uint64_t done = std::min(ns, g_ps2xVu1TickChargedNs);
++                g_ps2xVu1TickChargedNs = 0;
++                ns -= done;
++            }
++            if (!ns || !asyncOn() || !chargeOn())
++                return;
++            st().chargedNs.fetch_add(ns, std::memory_order_relaxed);
++            // 294.912 MHz EE clock
++            g_ps2xVu1ChargeCycles.fetch_add(ns * 294912ull / 1000000ull, std::memory_order_relaxed);
++        }
++
++        // Does a PATH3 packet contain a FINISH (0x61) register write? PACKED A+D and REGLIST are scanned,
++        // IMAGE data is skipped. Stops at the end of the data.
++        bool gifHasFinish(const std::vector<uint8_t> &d)
++        {
++            size_t p = 0;
++            const size_t n = d.size() & ~size_t(15);
++            while (p + 16 <= n)
++            {
++                uint64_t lo, hi;
++                std::memcpy(&lo, d.data() + p, 8);
++                std::memcpy(&hi, d.data() + p + 8, 8);
++                p += 16;
++                const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
++                const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
++                uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
++                if (nreg == 0)
++                    nreg = 16;
++                if (flg == 0u) // PACKED
++                {
++                    for (uint32_t l = 0; l < nloop && p + 16 <= n; ++l)
++                        for (uint32_t r = 0; r < nreg && p + 16 <= n; ++r, p += 16)
++                            if (((hi >> (r * 4u)) & 0xFu) == 0xEu && d[p + 8] == 0x61u)
++                                return true;
++                }
++                else if (flg == 1u) // REGLIST: 64-bit words, padded to a qword
++                {
++                    const uint64_t words = static_cast<uint64_t>(nloop) * nreg;
++                    p += static_cast<size_t>(((words + 1u) / 2u) * 16u);
++                }
++                else // IMAGE
++                    p += static_cast<size_t>(nloop) * 16u;
++            }
++            return false;
++        }
++
++        // EE thread: queue a job (kick order).
++        void enqueueJob(PS2Memory &mem, Job &&job)
++        {
++            State &s = st();
++            {
++                std::lock_guard<std::mutex> lk(s.m);
++                s.mem = &mem;
++                s.queue.push_back(std::move(job));
++                ++s.submitted;
++                s.submittedAtomic.store(s.submitted, std::memory_order_release);
++            }
++            s.workCv.notify_one();
++        }
++
++        uint64_t inFlight()
++        {
++            State &s = st();
++            return s.submittedAtomic.load(std::memory_order_relaxed) - s.finishedAtomic.load(std::memory_order_acquire);
++        }
++    }
++
++    namespace
++    {
++        // vk22c debug: a CSR poll streak that never sees FINISH (the game's FINISH wait at 0x16c410 hung once).
++        std::string ringText()
++        {
++            std::string r;
++            char b[64];
++            for (unsigned i = 0; i < 24u && i < ps2x_vu1async_dbg::g_ringN; ++i)
++            {
++                const auto &e = ps2x_vu1async_dbg::g_ring[(ps2x_vu1async_dbg::g_ringN - 1u - i) & 63u];
++                std::snprintf(b, sizeof(b), " %c%x@%llu/%llu", e.k, e.v, (unsigned long long)e.job, (unsigned long long)e.fin);
++                r += b;
++            }
++            return r;
++        }
++
++        // vk22d: FINISH-wait rescue. The worker and GS stage are idle (everything the EE queued has run), the EE keeps
++        // polling CSR without FINISH and has queued no new work for PS2X_VU1_ASYNC_RESCUE_MS (default 250, 0 = off):
++        // nothing can ever raise FINISH, so the game is hung (seen once at sea: 0x16c410 FINISH poll, FINISH erased by a
++        // W1C clear ordered after it). Raise FINISH, which is true anyway (the GS has finished all work). A spurious
++        // FINISH is harmless here: every game sync routine clears CSR.FINISH before kicking its FINISH packet.
++        bool rescueFinish(uint64_t raw)
++        {
++            static const uint64_t s_ms = []() -> uint64_t { const char *e = std::getenv("PS2X_VU1_ASYNC_RESCUE_MS"); return e ? std::strtoull(e, nullptr, 10) : 250u; }();
++            static thread_local uint64_t t0 = 0, sub0 = ~0ull, polls = 0;
++            static std::atomic<uint32_t> s_logged{0};
++            if (!s_ms)
++                return false;
++            State &s = st();
++            const uint64_t sub = s.submittedAtomic.load(std::memory_order_relaxed) + s.inlineGif.load(std::memory_order_relaxed); // any new GS work
++            const uint64_t now = nowNs();
++            if (sub != sub0 || (raw & 0x2ull)) { sub0 = sub; t0 = now; polls = 0; return false; }
++            if (++polls < 4096u || now - t0 < s_ms * 1000000ull)
++                return false;
++            t0 = now; polls = 0;
++            s.rescues.fetch_add(1, std::memory_order_relaxed);
++            if (s_logged.fetch_add(1, std::memory_order_relaxed) < 20u)
++                std::fprintf(stderr, "[vu1async] FINISH rescue: EE polled CSR %llu ms with the GS idle and no FINISH (raw=%llx); recent:%s\n",
++                             (unsigned long long)s_ms, (unsigned long long)raw, ringText().c_str());
++            return true;
++        }
++
++        void noteCsrPoll(bool fin, bool idle, uint64_t raw)
++        {
++            static thread_local uint64_t streak = 0, t0 = 0, lastDump = 0;
++            if (fin) { streak = 0; return; }
++            if (++streak == 1u) { t0 = nowNs(); return; }
++            if ((streak & 0xFFFFu) != 0u)
++                return;
++            const uint64_t now = nowNs();
++            if (now - t0 < 2000000000ull || now - lastDump < 2000000000ull)
++                return;
++            lastDump = now;
++            State &s = st();
++            GsStage &g = gsStage();
++            uint64_t gp = 0, gd = 0; size_t gq = 0;
++            { std::lock_guard<std::mutex> lk(g.m); gp = g.pushed; gd = g.done; gq = g.queue.size(); }
++            {
++                std::string r;
++                char b[64];
++                for (unsigned i = 0; i < 24u && i < ps2x_vu1async_dbg::g_ringN; ++i)
++                {
++                    const auto &e = ps2x_vu1async_dbg::g_ring[(ps2x_vu1async_dbg::g_ringN - 1u - i) & 63u];
++                    std::snprintf(b, sizeof(b), " %c%x@%llu/%llu", e.k, e.v, (unsigned long long)e.job, (unsigned long long)e.fin);
++                    r += b;
++                }
++                std::fprintf(stderr, "[vu1async:finwait] recent (newest first; W=csr write, Q=queued clear, F=finish scan, I=inline gif, V=idle read):%s\n", r.c_str());
++            }
++            std::fprintf(stderr, "[vu1async:finwait] %llu polls / %.1fs without FINISH: idle=%d raw=%llx virt=%d finClearJob=%llu submitted=%llu finished=%llu applied=%llu stage pushed=%llu done=%llu q=%zu inlineGif=%llu\n",
++                         (unsigned long long)streak, (now - t0) / 1e9, (int)idle, (unsigned long long)raw, (int)s.virtFinish,
++                         (unsigned long long)s.finClearJob, (unsigned long long)s.submittedAtomic.load(), (unsigned long long)s.finishedAtomic.load(),
++                         (unsigned long long)s.applied, (unsigned long long)gp, (unsigned long long)gd, gq, (unsigned long long)s.inlineGif.load());
++        }
++    }
++
++    bool privCsrRead(PS2Memory &mem, uint64_t &rawCsr)
++    {
++        if (!asyncOn() || onWorkerThread())
++            return false;
++        State &s = st();
++        if (inFlight() == 0u)
++        {
++            // Worker idle: the real register is current (a queued FINISH has run, queued clears too).
++            applyCompletions(mem);
++            uint64_t raw = mem.gs().csr.load(std::memory_order_acquire);
++            if (rescueFinish(raw))
++            {
++                mem.gs().csr.fetch_or(0x2ull, std::memory_order_acq_rel);
++                raw |= 0x2ull;
++            }
++            s.virtFinish = (raw & 0x2ull) != 0u;
++            {
++                static uint64_t s_lastIdleRaw = ~0ull;
++                if ((raw & 0x3ull) != s_lastIdleRaw)
++                {
++                    s_lastIdleRaw = raw & 0x3ull;
++                    ps2x_vu1async_dbg::ev('V', static_cast<uint32_t>(raw & 0x3ull), s.submittedAtomic.load(), s.finishedAtomic.load());
++                }
++            }
++            noteCsrPoll(s.virtFinish, true, raw);
++            return false;
++        }
++        const uint64_t raw = mem.gs().csr.load(std::memory_order_acquire);
++        // A real FINISH (e.g. from a GIF packet run inline) counts unless the EE cleared it since and that
++        // clear is still queued.
++        const bool clearPending = s.finishedAtomic.load(std::memory_order_acquire) < s.finClearJob;
++        const bool fin = s.virtFinish || ((raw & 0x2ull) != 0u && !clearPending);
++        rawCsr = (raw & ~0x2ull) | (fin ? 0x2ull : 0u);
++        s.virtCsr.fetch_add(1, std::memory_order_relaxed);
++        noteCsrPoll(fin, false, raw);
++        return true;
++    }
++
++    bool privCsrWrite(PS2Memory &mem, uint32_t off, uint64_t value, bool full)
++    {
++        if (!asyncOn() || onWorkerThread())
++            return false;
++        State &s = st();
++        const uint32_t low = full ? static_cast<uint32_t>(value) : (off == 0u ? static_cast<uint32_t>(value) : 0u);
++        ps2x_vu1async_dbg::ev('W', low, s.submittedAtomic.load(), s.finishedAtomic.load());
++        if (inFlight() == 0u)
++        {
++            if (low & 0x2u)
++                s.virtFinish = false;
++            return false; // direct path (nothing to drain)
++        }
++        if (low & 0x200u) // RESET: keep the synchronous path
++            return false;
++        // Non-W1C bits are EE-side state: apply now. W1C bits (SIGNAL/FINISH) clear events the queued GS
++        // work may still raise, so they run in order behind it.
++        if (full)
++            writeCsrFull(mem.gs().csr, value & ~0x3ull);
++        else
++            writeCsrHalf(mem.gs().csr, off, off == 0u ? (static_cast<uint32_t>(value) & ~0x3u) : static_cast<uint32_t>(value));
++        const uint32_t w1c = low & 0x3u;
++        if (w1c)
++        {
++            if (w1c & 0x2u)
++                s.virtFinish = false;
++            ensureStarted();
++            Job job;
++            Item it;
++            it.csrClear = w1c;
++            job.items.push_back(std::move(it));
++            s.csrOps.fetch_add(1, std::memory_order_relaxed);
++            enqueueJob(mem, std::move(job));
++            if (w1c & 0x2u)
++                s.finClearJob = s.submittedAtomic.load(std::memory_order_relaxed);
++            ps2x_vu1async_dbg::ev('Q', w1c, s.submittedAtomic.load(), s.finishedAtomic.load());
++        }
++        return true;
++    }
++
++    void onVsync(PS2Memory &mem)
++    {
++        (void)mem;
++        if (!asyncOn())
++            return;
++        static const uint64_t s_lag = []() -> uint64_t {
++            const char *e = std::getenv("PS2X_VU1_ASYNC_LAG");
++            const long v = e ? std::atol(e) : 2;
++            return static_cast<uint64_t>(std::min<long>(7, std::max<long>(1, v)));
++        }();
++        State &s = st();
++        s.vsyncSub[s.vsyncN & 7u] = s.submittedAtomic.load(std::memory_order_relaxed);
++        ++s.vsyncN;
++        if (s.vsyncN <= s_lag)
++            return;
++        const uint64_t target = s.vsyncSub[(s.vsyncN - 1u - s_lag) & 7u];
++        if (s.finishedAtomic.load(std::memory_order_acquire) >= target)
++            return;
++        const uint64_t t0 = nowNs();
++        {
++            std::unique_lock<std::mutex> lk(s.m);
++            waitReport(lk, [&]() { return s.finished >= target; }, "vsync-lag", target);
++        }
++        const uint64_t waited = nowNs() - t0;
++        s.lagWaits.fetch_add(1, std::memory_order_relaxed);
++        s.lagWaitNs.fetch_add(waited, std::memory_order_relaxed);
++        chargeBlocked(waited);
 +    }
 +
 +    bool gsDeferSubmit(PS2Memory &mem, uint32_t pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
@@ -6628,7 +7030,7 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +        if (!enabled() || onWorkerThread())
 +            return;
 +        st().drains.fetch_add(1, std::memory_order_relaxed);
-+        waitIdle(reason);
++        chargeBlocked(waitIdle(reason));
 +        applyCompletions(mem);
 +    }
 +
@@ -6636,7 +7038,9 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +    {
 +        if (!enabled() || onWorkerThread())
 +            return;
-+        waitIdle(reason);
++        const uint64_t waited = waitIdle(reason);
++        if (g_ps2xEeHostThread) // vk22b: GS-direct / readback drains on an EE thread are blocked EE time too
++            chargeBlocked(waited);
 +    }
 +
 +    // EE thread, from processPendingTransfers(): move GIF + VIF1 transfers into a worker job.
@@ -6661,6 +7065,8 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +            if (s.applied != s.finishedAtomic.load(std::memory_order_acquire))
 +                applyCompletions(mem);
 +            s.inlineGif.fetch_add(1, std::memory_order_relaxed);
++            if (!mem.m_pendingGifTransfers.empty())
++                ps2x_vu1async_dbg::ev('I', mem.m_pendingGifTransfers.front().qwc, s.submittedAtomic.load(), s.finishedAtomic.load());
 +            return;
 +        }
 +        ensureStarted();
@@ -6705,7 +7111,15 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +                else
 +                    it.data = gatherLinear(mem, p.srcAddr, p.qwc, p.fromScratchpad);
 +                if (gif)
++                {
 +                    it.data.resize(it.data.size() & ~size_t(15)); // GIF consumes whole qwords only
++                    if (asyncOn() && gifHasFinish(it.data))
++                    {
++                        s.virtFinish = true; // vk22: the GS will set CSR.FINISH when it runs this
++                        ps2x_vu1async_dbg::ev('F', static_cast<uint32_t>(it.data.size() / 16u), s.submittedAtomic.load() + 1u, s.finishedAtomic.load());
++                        s.finScan.fetch_add(1, std::memory_order_relaxed);
++                    }
++                }
 +                job.bytes += it.data.size();
 +                job.items.push_back(std::move(it));
 +            }
@@ -6737,14 +7151,7 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +        s.jobBytes.fetch_add(job.bytes, std::memory_order_relaxed);
 +        if (job.bytes >= 256u * 1024u)
 +            s.bigJobs.fetch_add(1, std::memory_order_relaxed);
-+        {
-+            std::lock_guard<std::mutex> lk(s.m);
-+            s.mem = &mem;
-+            s.queue.push_back(std::move(job));
-+            ++s.submitted;
-+            s.submittedAtomic.store(s.submitted, std::memory_order_release);
-+        }
-+        s.workCv.notify_one();
++        enqueueJob(mem, std::move(job));
 +        // Debug: PS2X_VU1_THREAD_SYNC=1 runs each job on the worker but waits for it here,
 +        // so completion timing matches the synchronous path (isolates thread vs timing bugs).
 +        static const bool s_syncDebug = []() { const char *e = std::getenv("PS2X_VU1_THREAD_SYNC"); return e && e[0] == '1'; }();
@@ -6766,10 +7173,12 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +            const uint64_t t0 = nowNs();
 +            {
 +                std::unique_lock<std::mutex> lk(s.m);
-+                s.idleCv.wait(lk, [&]() { return s.submitted - s.finished <= s_maxJobs / 2; });
++                waitReport(lk, [&]() { return s.submitted - s.finished <= s_maxJobs / 2; }, "queue-full", s.submitted - s_maxJobs / 2);
 +            }
-+            s.drainWaitNs.fetch_add(nowNs() - t0, std::memory_order_relaxed);
++            const uint64_t waited = nowNs() - t0;
++            s.drainWaitNs.fetch_add(waited, std::memory_order_relaxed);
 +            s.drainsWaited.fetch_add(1, std::memory_order_relaxed);
++            chargeBlocked(waited);
 +            if (statsOn())
 +            {
 +                std::lock_guard<std::mutex> lk(s.reasonMutex);
@@ -6808,6 +7217,14 @@ index 0000000000000000000000000000000000000000..56a6a94ffcf1747bff5d73361d5036a8
 +        {
 +            drain(mem, "chcr-poll");
 +            return false;
++        }
++        if (asyncOn())
++        {
++            // vk22: the transfer's data was copied at kick and later kicks queue behind it, so to the EE the
++            // channel is done. The completion (D_STAT CIS, DMAC interrupt) still arrives when the job ran.
++            st().virtPolls.fetch_add(1, std::memory_order_relaxed);
++            value = mem.m_ioRegisters[address] & ~0x100u;
++            return true;
 +        }
 +        // PS2X_EEVU1_OVERLAP=<n> (experiment, default off): a D1 CHCR poll reports the channel
 +        // idle (STR=0) while at most n VIF1 jobs are still queued, so the EE builds the next

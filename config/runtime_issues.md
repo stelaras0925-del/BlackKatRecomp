@@ -1604,3 +1604,23 @@ flags single presented frames that differ from both neighbours, 32x24 luma grid,
   Validation 0 errors / 0 warnings, 0 unmapped glyphs, fps unchanged (main menu 28-29 at 4x and 1x). Active at every scale.
 - Tried and dropped (vk21b): tracing the game's own glyphs to vectors with potrace; the result looked disconnected because the
   pixel art relies on the pixel grid.
+
+
+### EE/VU1 async overlap and FINISH hang fix (vk22, 2026-11-25)
+- `PS2X_VU1_ASYNC` (default on with the VU1 worker; 0 = the vk21 behaviour) lets the EE run ahead of the
+  worker: VIF1_STAT reads and an unchanged GIF_MODE write no longer drain, and GS CSR reads answer FINISH
+  from a virtual flag set when a queued PATH3 packet carries a FINISH write. CSR write-one-to-clear bits are
+  ordered after the GS work queued before them (`CsrClear` jobs). `PS2X_VU1_ASYNC_LAG` vsyncs (default 2)
+  cap how far ahead the EE may get. Host time the EE spends blocked on the worker is charged as EE cycles at
+  the next scheduler checkpoint, and mid-wait every `PS2X_VU1_ASYNC_TICK_MS` (default 2; 0 = off) so it is
+  not repaid in one burst (`PS2X_VU1_ASYNC_CHARGE=0` disables charging).
+- Hang (slot 3, GL, async on): a delayed `completeChannel` zeroed QWC at the start of the next CHCR write,
+  so the 0x153C00 / 0x114710 kick (2-QW FINISH after CSR=2) saw qwc==0 and was dropped. The EE then polled
+  forever at 0x16c410. vk22g: `completeChannel` leaves QWC alone while the channel is still busy, and a
+  CHCR start write snapshots MADR+QWC around `applyCompletions`. The 250 ms FINISH rescue stays as a safety
+  net. Confirm: GL + `PS2X_VU1_ASYNC=0` never hung (0 rescues). Verify: 55 s GL and Vulkan, then 45.5 min
+  soaks from the slot-3 copy (Ape Island beach), Vulkan fps 29.99 and GL fps 27.77, 0 rescues, 0 hangs,
+  0 crashes. `PS2X_VU1_BC_CHECK` on slot 3: 540000 runs, 0 mismatches.
+- `PS2X_SHOT_BURST=startSec:count[:every]` writes presented frames as binary PPMs (`PS2X_SHOT_PREFIX`) for
+  pan debugging. A same-process `PS2X_VK_CMP` pan and a `PS2X_VK_FRAMES=1` vs default compare did not show
+  a Vulkan-only palm-trunk ghost; two frames in flight is not the cause of the leftover OBS trail.
